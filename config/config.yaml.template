@@ -1,0 +1,164 @@
+﻿# =====================================================================
+# Mihomo (Clash.Meta) 配置模板 - 由 install.ps1 替换占位符后生成
+# Config template - run scripts\install.ps1 to generate the real config.
+#
+# 占位符 / Placeholders:
+#   __SUBSCRIPTION_URL__       你的 YAML 订阅地址
+#   __SUBSCRIPTION_INTERVAL__  订阅刷新间隔（分钟，0=仅启动拉一次）
+#   __SECRET__                 Dashboard 密码（留空 = 无密码）
+#
+# 节点命名不同？调整下方 US-FAST / VIETNAM 组的 filter
+# =====================================================================
+
+external-controller: 127.0.0.1:9090
+secret: "__SECRET__"
+
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+
+ipv6: false
+log-level: info
+
+# ---------- DNS ----------
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - +.localhost
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+  default-nameserver:
+    - 223.5.5.5
+  nameserver:
+    - 223.5.5.5
+  proxy-server-nameserver:
+    - 223.5.5.5
+  fallback:
+    - 8.8.8.8
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    geosite:
+      - gfw
+
+# ---------- Geo data ----------
+geodata-mode: true
+geo-auto-update: true
+geo-update-interval: 24
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+unified-delay: true
+tcp-concurrent: true
+sniffing: true
+
+# ---------- TUN ----------
+tun:
+  enable: true
+  stack: gvisor
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  sniffing: true
+
+# =====================================================================
+# Proxy providers
+# =====================================================================
+proxy-providers:
+  subscription:
+    type: http
+    url: "__SUBSCRIPTION_URL__"
+    path: ./providers/subscription.yaml
+    interval: __SUBSCRIPTION_INTERVAL__
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+
+# =====================================================================
+# Proxy groups
+# =====================================================================
+proxy-groups:
+  - name: PROXY
+    type: select
+    use:
+      - subscription
+    proxies:
+      - AUTO-FOREIGN
+      - US-FAST
+      - DIRECT
+
+  - name: AUTO-FOREIGN
+    type: url-test
+    use:
+      - subscription
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 100
+    timeout: 5000
+
+  - name: US-FAST
+    type: url-test
+    filter: "(?i)美|us|usa|🇺🇸"
+    use:
+      - subscription
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    timeout: 5000
+
+  - name: VIETNAM
+    type: select
+    use:
+      - subscription
+    filter: "(?i)越南|vietnam|🇻🇳"
+    proxies:
+      - PROXY
+      - DIRECT
+
+  - name: GLOBAL
+    type: select
+    proxies:
+      - PROXY
+      - AUTO-FOREIGN
+      - US-FAST
+      - VIETNAM
+      - DIRECT
+
+# =====================================================================
+# Rules
+# =====================================================================
+rules:
+  - GEOSITE,private,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+
+  # 海外开发 / AI 服务
+  - GEOSITE,openai,US-FAST
+  - GEOSITE,anthropic,US-FAST
+  - GEOSITE,github,US-FAST
+  - GEOSITE,google,PROXY
+  - DOMAIN-SUFFIX,x.ai,US-FAST
+  - DOMAIN-SUFFIX,grok.com,US-FAST
+  - DOMAIN-SUFFIX,chatgpt.com,US-FAST
+
+  # TikTok
+  - GEOSITE,tiktok,VIETNAM
+  - DOMAIN-SUFFIX,tiktok.com,VIETNAM
+  - DOMAIN-SUFFIX,tiktokv.com,VIETNAM
+
+  # 国内
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+
+  - MATCH,PROXY
