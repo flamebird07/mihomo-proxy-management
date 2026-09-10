@@ -15,7 +15,27 @@ Targets Windows (elevated PowerShell). Other platforms are best-effort.
 - 自动注册计划任务，开机自启 + 崩溃自动重启
 - TUN 模式透明代理，无需配置系统代理
 - 内置 `AUTO-FOREIGN` / `US-FAST` / `VIETNAM` / `GLOBAL` 智能分组
+- 订阅转换脚本支持全部主流协议: ss / trojan / vless / tuic / **anytls** / **hysteria2**（anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint）
 - `start / stop / restart / status / test / update-subscription / uninstall` 一套脚本
+
+---
+
+## 订阅转换 / Subscription Conversion
+
+订阅里 anytls 协议的节点 mihomo 不原生识别。仓库自带转换脚本 `scripts/convert_sub.py`，把 anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint 格式：
+
+```bash
+# 从订阅链接转换，输出 proxy-provider YAML
+python scripts/convert_sub.py -u "<订阅链接>" -o providers/subscription.yaml
+
+# 从本地 base64 订阅文件转换并列出节点
+python scripts/convert_sub.py -i subscription_raw.txt --list
+
+# 合并进现有配置（按节点名去重）
+python scripts/convert_sub.py -u "<订阅链接>" --merge providers/subscription.yaml -o providers/subscription.yaml
+```
+
+支持协议: ss / trojan / vless / tuic / anytls / hysteria2 (hy2)。
 
 ---
 
