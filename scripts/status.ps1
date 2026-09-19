@@ -8,9 +8,14 @@ $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib\common.ps1')
 
 Write-Section 'Process'
-$p = Get-MihomoProcess
-if ($p) {
-    Write-Ok "running PID=$($p.Id) started=$($p.StartTime) mem=$([math]::Round($p.WorkingSet64/1MB,1))MB"
+$procs = @(Get-MihomoProcesses)
+if ($procs.Count -gt 0) {
+    foreach ($p in $procs) {
+        Write-Ok "running PID=$($p.Id) name=$($p.ProcessName) started=$($p.StartTime) mem=$([math]::Round($p.WorkingSet64/1MB,1))MB"
+    }
+    if ($procs.Count -gt 1) {
+        Write-Err "检测到 $($procs.Count) 个 mihomo 进程（应为 1 个）！运行 start.ps1 可自动清理去重 / DUPLICATE instances, run start.ps1 to self-heal"
+    }
     $v = Get-MihomoVersion
     if ($v) { Write-Host "  version: $v" }
 } else {
@@ -37,7 +42,7 @@ Get-NetAdapter -ErrorAction SilentlyContinue |
     Select-Object Name, InterfaceDescription, Status |
     Format-Table -AutoSize
 
-if ($p) {
+if ($procs.Count -gt 0) {
     Write-Section 'Proxies (subscription provider)'
     try {
         $d = Invoke-RestMethod 'http://127.0.0.1:9090/providers/proxies' -TimeoutSec 5

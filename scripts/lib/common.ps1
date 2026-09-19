@@ -133,8 +133,19 @@ function Render-Config {
     Set-Content -Path $OutPath -Value $out -Encoding UTF8 -NoNewline
 }
 
+# mihomo 可能以两个二进制名运行（历史遗留的 mihomo-windows-amd64.exe），
+# 只按 "mihomo" 查会漏掉第二个进程，导致 stop/restart 后残留实例。
+# mihomo may run under two exe names (legacy mihomo-windows-amd64.exe);
+# matching only "mihomo" misses the second instance.
+$script:MihomoProcessNames = @('mihomo', 'mihomo-windows-amd64')
+
+function Get-MihomoProcesses {
+    Get-Process -Name $script:MihomoProcessNames -ErrorAction SilentlyContinue
+}
+
 function Get-MihomoProcess {
-    Get-Process mihomo -ErrorAction SilentlyContinue | Select-Object -First 1
+    # 兼容旧调用方：返回第一个进程 / legacy single-process accessor
+    Get-MihomoProcesses | Select-Object -First 1
 }
 
 function Get-MihomoTask {
@@ -143,13 +154,34 @@ function Get-MihomoTask {
 
 function Stop-Mihomo {
     Write-Section 'Stopping mihomo'
-    $p = Get-MihomoProcess
-    if ($p) {
-        Stop-Process -Id $p.Id -Force
-        Start-Sleep -Seconds 2
-        Write-Ok "Stopped PID=$($p.Id)"
-    } else {
+
+    # 必须先停计划任务再杀进程：任务带"失败自动重启"策略，
+    # 直接杀进程会让 Task Scheduler 在 1 分钟内把 mihomo 又拉起来（幽灵进程）。
+    # Stop the task first: its failure-restart policy would otherwise
+    # respawn mihomo right after we kill the process.
+    $t = Get-MihomoTask
+    if ($t) { Stop-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue }
+
+    $procs = @(Get-MihomoProcesses)
+    if ($procs.Count -eq 0) {
         Write-Warn 'mihomo is not running'
+        return
+    }
+
+    foreach ($p in $procs) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        Write-Host ('[OK] stopped PID={0} ({1})' -f $p.Id, $p.ProcessName)
+    }
+
+    # 等待进程真正退出（端口/TUN 释放），否则下一个实例会绑定失败
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline -and @(Get-MihomoProcesses).Count -gt 0) {
+        Start-Sleep -Milliseconds 500
+    }
+    if (@(Get-MihomoProcesses).Count -gt 0) {
+        Write-Err '仍有 mihomo 进程未退出（可能是 SYSTEM 权限进程，需管理员）/ processes still alive'
+    } else {
+        Write-Ok 'all mihomo processes stopped'
     }
 }
 

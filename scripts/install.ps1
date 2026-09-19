@@ -16,6 +16,7 @@ param(
     [string]$InstallDir,
     [switch]$SkipDownload,    # 跳过二进制下载（仅重新生成配置 + 注册计划任务）
     [switch]$SkipTask,        # 跳过注册计划任务
+    [switch]$SkipConfigRender, # 保留 install_dir 中已存在的 config.yaml（手工维护的内联节点配置）
     [switch]$Force            # 强制重新下载
 )
 
@@ -32,27 +33,34 @@ New-Item -ItemType Directory -Path (Join-Path $InstallDir 'providers') -Force | 
 New-Item -ItemType Directory -Path (Join-Path $InstallDir 'logs')      -Force | Out-Null
 
 # ---------- subscription.env ----------
-$envPath = Join-Path $InstallDir 'subscription.env'
-if (-not (Test-Path $envPath)) {
-    Write-Host "subscription.env 不存在，从模板创建空文件并打开 / creating from template"
-    Copy-Item (Join-Path (Get-RepoRoot) 'config\subscription.env.example') $envPath -Force
-    Start-Process notepad.exe $envPath
-    throw "请先填写 subscription.env 中的 SUBSCRIPTION_URL，再重新运行本脚本 / `nPlease fill SUBSCRIPTION_URL in subscription.env and re-run."
-}
+if (-not $SkipConfigRender) {
+    $envPath = Join-Path $InstallDir 'subscription.env'
+    if (-not (Test-Path $envPath)) {
+        Write-Host "subscription.env 不存在，从模板创建空文件并打开 / creating from template"
+        Copy-Item (Join-Path (Get-RepoRoot) 'config\subscription.env.example') $envPath -Force
+        Start-Process notepad.exe $envPath
+        throw "请先填写 subscription.env 中的 SUBSCRIPTION_URL，再重新运行本脚本 / `nPlease fill SUBSCRIPTION_URL in subscription.env and re-run."
+    }
 
-if (-not (Test-EnvConfigured $envPath)) {
-    Write-Err "subscription.env 中的 SUBSCRIPTION_URL 未配置或仍为示例值 / SUBSCRIPTION_URL not configured"
-    Start-Process notepad.exe $envPath
-    throw "请编辑 $envPath 后重试 / Please edit it then re-run."
-}
+    if (-not (Test-EnvConfigured $envPath)) {
+        Write-Err "subscription.env 中的 SUBSCRIPTION_URL 未配置或仍为示例值 / SUBSCRIPTION_URL not configured"
+        Start-Process notepad.exe $envPath
+        throw "请编辑 $envPath 后重试 / Please edit it then re-run."
+    }
 
-# ---------- 渲染 config ----------
-Write-Section 'Rendering config'
-Render-Config `
-    -EnvPath     $envPath `
-    -TemplatePath (Get-TemplatePath) `
-    -OutPath     (Join-Path $InstallDir 'config.yaml')
-Write-Ok "config.yaml 已生成 / generated at $(Join-Path $InstallDir 'config.yaml')"
+    # ---------- 渲染 config ----------
+    Write-Section 'Rendering config'
+    Render-Config `
+        -EnvPath     $envPath `
+        -TemplatePath (Get-TemplatePath) `
+        -OutPath     (Join-Path $InstallDir 'config.yaml')
+    Write-Ok "config.yaml 已生成 / generated at $(Join-Path $InstallDir 'config.yaml')"
+} else {
+    if (-not (Test-Path (Join-Path $InstallDir 'config.yaml'))) {
+        throw "-SkipConfigRender 需要 $InstallDir\config.yaml 已存在 / config.yaml must exist"
+    }
+    Write-Ok "跳过配置渲染，保留现有 config.yaml / keeping existing config.yaml"
+}
 
 # ---------- 下载二进制 / Geo 数据 ----------
 if (-not $SkipDownload) {
@@ -174,12 +182,18 @@ if (-not $SkipDownload) {
 if (-not $SkipTask) {
     Write-Section 'Registering scheduled task'
 
-    # 移除旧的（兼容 "MihomoProxy50" / "MihomoProxy"）
-    'MihomoProxy50', 'MihomoProxy' | ForEach-Object {
-        $t = Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue
-        if ($t) {
-            Unregister-ScheduledTask -TaskName $_ -Confirm:$false
-            Write-Warn "已注销旧任务 / unregistered old task: $_"
+    # 移除所有会启动 mihomo 的遗留任务（含旧名 MihomoProxy50 / MihomoProxy）。
+    # 多个任务同时拉起 mihomo 是双进程的直接来源之一。
+    # Remove every legacy task whose action launches mihomo (incl. old
+    # MihomoProxy50 / MihomoProxy) - multiple starters cause duplicate processes.
+    foreach ($tk in (Get-ScheduledTask)) {
+        $launchesMihomo = $false
+        foreach ($a in $tk.Actions) {
+            if ("$($a.Execute) $($a.Arguments)" -match '(?i)mihomo') { $launchesMihomo = $true }
+        }
+        if ($launchesMihomo) {
+            Unregister-ScheduledTask -TaskName $tk.TaskName -Confirm:$false
+            Write-Warn "已注销旧任务 / unregistered old task: $($tk.TaskName)"
         }
     }
 
@@ -198,9 +212,22 @@ if (-not $SkipTask) {
     Write-Ok "计划任务已注册 / scheduled task registered: $script:TaskName"
 }
 
+# ---------- 检查其他自启动项 / detect foreign autostart starters ----------
+$foreignStarters = @()
+foreach ($folder in @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+                      "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup")) {
+    $foreignStarters += Get-ChildItem $folder -Filter '*.vbs' -ErrorAction SilentlyContinue |
+        Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match '(?i)mihomo' } |
+        ForEach-Object { $_.FullName }
+}
+if ($foreignStarters) {
+    Write-Warn "以下启动项也会拉起 mihomo，会造成双进程，请删除（计划任务已覆盖该职责）/ these autostart entries also start mihomo and MUST be removed:"
+    $foreignStarters | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+}
+
 # ---------- 立即启动一次 ----------
 Write-Section 'Starting mihomo'
-Get-MihomoProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-MihomoProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Start-ScheduledTask -TaskName $script:TaskName
 if (Wait-MihomoReady -TimeoutSec 20) {
