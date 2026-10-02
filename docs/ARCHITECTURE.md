@@ -1,5 +1,10 @@
 # Architecture & Troubleshooting
 
+> Windows 架构如下；Linux 系统部署的架构、支持矩阵、DEGRADED 语义、供应链与
+> 生命周期规则见 [`LINUX.md`](LINUX.md)。
+> Everything below documents the Windows flow; the Linux system profile lives in
+> [`LINUX.md`](LINUX.md).
+
 ## 设计目标 / Goals
 
 - **零节点维护**：用户只关心一个 `SUBSCRIPTION_URL`，节点列表由 mihomo 按 `proxy-providers` 自动拉取
@@ -92,8 +97,16 @@ C:\mihomo\mihomo.exe -d C:\mihomo
 
 ## 安全 / Security
 
-- **永远不要把 `subscription.env` 提交进 git** — 它包含你的订阅凭证
+- **永远不要把 `subscription.env` 提交进 git** — 它包含你的订阅凭证（`.gitignore`
+  现为递归规则：任意目录下的 `**/subscription.env` / `**/*.env`（`*.env.example` 除外）
+  / `**/config.yaml` / `providers/*.yaml` 全部忽略）
 - **永远不要把 `providers/subscription.yaml` 提交进 git** — 它是订阅解码后的明文节点
+- Windows controller API（127.0.0.1:9090）调用现统一经由 `Invoke-MihomoApi` 携带
+  `Bearer $SECRET`；`SECRET` 为空时直接抛错，不存在未认证回退（Linux 侧同理，见 LINUX.md）
+- `convert_sub.py` 不再原样回显订阅 URL；节点 server:port 默认隐藏，
+  `--show-endpoints` 也只显示脱敏后的 `***.example.invalid`
+- **已知未修复（本期范围外，明示）**：Windows `install.ps1` 的下载仍是 latest +
+  无摘要校验 + 失败回退，不具备 Linux 侧的供应链验证；不要将 Windows 安装视为已验证
 - Dashboard 默认监听 `127.0.0.1:9090`，仅本机访问。若需远程 Dashboard，
   在 `subscription.env` 设 `SECRET=强密码`，并把 `external-controller`
   改为 `0.0.0.0:9090`（自行修改模板）。

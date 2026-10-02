@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "generated_by": "read-only official GitHub release metadata query (no credentials, no download); digests re-verified 2026-10-01",
+  "generated_at": "2026-10-01",
+  "policy": {
+    "pinning": "exact tag + exact asset name + full sha256 + byte size; any missing, ambiguous or mismatched digest aborts install",
+    "architectures": [
+      "x86_64 (v3 when AVX2 is present, otherwise compatible)",
+      "arm64"
+    ],
+    "metadata_api": "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v1.19.32",
+    "geo_metadata_api": "https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/latest",
+    "credentials": "none; public read-only metadata only",
+    "fallback": "none; an unavailable API must never degrade into an unverified download"
+  },
+  "mihomo_tag": "v1.19.32",
+  "geo_tag": "latest",
+  "assets": [
+    {
+      "key": "linux-amd64-v3",
+      "name": "mihomo-linux-amd64-v3-v1.19.32.gz",
+      "kind": "binary",
+      "source": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-v3-v1.19.32.gz",
+      "sha256": "13239bf2a4e9f8e172ee3d3910a5543ac15b7a9e08d3bdefe1cdcfc3d95855ae",
+      "size": 22846529,
+      "select_when": "arch=x86_64 and cpu has avx2"
+    },
+    {
+      "key": "linux-amd64-compatible",
+      "name": "mihomo-linux-amd64-compatible-v1.19.32.gz",
+      "kind": "binary",
+      "source": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-compatible-v1.19.32.gz",
+      "sha256": "ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20",
+      "size": 22877876,
+      "select_when": "arch=x86_64 and cpu lacks avx2"
+    },
+    {
+      "key": "linux-arm64",
+      "name": "mihomo-linux-arm64-v1.19.32.gz",
+      "kind": "binary",
+      "source": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-arm64-v1.19.32.gz",
+      "sha256": "9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
+      "size": 20809592,
+      "select_when": "arch=arm64"
+    },
+    {
+      "key": "geoip",
+      "name": "geoip.dat",
+      "kind": "geo",
+      "install_as": "GeoIP.dat",
+      "source": "https://github.com/MetaCubeX/meta-rules-dat/releases/tag/latest",
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+      "sha256": "3e21484fe4b72d788439e6f16a29bf7967892dd9e82f17e087608837cb260639",
+      "size": 16514644
+    },
+    {
+      "key": "geosite",
+      "name": "geosite.dat",
+      "kind": "geo",
+      "install_as": "GeoSite.dat",
+      "source": "https://github.com/MetaCubeX/meta-rules-dat/releases/tag/latest",
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+      "sha256": "012e87fb009b46a89a649ab5127f866e4525c40084da5841b01935770a636d69",
+      "size": 4253424
+    }
+  ],
+  "notes": [
+    "meta-rules-dat publishes under a rolling tag literally named 'latest'; the sha256 + byte size below are what pin it, not the tag",
+    "any digest drift must be re-fetched and re-committed; install never falls back to an unverified download"
+  ]
+}

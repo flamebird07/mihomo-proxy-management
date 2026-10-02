@@ -3,8 +3,15 @@
 > 一键部署 mihomo (Clash.Meta) 透明代理：填一个订阅链接，剩下的全自动。
 > Drop-in mihomo (Clash.Meta) deployment — plug in one subscription URL, the rest is automatic.
 
-适用于 Windows（管理员 PowerShell）。其它平台仅作参考。
-Targets Windows (elevated PowerShell). Other platforms are best-effort.
+适用于 Windows（管理员 PowerShell）**与 Linux 系统部署**（Ubuntu 22.04/24.04、Debian 12，
+systemd，见 `docs/LINUX.md`）。
+Windows (elevated PowerShell) and a Linux **system profile** (Ubuntu 22.04/24.04,
+Debian 12, systemd - see `docs/LINUX.md`) are supported; other platforms are best-effort.
+
+> ⚠️ 订阅链接 = 凭证。任何真实订阅 URL / 节点信息都不得提交进 git，也不得原样打印到
+> 终端 / CI 日志。文档与示例一律使用 RFC 2606 `example.invalid` 占位。
+> A subscription URL **is a credential**. Never commit it or echo it into logs; all
+> docs/examples use RFC 2606 `example.invalid` placeholders.
 
 ---
 
@@ -15,7 +22,8 @@ Targets Windows (elevated PowerShell). Other platforms are best-effort.
 - 自动注册计划任务，开机自启 + 崩溃自动重启
 - TUN 模式透明代理，无需配置系统代理
 - 内置 `AUTO-FOREIGN` / `US-FAST` / `VIETNAM` / `GLOBAL` 智能分组
-- 订阅转换脚本支持全部主流协议: ss / trojan / vless / tuic / **anytls** / **hysteria2**（anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint）
+- 订阅转换脚本 `convert_sub.py` 实际解析 **anytls / hysteria2**（anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint）；ss / trojan / vless / tuic 解析器尚未实现（见脚本内 TODO），请勿依赖
+- 转换脚本默认不回显订阅 URL 与节点 server:port（仅 `--show-endpoints` 时显示脱敏后的 `***.example`）
 - `start / stop / restart / status / test / update-subscription / uninstall` 一套脚本
 
 ---
@@ -35,7 +43,8 @@ python scripts/convert_sub.py -i subscription_raw.txt --list
 python scripts/convert_sub.py -u "<订阅链接>" --merge providers/subscription.yaml -o providers/subscription.yaml
 ```
 
-支持协议: ss / trojan / vless / tuic / anytls / hysteria2 (hy2)。
+实际支持协议: anytls / hysteria2 (hy2)。ss / trojan / vless / tuic 解析**未实现**。
+转换过程不会把订阅 URL（含 token）原样打印；出错信息同样脱敏。
 
 ---
 
@@ -87,11 +96,15 @@ Run scripts as Administrator. Paths are relative to the repo root.
 ### `subscription.env`
 
 ```ini
-SUBSCRIPTION_URL=https://your-provider.com/link?clash=1
+SUBSCRIPTION_URL=https://provider.example.invalid/link?clash=1   # 占位示例；真实链接是凭证
 SUBSCRIPTION_INTERVAL=60       # 分钟；0 = 仅启动拉一次
 SECRET=change-me               # Dashboard 密码，留空 = 无密码
 INSTALL_DIR=C:\mihomo          # 默认值，可不改
 ```
+
+> 该文件是**真凭证的存放地**（仅本机，已被 `.gitignore` 递归覆盖，任何目录下都叫
+> `subscription.env` 一律忽略）。仓库里只有 `.example` 模板。
+> This file holds real credentials; the recursive `.gitignore` covers it anywhere.
 
 ### 修改代理组 / Editing proxy groups
 
@@ -123,7 +136,14 @@ mihomo-proxy-management/
 │   ├── config.yaml.template       # 占位符模板，install.ps1 渲染
 │   └── subscription.env.example   # 配置示例（不含凭证）
 ├── docs/
-│   └── ARCHITECTURE.md            # 详细架构 / 故障排查
+│   ├── ARCHITECTURE.md            # 详细架构 / 故障排查（Windows）
+│   └── LINUX.md                   # Linux 系统部署：支持矩阵 / 降级 / 供应链 / 生命周期
+├── linux/                         # Linux 实现（唯一生命周期逻辑 = python/mpm）
+│   ├── bin/mihomo-proxy-management    # 薄入口 wrapper（无业务逻辑）
+│   ├── python/mpm/                 # CLI + 生命周期引擎
+│   ├── supply/mihomo.lock.json     # 摘要锁定的供应链清单
+│   ├── systemd/*.template          # 非机密 unit 参考模板
+│   └── tests/                      # 免主机测试（run_tests.py）
 ├── providers/
 │   └── .gitkeep
 └── scripts/
@@ -137,6 +157,25 @@ mihomo-proxy-management/
     ├── update-subscription.ps1
     └── uninstall.ps1
 ```
+
+---
+
+## Linux（系统 systemd）Quick Start
+
+```bash
+sudo mkdir -p /etc/mihomo-proxy-management
+sudoedit /etc/mihomo-proxy-management/subscription.env   # 0600；MPM_* 键，详见 docs/LINUX.md
+sudo python3 linux/tests/run_tests.py                    # 先跑免主机测试
+sudo MPM_SOURCE_DIR=$PWD/linux ./linux/bin/mihomo-proxy-management install --enable
+sudo ./linux/bin/mihomo-proxy-management status
+```
+
+要点 / Key points：
+- TUN 不可用时**显式降级**为 mixed-port（大声的 DEGRADED 横幅 + 持久化原因），绝不静默
+- 订阅 URL 只来自 0600 文件或 install/configure 进程环境变量，绝不经命令行参数
+- 下载二进制按 `linux/supply/mihomo.lock.json` 的 sha256+size 逐项校验，任何不匹配都不安装、不启动
+- `start` 从不隐式 `enable`；端口被其它 systemd 单元占用时拒绝启动并**点名占用者**（绝不 kill）
+- 真实 CN 出口需用户自验；CI 只用本地 mock 与 `example.invalid` 金丝雀
 
 ---
 

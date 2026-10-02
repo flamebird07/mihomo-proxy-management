@@ -1,0 +1,34 @@
+# Line-ending policy (D15/B3).
+#
+# Default: hand normalisation to whoever created the file.  We only force LF
+# for the text that is authored/consumed on Linux, because a stray CRLF there
+# breaks shebangs, systemd units and YAML digests.
+#
+# Windows scripts (.ps1) and their BOM are deliberately NOT touched here -
+# Windows tooling expects the files as shipped, and phase 3 does not rewrite
+# them byte-wise.
+text=auto
+
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+*.template text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Linux delivery tree is LF-only, no BOM, by construction (see docs).
+linux/** text eol=lf
+linux/bin/mihomo-proxy-management text eol=lf
+linux/systemd/*.template text eol=lf
+
+# Binary material must never be normalised.
+*.dat binary
+*.gz binary
+*.zip binary
+*.db binary
+*.exe binary
+*.dll binary

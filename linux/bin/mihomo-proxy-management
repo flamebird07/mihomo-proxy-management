@@ -1,0 +1,50 @@
+#!/bin/sh
+# mihomo-proxy-management - thin entry wrapper.
+#
+# ALL lifecycle logic lives in the Python package (mpm).  This file contains no
+# business rules on purpose: no path constants beyond package locations, no
+# curl, no systemctl call, no config rendering.  Do not add any - extend
+# mpm/lifecycle.py instead.
+#
+# Resolution order:
+#   1. MPM_PYTHON / MPM_PYTHONPATH (used by the test-suite and staging roots)
+#   2. the installed system layout: /usr/share/mihomo-proxy-management/python
+#   3. the source tree this wrapper was run from (development)
+#
+# The package directory is passed to Python through PYTHONPATH only, never
+# interpolated into code, so a path containing shell metacharacters cannot
+# become an injection point.
+set -eu
+
+MPM_PYTHON="${MPM_PYTHON:-python3}"
+
+if [ -n "${MPM_PYTHONPATH:-}" ] && [ -d "${MPM_PYTHONPATH}" ]; then
+    PYTHONPATH="${MPM_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH
+    exec "$MPM_PYTHON" -c 'import sys; from mpm.cli import main; raise SystemExit(main())' "$@"
+fi
+
+SYSTEM_PKG="/usr/share/mihomo-proxy-management/python"
+if [ -d "$SYSTEM_PKG" ]; then
+    PYTHONPATH="$SYSTEM_PKG"
+    export PYTHONPATH
+    exec "$MPM_PYTHON" -c 'import sys; from mpm.cli import main; raise SystemExit(main())' "$@"
+fi
+
+self="$0"
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case "$link" in
+        /*) self="$link" ;;
+        *) self=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)/"$link" ;;
+    esac
+done
+src=$(CDPATH= cd -- "$(dirname -- "$self")/../python" 2>/dev/null && pwd) || src=""
+if [ -n "$src" ] && [ -d "$src/mpm" ]; then
+    PYTHONPATH="$src"
+    export PYTHONPATH
+    exec "$MPM_PYTHON" -c 'import sys; from mpm.cli import main; raise SystemExit(main())' "$@"
+fi
+
+echo "[FAIL] mihomo-proxy-management: python package not found (expected $SYSTEM_PKG)" >&2
+exit 4

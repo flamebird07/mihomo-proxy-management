@@ -82,6 +82,33 @@ function Write-Section {
     Write-Host ('=== {0} ===' -f $Title) -ForegroundColor Cyan
 }
 
+function Get-ControllerSecret {
+    # controller 密钥只来自 subscription.env（本地机密文件，勿提交）。
+    # The controller secret comes only from subscription.env (local, secret).
+    $env = Read-EnvFile (Get-EnvPath)
+    $sec = if ($env['SECRET']) { ([string]$env['SECRET']).Trim() } else { '' }
+    return $sec
+}
+
+function Invoke-MihomoApi {
+    # 所有 controller 调用必须经过本函数：统一携带 Bearer 认证。
+    # 密钥缺失时抛错 fail-closed，绝不发起未认证请求（D16-1）。
+    # Every controller call goes through this function with the Bearer header.
+    # A missing secret is a hard error: no unauthenticated fallback exists.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Method = 'GET',
+        [int]$TimeoutSec = 5
+    )
+    if (-not $Path.StartsWith('/')) { $Path = '/' + $Path }
+    $secret = Get-ControllerSecret
+    if (-not $secret) {
+        throw 'controller secret (SECRET in subscription.env) is empty; refusing unauthenticated API call'
+    }
+    $headers = @{ Authorization = "Bearer $secret" }
+    return Invoke-RestMethod -Uri ("http://127.0.0.1:9090" + $Path) -Headers $headers -Method $Method -TimeoutSec $TimeoutSec
+}
+
 function Write-Ok   { param($m) Write-Host ('[OK] {0}'   -f $m) -ForegroundColor Green }
 function Write-Warn { param($m) Write-Host ('[WARN] {0}' -f $m) -ForegroundColor Yellow }
 function Write-Err  { param($m) Write-Host ('[ERR] {0}'  -f $m) -ForegroundColor Red }
@@ -108,7 +135,7 @@ function Test-EnvConfigured {
     $env = Read-EnvFile $Path
     if (-not $env.ContainsKey('SUBSCRIPTION_URL') -or
         [string]::IsNullOrWhiteSpace($env['SUBSCRIPTION_URL']) -or
-        $env['SUBSCRIPTION_URL'] -match 'example\.com') {
+        $env['SUBSCRIPTION_URL'] -match 'example\.(com|invalid)') {
         return $false
     }
     return $true
@@ -186,10 +213,12 @@ function Stop-Mihomo {
 }
 
 function Wait-MihomoReady {
+    # readiness 也必须走认证接口；未认证 200 不算就绪（默认 CAP 下 401）。
+    # Readiness uses the authenticated API as well.
     param([int]$TimeoutSec = 15)
     for ($i = 0; $i -lt $TimeoutSec; $i++) {
         try {
-            $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9090/version' -TimeoutSec 2
+            $r = Invoke-MihomoApi -Path '/version' -TimeoutSec 2
             if ($r) { return $true }
         } catch { }
         Start-Sleep -Seconds 1
@@ -199,7 +228,7 @@ function Wait-MihomoReady {
 
 function Get-MihomoVersion {
     try {
-        $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9090/version' -TimeoutSec 3
+        $r = Invoke-MihomoApi -Path '/version' -TimeoutSec 3
         return $r.version
     } catch { return $null }
 }
