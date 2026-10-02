@@ -45,7 +45,7 @@ Get-NetAdapter -ErrorAction SilentlyContinue |
 if ($procs.Count -gt 0) {
     Write-Section 'Proxies (subscription provider)'
     try {
-        $d = Invoke-RestMethod 'http://127.0.0.1:9090/providers/proxies' -TimeoutSec 5
+        $d = Invoke-MihomoApi -Path '/providers/proxies' -TimeoutSec 5
         $nodes = $d.providers.subscription.proxies
         Write-Host ("Total nodes: {0}" -f $nodes.Count)
         $nodes | Select-Object -First 10 `
@@ -60,7 +60,7 @@ if ($procs.Count -gt 0) {
 
     Write-Section 'Selected proxy groups'
     try {
-        $groups = Invoke-RestMethod 'http://127.0.0.1:9090/proxies' -TimeoutSec 5
+        $groups = Invoke-MihomoApi -Path '/proxies' -TimeoutSec 5
         $groups.proxies |
             Where-Object { $_.type -in 'Selector','URLTest' } |
             Select-Object name, type,

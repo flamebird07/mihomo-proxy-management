@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-convert_sub.py - Convert anytls/hysteria2/ss/trojan/tuic/vless subscription nodes to mihomo/Clash.Meta format.
+convert_sub.py - Convert subscription nodes (anytls / hysteria2) to mihomo/Clash.Meta format.
 
 Original anytls2mihomo upgraded for mihomo-proxy-management skill.
+
+Privacy rules (phase 3, D16):
+  - a subscription URL is a credential; it is NEVER echoed in full
+  - node server:port pairs are hidden unless --show-endpoints is passed,
+    and even then the hostname is masked (***.example.invalid)
+  - exception/error text is scrubbed of the URL and of token-like values
+  - documentation examples use example.invalid (RFC 2606) canaries only
 
 anytls 协议本质是 VLESS + TLS + TCP + client-fingerprint (TLS 指纹伪装)。
 hysteria2 是 QUIC 协议，直接支持。
@@ -34,9 +41,9 @@ mihomo / Clash.Meta 不识别 anytls 协议名，但支持 vless + tls + client-
   - 合并到现有 YAML 配置
 
 Usage:
-  python anytls2mihomo.py -u "https://example.com/sub?token=xxx" -o output.yaml
-  python anytls2mihomo.py -i subscription.txt -o proxies.yaml
-  python anytls2mihomo.py -u "https://..." --merge existing.yaml -o merged.yaml
+  python convert_sub.py -u "https://provider.example.invalid/sub?token=<redacted>" -o output.yaml
+  python convert_sub.py -i subscription.txt -o proxies.yaml
+  python convert_sub.py -u "https://provider.example.invalid/sub" --merge existing.yaml -o merged.yaml
 """
 
 from __future__ import annotations
@@ -53,6 +60,57 @@ try:
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
+
+
+# ---- redaction (D16: URL/endpoint must never leak through this tool) ------
+import re
+
+_SECRET_QUERY_RE = re.compile(r'(?i)([?&](?:token|key|password|passwd|secret|auth|type)=[^&\s]+)')
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)((?:password|passwd|secret|token|api[-_]?key|apikey|auth|uuid|pbk|psk|sid)\s*[:=]\s*)"
+    r"([^\s,;'\"]+)"
+)
+
+
+def redact_url(url: str) -> str:
+    """scheme://host only - never userinfo, never path, never query string."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or '').lower()
+        scheme = (parts.scheme or '').lower()
+    except ValueError:
+        return '<unparseable-url>'
+    if not scheme or not host:
+        return '<invalid-url>'
+    return f'{scheme}://{host}'
+
+
+def mask_host(server: str) -> str:
+    """Keep only the last two labels: node1.hk.provider.example -> ***.example"""
+    labels = (server or '').split('.')
+    if len(labels) <= 2:
+        return server
+    return '***.' + '.'.join(labels[-2:])
+
+
+def redact_endpoint(server: str, port) -> str:
+    return f'{mask_host(server)}:{port}'
+
+
+def scrub(text: str) -> str:
+    """Defence in depth for anything we are about to print."""
+    text = _SECRET_QUERY_RE.sub(lambda m: m.group(1).split('=')[0] + '=<redacted>', text or '')
+    text = _SECRET_ASSIGN_RE.sub(lambda m: m.group(1) + '<redacted>', text)
+    return text
+
+
+def safe_error(exc: BaseException, *secrets: str) -> str:
+    """Exception text with the subscription URL and token-like values removed."""
+    message = f'{type(exc).__name__}: {exc}'
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, redact_url(secret))
+    return scrub(message)
 
 
 def fetch_subscription(url: str, timeout: int = 30) -> str:
@@ -368,8 +426,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # From URL, output YAML
-  python convert_sub.py -u "https://example.com/sub?token=xxx" -o proxies.yaml
+  # From URL, output YAML (URL is never echoed; use an example.invalid canary when testing)
+  python convert_sub.py -u "https://provider.example.invalid/sub?token=<redacted>" -o proxies.yaml
   
   # From local file
   python convert_sub.py -i subscription.txt -o proxies.yaml
@@ -398,14 +456,22 @@ Examples:
                         help='Suffix to append to converted node names (default: none, use original names)')
     parser.add_argument('--timeout', type=int, default=30, help='HTTP timeout in seconds (default: 30)')
     parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode')
+    parser.add_argument('--show-endpoints', action='store_true',
+                        help='Opt in to (masked) server endpoints in listing/preview; '
+                             'off by default so node servers are never echoed')
     
     args = parser.parse_args()
     
     # Get subscription content
     if args.url:
         if not args.quiet:
-            print(f"Fetching subscription from: {args.url}", file=sys.stderr)
-        content = fetch_subscription(args.url, args.timeout)
+            # host only: the URL itself is a credential (D16)
+            print(f"Fetching subscription from: {redact_url(args.url)}", file=sys.stderr)
+        try:
+            content = fetch_subscription(args.url, args.timeout)
+        except Exception as exc:  # noqa: BLE001 - reported redacted
+            print(safe_error(exc, args.url), file=sys.stderr)
+            sys.exit(1)
     elif args.input:
         if not args.quiet:
             print(f"Reading from file: {args.input}", file=sys.stderr)
@@ -435,16 +501,23 @@ Examples:
             p['name'] = p['name'] + args.suffix
     
     if not args.quiet:
-        print(f"Converted {len(proxies)} anytls nodes to VLESS+TLS format", file=sys.stderr)
+        print(f"Converted {len(proxies)} nodes to mihomo format", file=sys.stderr)
         if not args.list:
             for p in proxies[:10]:
-                print(f"  - {p['name']} ({p['server']}:{p['port']})", file=sys.stderr)
+                line = f"  - {p['name']}"
+                if args.show_endpoints:
+                    line += f" ({redact_endpoint(p['server'], p['port'])})"
+                print(scrub(line), file=sys.stderr)
             if len(proxies) > 10:
                 print(f"  ... and {len(proxies)-10} more", file=sys.stderr)
     
     if args.list:
         for p in proxies:
-            print(f"[{p['type']}] {p['name']}  {p['server']}:{p['port']}  fp={p.get('client-fingerprint','?')}")
+            line = f"[{p['type']}] {p['name']}"
+            if args.show_endpoints:
+                line += f"  {redact_endpoint(p['server'], p['port'])}"
+                line += f"  fp={p.get('client-fingerprint','?')}"
+            print(scrub(line))
         return
     
     # Generate output

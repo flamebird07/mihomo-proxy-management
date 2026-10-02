@@ -64,13 +64,17 @@ try {
             Remove-Item $cache -Force
             Write-Warn '已删除本地缓存 / cache deleted'
         }
-        Invoke-WebRequest -Uri 'http://127.0.0.1:9090/providers/proxies/subscription' `
-            -Method PUT -UseBasicParsing -TimeoutSec 10 | Out-Null
+        Invoke-MihomoApi -Path '/providers/proxies/subscription' -Method PUT -TimeoutSec 10 | Out-Null
         Write-Ok '已触发软刷新（仅重载 provider，不重拉 url）/ soft refresh triggered'
     }
 } catch {
-    Write-Warn "controller 调用失败，请手动重启 mihomo / controller call failed: $($_.Exception.Message)"
-    & (Join-Path $PSScriptRoot 'restart.ps1')
+    # 失败必须非零退出；绝不为“掩盖失败”而自动重启（重启不会重拉订阅 URL，
+    # 需要重拉请显式使用 -Resubscribe）。
+    # Fail closed with a non-zero exit. We never auto-restart to paper over a
+    # failed refresh (a restart would not re-fetch the URL anyway; use
+    # -Resubscribe deliberately).
+    Write-Err "controller 刷新失败 / controller refresh failed: $($_.Exception.Message)"
+    exit 1
 }
 
 Start-Sleep -Seconds 5
@@ -78,7 +82,7 @@ Start-Sleep -Seconds 5
 if ($ShowYaml) {
     Write-Section 'Current nodes'
     try {
-        $d = Invoke-RestMethod 'http://127.0.0.1:9090/providers/proxies' -TimeoutSec 5
+        $d = Invoke-MihomoApi -Path '/providers/proxies' -TimeoutSec 5
         $d.providers.subscription.proxies | Select-Object -First 20 `
             @{n='Name';e={$_.name}}, type,
             @{n='Alive';e={$_.alive}},
