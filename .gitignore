@@ -45,6 +45,7 @@ install_dir/providers/*.yml
 # Linux side artifacts (staging roots, caches, build/test droppings).
 linux/.mpm-root/
 linux/**/__pycache__/
+**/__pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage

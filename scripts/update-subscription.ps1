@@ -1,94 +1,40 @@
-﻿# =====================================================================
-# update-subscription.ps1 - 强制立即拉取订阅
-# Force-refresh the subscription right now.
-# =====================================================================
-
 [CmdletBinding()]
 param(
-    [switch]$Resubscribe,    # 强制重新下载（忽略本地缓存）
-    [switch]$ShowYaml        # 拉取后打印节点概要
+    [Parameter(Mandatory = $true)]
+    [string]$EnvFile,
+    [Parameter(Mandatory = $true)]
+    [string]$Output,
+    [ValidateRange(1, 2147483647)]
+    [int]$MinNodes
 )
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'lib\common.ps1')
 
-$dir = Get-InstallDir
-$envPath = Get-EnvPath
-if (-not (Test-Path $envPath)) { throw "缺少 subscription.env，请先运行 install.ps1" }
-
-$env = Read-EnvFile $envPath
-$url = $env['SUBSCRIPTION_URL']
-if (-not $url) { throw "subscription.env 中 SUBSCRIPTION_URL 未设置" }
-
-Write-Section "Fetching subscription"
-# 只显示 host，不泄露完整 URL（含 token）
 try {
-    $hostOnly = ([uri]$url).Host
-    Write-Host "Provider: $hostOnly"
+    $python = @(Get-Command python -CommandType Application -ErrorAction Stop)[0].Source
 } catch {
-    Write-Host 'Provider: (无法解析 URL host)'
+    Write-Error 'Python is required; candidate output was not changed.' -ErrorAction Continue
+    exit 2
 }
 
-# mihomo 用 ua: clash-verge/2.0 之类的会被机场识别为 Clash 客户端，
-# 但 mihomo 默认 user-agent 是 clash-meta，多数机场会自动返回 YAML。
-# 这里覆写 ua 提高兼容性。
-$headers = @{ 'User-Agent' = 'clash.meta' }
-if ($env['SUBSCRIPTION_USER_AGENT']) {
-    $headers['User-Agent'] = $env['SUBSCRIPTION_USER_AGENT']
+$converter = Join-Path $PSScriptRoot 'convert_sub.py'
+$arguments = @($converter, '--sources-env-file', $EnvFile, '--output', $Output)
+if ($PSBoundParameters.ContainsKey('MinNodes')) {
+    $arguments += @('--min-nodes', [string]$MinNodes)
 }
 
-# mihomo 内置定时拉取会写入 ./providers/subscription.yaml；
-# 我们这里只是触发一次刷新（通过 controller API）
-Ensure-Admin
-if (-not (Get-MihomoProcess)) {
-    Write-Warn 'mihomo 未运行，先启动 / starting first'
-    & (Join-Path $PSScriptRoot 'start.ps1')
-}
-
-# 调用 controller 强制刷新（v1.19+ 支持）
+# Python owns atomic replacement and exit 5 means accepted output with partial source failure.
 try {
-    if ($Resubscribe) {
-        # 先删缓存，让 mihomo 重启后按当前 SUBSCRIPTION_URL 重新拉取
-        # mihomo 在运行时不主动重拉 url，只在启动时拉
-        $cache = Join-Path $dir 'providers\subscription.yaml'
-        if (Test-Path $cache) {
-            Remove-Item $cache -Force
-            Write-Warn '已删除本地缓存 / provider cache deleted'
-        }
-        Write-Warn '强重拉需要重启 mihomo / -Resubscribe forces restart'
-        & (Join-Path $PSScriptRoot 'restart.ps1')
-        return
-    } else {
-        # 软刷新：删缓存 + 重载 provider，触发新一轮 health-check
-        $cache = Join-Path $dir 'providers\subscription.yaml'
-        if (Test-Path $cache) {
-            Remove-Item $cache -Force
-            Write-Warn '已删除本地缓存 / cache deleted'
-        }
-        Invoke-MihomoApi -Path '/providers/proxies/subscription' -Method PUT -TimeoutSec 10 | Out-Null
-        Write-Ok '已触发软刷新（仅重载 provider，不重拉 url）/ soft refresh triggered'
-    }
+    & $python @arguments
+    $result = $LASTEXITCODE
 } catch {
-    # 失败必须非零退出；绝不为“掩盖失败”而自动重启（重启不会重拉订阅 URL，
-    # 需要重拉请显式使用 -Resubscribe）。
-    # Fail closed with a non-zero exit. We never auto-restart to paper over a
-    # failed refresh (a restart would not re-fetch the URL anyway; use
-    # -Resubscribe deliberately).
-    Write-Err "controller 刷新失败 / controller refresh failed: $($_.Exception.Message)"
-    exit 1
+    Write-Error 'Python could not run; candidate refresh was not completed.' -ErrorAction Continue
+    exit 2
 }
-
-Start-Sleep -Seconds 5
-
-if ($ShowYaml) {
-    Write-Section 'Current nodes'
-    try {
-        $d = Invoke-MihomoApi -Path '/providers/proxies' -TimeoutSec 5
-        $d.providers.subscription.proxies | Select-Object -First 20 `
-            @{n='Name';e={$_.name}}, type,
-            @{n='Alive';e={$_.alive}},
-            @{n='Delay(ms)';e={ if ($_.history) { $_.history[-1].delay } else { 0 } }} |
-            Format-Table -AutoSize
-    } catch {
-        Write-Warn "无法读取 /providers/proxies : $($_.Exception.Message)"
-    }
+if ($result -eq 0) {
+    Write-Host 'Candidate pool written; no service reload or connectivity test performed.'
+} elseif ($result -eq 5) {
+    Write-Warning 'Candidate pool written with source failures; no service reload performed.'
+} else {
+    Write-Warning 'Candidate refresh failed; existing output was not replaced.'
 }
+exit $result

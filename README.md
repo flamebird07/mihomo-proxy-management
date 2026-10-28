@@ -22,29 +22,130 @@ Debian 12, systemd - see `docs/LINUX.md`) are supported; other platforms are bes
 - 自动注册计划任务，开机自启 + 崩溃自动重启
 - TUN 模式透明代理，无需配置系统代理
 - 内置 `AUTO-FOREIGN` / `US-FAST` / `VIETNAM` / `GLOBAL` 智能分组
-- 订阅转换脚本 `convert_sub.py` 实际解析 **anytls / hysteria2**（anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint）；ss / trojan / vless / tuic 解析器尚未实现（见脚本内 TODO），请勿依赖
-- 转换脚本默认不回显订阅 URL 与节点 server:port（仅 `--show-endpoints` 时显示脱敏后的 `***.example`）
+- 订阅转换脚本 `scripts/convert_sub.py`：支持 ss / trojan / vless / tuic / **anytls** / **hysteria2**；AnyTLS 按 mihomo 原生 `type: anytls`（`password`/`sni`/`client-fingerprint`）原样保留，**不伪装成 vless**
 - `start / stop / restart / status / test / update-subscription / uninstall` 一套脚本
 
 ---
 
 ## 订阅转换 / Subscription Conversion
 
-订阅里 anytls 协议的节点 mihomo 不原生识别。仓库自带转换脚本 `scripts/convert_sub.py`，把 anytls 自动转为 mihomo 兼容的 VLESS+TLS+client-fingerprint 格式：
+`scripts/convert_sub.py` 把订阅转成 mihomo / Clash.Meta YAML。三类输入逐源自动识别：
+
+1. **Clash / mihomo YAML**（含 `proxies:` 的映射）——节点原字段透传，嵌套结构保持不变；
+2. **sing-box JSON**（顶层 `outbounds`）——映射 shadowsocks、trojan、vless、tuic、hysteria2、anytls；
+3. **base64 / 纯 URI 列表 / 单个分享链接**——复用原有 URI 解析器。
+
+sing-box 的 selector/urltest/direct/block/dns 只计入 `skipped_non_node`，不冒充代理节点；
+未知类型告警、计数并跳过。TLS/SNI/ALPN/uTLS/Reality、WS/gRPC、TUIC、Hysteria2 混淆和
+AnyTLS 会话参数按支持范围映射；不能忠实映射的选项（例如 detour、证书文件、未知 transport）
+按 `skipped_unsupported` 告警并跳过整节点，不静默降级为 TCP 或绕过 TLS。
+完整范围见 [架构说明](docs/ARCHITECTURE.md)。
+
+支持的 URI 协议：`anytls` / `ss` / `trojan` / `vless` / `tuic` / `hysteria2`（`hy2`）。
+AnyTLS **不再伪造成 vless**：`anytls://password@host:port` 输出为 mihomo 原生的
+`type: anytls` + `password`，并保留 `sni` / `client-fingerprint` / `alpn` /
+`skip-cert-verify` 等 TLS 参数（支持 percent-encoding 与 IPv6 字面量）。
+
+未知项处理（两者不同，勿混淆）：
+
+- **未知 URI 协议**（如 `vmess://`）：**始终**带「节点序号 + 白名单内协议类型」告警、计入
+  `skipped_unknown` 并**跳过**，不会保留；非白名单的类型文本不回显；
+- **Clash YAML 里的未知 `type`**：**默认原样保留**（透传），仅显式加 `--skip-unknown`
+  才丢弃；两种情况都会统计 `input / output / skipped`。
+
+输入健壮性：仅当输入是**纯 URI 列表**时才走 URI 回退；含 `://` 的畸形 Clash YAML
+**直接 fail closed**（不会把 YAML 内部 URL 当成节点）；URI 列表中非 URI 行会计数告警，
+不静默丢弃。
 
 ```bash
-# 从订阅链接转换，输出 proxy-provider YAML
-python scripts/convert_sub.py -u "<订阅链接>" -o providers/subscription.yaml
+# SUB_URL 预先从本机环境提供；不要把真实 URL 写进命令行或历史
+python scripts/convert_sub.py --url-env SUB_URL -o providers/subscription.yaml
 
-# 从本地 base64 订阅文件转换并列出节点
-python scripts/convert_sub.py -i subscription_raw.txt --list
+# 或从 stdin 读 URL
+echo "$SUB_URL" | python scripts/convert_sub.py --url-stdin -o providers/subscription.yaml
 
-# 合并进现有配置（按节点名去重）
-python scripts/convert_sub.py -u "<订阅链接>" --merge providers/subscription.yaml -o providers/subscription.yaml
+# 直接吃 Clash YAML（原字段透传）并列出节点
+python scripts/convert_sub.py -i clash_sub.yaml --list
+
+# 合并进现有配置（按除 name 外的完整字段去重，保留同名不同节点）
+python scripts/convert_sub.py -i raw.txt --merge providers/subscription.yaml -o providers/subscription.yaml
 ```
 
-实际支持协议: anytls / hysteria2 (hy2)。ss / trojan / vless / tuic 解析**未实现**。
-转换过程不会把订阅 URL（含 token）原样打印；出错信息同样脱敏。
+### 三源候选池（不自动上线）
+
+从 `config/subscription.env.example` 复制本地环境文件，私下填入 `SUBSCRIPTION_URL_1`、
+`SUBSCRIPTION_URL_2`、`SUBSCRIPTION_URL_3`；对应的 `SUBSCRIPTION_UA_1/2/3` 可分别设置，
+默认 `ClashMeta/1.18.0`。环境文件按 `KEY=VALUE` 读取，支持 UTF-8 BOM 和成对引号；
+不执行变量或命令展开，不剥离值中的 `#`、`=` 或 query。不要在值后写行内注释。
+
+以下是后续授权后的使用方式，本阶段测试不访问真实订阅：
+
+```powershell
+# 输出目录须已存在，先选择不在运行中的候选文件，勿直接覆盖生产缓存
+.\scripts\update-subscription.ps1 -EnvFile .\subscription.env -Output .\providers\candidate.yaml -MinNodes 20
+```
+
+```bash
+# 等价 Python 入口；三源变量已由本机环境提供，无需读取环境文件
+python scripts/convert_sub.py --sources-env -o providers/candidate.yaml --min-nodes 20
+# 或指定本地环境文件
+python scripts/convert_sub.py --sources-env-file subscription.env -o providers/candidate.yaml
+```
+
+- 三个槽位独立抓取、识别和统计；缺失/空结果/失败的来源不借用旧缓存，不阻断其他来源。
+- 合并按除 `name` 外的完整字段规范化比较，包含协议、端点、认证、TLS 和传输；字段键顺序不影响比较。
+  完全相同的配置只保留第一份；同名不同配置保留并按源顺序命名为 `名称 [2]` 等，避开已有名称。
+  不臆测不同格式中“省略默认值”与“显式默认值”等价，以免误删候选；可能保留行为等价的节点。
+- `MIN_CANDIDATE_NODES` 默认 **1**，是保守的防空池门槛，不代表足够多；应按历史候选规模提高。
+  `--min-nodes` / `-MinNodes` 优先，必须为正整数；门槛在新抓取结果去重后检查，旧 `--merge` 节点不能凑数。
+- 每源日志含 format/input/output、各 skipped 分类与 failed，另报 merged/duplicates/failed_sources；
+  output 是源转换后、全局去重前的数量。解析失败无法计算 input 时记 0 且 failed=1。
+- 退出码 **0**：所有来源产生候选且满足门槛；**5**：部分来源失败，但成功来源达标且已原子写出
+  （`--list` 只预览、不写出）；**1**：空池/低于门槛；**2**：参数或依赖问题；**3**：解析/输出失败；
+  **4**：单源网络失败。三源全失败最终为 1；多源警告与统计不受 `--quiet` 抑制。不能把 5 当全成功。
+- `update-subscription.ps1` 现在只调用转换器并透传退出码；旧 `-Resubscribe` / `-ShowYaml` 参数已移除。
+  不再请求 controller、删除缓存、提权、启动、重载或重启 mihomo。
+- 旧安装模板仍是单源 HTTP provider，**不会自动使用候选池**；不要直接覆盖其自动刷新的缓存。
+
+### 动态多目标健康池
+
+候选数量不是固定值。使用独立 Mihomo 实例对每个节点逐目标检测，只有同时通过基础连通性、
+ChatGPT 和 muse.ai 的节点才写入新 provider；输出采用原子替换。美国节点数量可以随订阅和健康状态
+增减，`--minimum-matching 1` 保证本轮至少存在一条美国健康节点，否则保留上一版文件、不覆盖生产池。
+
+```powershell
+python .\scripts\health-check-provider.py `
+  --candidate C:\mihomo\providers\three-sources-candidate.yaml `
+  --output C:\mihomo\providers\three-sources-all-targets.yaml `
+  --target https://www.gstatic.com/generate_204 `
+  --target https://chatgpt.com/cdn-cgi/trace `
+  --target https://muse.ai/ `
+  --minimum-matching 1
+```
+
+生产 `US-FAST` 使用 file provider 的 `use` 和美国名称过滤器读取上述健康池，不在配置中固定写死
+节点数量；ChatGPT 与 `muse.ai` 的规则均指向 `US-FAST`。控制器 delay 通过后仍应做真实 HTTPS 请求复核。
+  接入本地 file provider、离线核心校验和真实健康检查需独立授权，见架构说明。
+
+这里的“候选”仅表示完成格式转换和结构检查；未经过目标 mihomo 二进制校验，更不代表已联网可用。
+AnyTLS 需原生支持它的核心版本；未知 YAML 类型仍透传，目标核心可能不接受，必须上线前校验。
+
+安全与健壮性：
+
+- 日志与 `--list` 不打印 URL、路径、节点原名、server 或认证字段，只用序号、白名单协议与计数；
+  HTTP/URL 异常仅回显 **固定分类 / HTTP 数字状态 / 异常类型**，不回显上游 reason 或原始端口。
+  单源不带 `-o` 时标准输出是完整 YAML **产物**而不是安全日志，含认证信息，不要录入日志或提交；
+  三源模式要求 `-o` 或 `--list`，避免意外把凭据产物打到终端。
+- 默认 UA 为 `ClashMeta/1.18.0`，可用 `--user-agent` 或环境变量 `CONVERT_SUB_UA` 覆盖。
+- **PyYAML 为硬依赖**，缺失时直接报错退出（fail closed），不会手工拼接脆弱 YAML。
+- 空输出 / 畸形 YAML / 无效顶层会给出明确诊断；`--list` 空结果同样非零退出；处理失败
+  **不会覆盖已有输出文件**（原子写入）。
+
+测试：
+
+```bash
+python -m unittest discover -s tests -p test_*.py
+```
 
 ---
 
@@ -86,7 +187,7 @@ Run scripts as Administrator. Paths are relative to the repo root.
 | `.\scripts\restart.ps1`           | 重启 |
 | `.\scripts\status.ps1`            | 状态总览（进程 / 端口 / TUN / 节点 / 选组） |
 | `.\scripts\test.ps1`              | 连通性测试（直连 + 走 7890 代理） |
-| `.\scripts\update-subscription.ps1` | 立即刷新订阅（`-Resubscribe` 强重拉，`-ShowYaml` 显示节点） |
+| `.\scripts\update-subscription.ps1` | 三源候选生成（必填 `-EnvFile` / `-Output`，可选 `-MinNodes`；不重载服务） |
 | `.\scripts\uninstall.ps1`         | 卸载（`-Purge` 顺带清目录） |
 
 ---
@@ -137,7 +238,8 @@ mihomo-proxy-management/
 │   └── subscription.env.example   # 配置示例（不含凭证）
 ├── docs/
 │   ├── ARCHITECTURE.md            # 详细架构 / 故障排查（Windows）
-│   └── LINUX.md                   # Linux 系统部署：支持矩阵 / 降级 / 供应链 / 生命周期
+│   ├── LINUX.md                   # Linux 系统部署：支持矩阵 / 降级 / 供应链 / 生命周期
+│   └── hermes-mihomo-SKILL.md     # Hermes 技能修正稿（脱敏）
 ├── linux/                         # Linux 实现（唯一生命周期逻辑 = python/mpm）
 │   ├── bin/mihomo-proxy-management    # 薄入口 wrapper（无业务逻辑）
 │   ├── python/mpm/                 # CLI + 生命周期引擎
@@ -146,8 +248,9 @@ mihomo-proxy-management/
 │   └── tests/                      # 免主机测试（run_tests.py）
 ├── providers/
 │   └── .gitkeep
-└── scripts/
+├── scripts/
     ├── lib/common.ps1             # 共享函数
+    ├── convert_sub.py             # 三源候选转换（YAML / sing-box JSON / base64 / URI）
     ├── install.ps1                # 一键安装
     ├── start.ps1
     ├── stop.ps1
@@ -156,6 +259,8 @@ mihomo-proxy-management/
     ├── test.ps1
     ├── update-subscription.ps1
     └── uninstall.ps1
+└── tests/
+    └── test_convert_sub.py        # convert_sub.py 单元测试
 ```
 
 ---
