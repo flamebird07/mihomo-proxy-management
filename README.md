@@ -125,6 +125,9 @@ python .\scripts\health-check-provider.py `
 
 生产 `US-FAST` 使用 file provider 的 `use` 和美国名称过滤器读取上述健康池，不在配置中固定写死
 节点数量；ChatGPT 与 `muse.ai` 的规则均指向 `US-FAST`。控制器 delay 通过后仍应做真实 HTTPS 请求复核。
+
+Windows 生产环境可运行 `scripts/refresh-production.ps1` 串联三源更新、三目标健康交集、热加载、
+分组选择恢复及应用层复核；任一步失败都会保留或恢复上一版健康 provider。
   接入本地 file provider、离线核心校验和真实健康检查需独立授权，见架构说明。
 
 这里的“候选”仅表示完成格式转换和结构检查；未经过目标 mihomo 二进制校验，更不代表已联网可用。
