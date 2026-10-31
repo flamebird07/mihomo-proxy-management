@@ -29,7 +29,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import contextlib
 import json
+import os
 import re
 import shutil
 import socket
@@ -1045,10 +1047,14 @@ def pick_ports(mixed_port: int, controller_port: int) -> tuple[int, int]:
     raise SyncError("no_free_port")
 
 
-DEFAULT_IPINFO_URL = "https://ipinfo.io/json"
-# Per-node ipinfo budget: keep full sync well under ~30 minutes with 84 nodes.
+# Per-node geo via isolated mixed-port (mode=rule + TEST select). Never use live :7890.
 IPINFO_TIMEOUT_S = 5.0
 IPINFO_TOTAL_BUDGET_S = 600.0  # 10 minutes hard cap for the region pass
+GEO_ENDPOINTS = (
+    "https://api.ip.sb/geoip",
+    "https://ipapi.co/json/",
+    "https://ipinfo.io/json",
+)
 
 
 def select_proxy(api: str, group: str, name: str, token: str | None = None) -> bool:
@@ -1071,35 +1077,158 @@ def select_proxy(api: str, group: str, name: str, token: str | None = None) -> b
         return False
 
 
-def format_ipinfo(payload: dict) -> str:
-    """Store country/region/city from ipinfo.io/json as CC/Region/City."""
-    country = str(payload.get("country") or "").strip()
-    region = str(payload.get("region") or "").strip()
+def _mixed_opener(mixed_port: int) -> urllib.request.OpenerDirector:
+    """Force HTTP(S) through isolated mixed-port; ignore process HTTP(S)_PROXY env (:7890)."""
+    proxy = f"http://127.0.0.1:{mixed_port}"
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+    )
+
+
+@contextlib.contextmanager
+def _force_proxy_env():
+    """urllib ProxyHandler still honors NO_PROXY/no_proxy (*=bypass). Clear while forcing mixed-port."""
+    keys = (
+        "NO_PROXY", "no_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    )
+    saved = {k: os.environ.pop(k, None) for k in keys}
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def format_geo_payload(payload: dict) -> str:
+    """Normalize api.ip.sb / ipapi.co / ipinfo.io JSON to CC/Region/City."""
+    country = str(
+        payload.get("country_code")
+        or payload.get("countryCode")
+        or payload.get("country")
+        or ""
+    ).strip()
+    if len(country) > 3:
+        country = str(
+            payload.get("country_code") or payload.get("countryCode") or country[:2]
+        ).strip()
+    region = str(
+        payload.get("region")
+        or payload.get("region_name")
+        or payload.get("regionName")
+        or ""
+    ).strip()
     city = str(payload.get("city") or "").strip()
     parts = [part for part in (country, region, city) if part]
     return "/".join(parts) if parts else ""
 
 
-def fetch_ipinfo_via_mixed(mixed_port: int, timeout_s: float = IPINFO_TIMEOUT_S) -> str:
-    """HTTP GET ipinfo through an isolated mixed-port (already selected node)."""
-    proxy = f"http://127.0.0.1:{mixed_port}"
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-    )
-    req = urllib.request.Request(
-        DEFAULT_IPINFO_URL,
-        headers={"User-Agent": "mihomo-feishu-sync/ipinfo", "Accept": "application/json"},
-    )
-    try:
-        with opener.open(req, timeout=timeout_s) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            return "未知"
-        text = format_ipinfo(payload)
-        return text or "未知"
-    except Exception:
-        return "未知"
+def format_cf_trace(text: str) -> str:
+    """Parse cloudflare cdn-cgi/trace (loc=CC, ip=...)."""
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            fields[key.strip()] = val.strip()
+    loc = fields.get("loc") or ""
+    ip = fields.get("ip") or ""
+    if loc and ip:
+        return f"{loc}/{ip}"
+    return loc or ip or ""
+
+
+def fetch_geo_via_mixed(mixed_port: int, timeout_s: float = IPINFO_TIMEOUT_S) -> str:
+    """GET geo JSON/trace through isolated mixed-port for the currently selected leaf."""
+    opener = _mixed_opener(mixed_port)
+    headers = {"User-Agent": "mihomo-feishu-sync/geo", "Accept": "application/json"}
+    with _force_proxy_env():
+        for url in GEO_ENDPOINTS:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with opener.open(req, timeout=timeout_s) as resp:
+                    raw = resp.read().decode("utf-8", "replace")
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    text = format_geo_payload(payload)
+                    if text:
+                        return text
+            except Exception:
+                continue
+        try:
+            req = urllib.request.Request(
+                "https://cloudflare.com/cdn-cgi/trace",
+                headers={"User-Agent": "mihomo-feishu-sync/geo"},
+            )
+            with opener.open(req, timeout=timeout_s) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            text = format_cf_trace(raw)
+            if text:
+                return text
+        except Exception:
+            pass
+    return "未知"
+
+
+def probe_direct_geo(timeout_s: float = IPINFO_TIMEOUT_S) -> str:
+    """Best-effort geo of THIS host without any proxy (fingerprint for bind-fail detection)."""
+    headers = {"User-Agent": "mihomo-feishu-sync/geo-direct", "Accept": "application/json"}
+    # Must NOT use mixed opener — intentional direct path.
+    for url in GEO_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+            if isinstance(payload, dict):
+                text = format_geo_payload(payload)
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+def validate_region_diversity(
+    regions: dict[str, str],
+    names: list[str],
+    log: "Logger",
+    direct_geo: str = "",
+) -> dict[str, str]:
+    """Blank to 未知 when bind failed: all identical, or matches host DIRECT egress."""
+    # Strip any leaf that merely echoed the machine's own egress.
+    if direct_geo:
+        stripped = 0
+        for name in list(regions):
+            if regions.get(name) == direct_geo:
+                regions[name] = "未知"
+                stripped += 1
+        if stripped:
+            log.warn(
+                f"ipinfo direct_egress_stripped count={stripped} direct={direct_geo} "
+                f"— those leaves matched host WAN, not proxy"
+            )
+    real = [regions.get(n) or "未知" for n in names]
+    real = [v for v in real if v and v != "未知"]
+    if len(real) < 2:
+        if real and direct_geo and real[0] == direct_geo:
+            log.error(
+                f"ipinfo diversity_fail direct_only={direct_geo} — blanking to 未知"
+            )
+            return {name: "未知" for name in names}
+        return regions
+    unique = set(real)
+    if len(unique) == 1:
+        only = next(iter(unique))
+        log.error(
+            f"ipinfo diversity_fail identical={only} count={len(real)} "
+            f"— egress not per-leaf; blanking to 未知"
+        )
+        return {name: "未知" for name in names}
+    log.info(f"ipinfo diversity_ok unique={len(unique)} sample={sorted(unique)[:6]}")
+    return regions
 
 
 def lookup_regions_isolated(
@@ -1110,29 +1239,47 @@ def lookup_regions_isolated(
     timeout_s: float = IPINFO_TIMEOUT_S,
     budget_s: float = IPINFO_TOTAL_BUDGET_S,
 ) -> dict[str, str]:
-    """Sequential: select TEST → ipinfo.json via mixed port. No live group switches."""
+    """Sequential: PUT TEST to leaf (mode=rule) -> geo via that mixed-port. No live switches."""
     regions: dict[str, str] = {}
     started = time.monotonic()
     ok = 0
+    direct_geo = probe_direct_geo(timeout_s=timeout_s)
+    if direct_geo:
+        log.info(f"ipinfo direct_fingerprint={direct_geo}")
+    else:
+        log.warn("ipinfo direct_fingerprint unavailable")
     for index, name in enumerate(names, 1):
         if time.monotonic() - started > budget_s:
             log.warn(
                 f"ipinfo budget_exhausted tried={index - 1} ok={ok} remain={len(names) - index + 1}"
             )
-            for rest in names[index - 1:]:
+            for rest in names[index - 1 :]:
                 regions.setdefault(rest, "未知")
             break
         if not select_proxy(api, "TEST", name):
             regions[name] = "未知"
             continue
-        value = fetch_ipinfo_via_mixed(mixed_port, timeout_s=timeout_s)
+        try:
+            with urllib.request.urlopen(
+                f"{api}/proxies/{urllib.parse.quote('TEST', safe='')}", timeout=3
+            ) as resp:
+                now = json.loads(resp.read().decode("utf-8", "replace")).get("now")
+            if now != name:
+                log.warn(f"ipinfo select_mismatch want={name} now={now}")
+                regions[name] = "未知"
+                continue
+        except Exception:
+            regions[name] = "未知"
+            continue
+        value = fetch_geo_via_mixed(mixed_port, timeout_s=timeout_s)
         regions[name] = value
         if value and value != "未知":
             ok += 1
         if index % 20 == 0 or index == len(names):
             log.info(f"ipinfo progress={index}/{len(names)} ok={ok}")
     log.info(f"ipinfo done tested={len(regions)} ok={ok}")
-    return regions
+    return validate_region_diversity(regions, names, log, direct_geo=direct_geo)
+
 
 
 def request_delay(api: str, name: str, target: str, timeout_ms: int,
@@ -1158,14 +1305,15 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
     mixed, controller = pick_ports(mixed_port, controller_port)
     runtime = Path(tempfile.mkdtemp(prefix="mihomo-feishu-"))
     api = f"http://127.0.0.1:{controller}"
+    # mode=rule required: global ignores MATCH,TEST; mixed would follow GLOBAL.
     config = {
         "mixed-port": mixed,
         "allow-lan": False,
-        "mode": "global",
+        "mode": "rule",
         "log-level": "warning",
         "ipv6": False,
         "external-controller": f"127.0.0.1:{controller}",
-        "dns": {"enable": False},
+        "dns": {"enable": True, "enhanced-mode": "redir-host", "nameserver": ["8.8.8.8", "1.1.1.1"]},
         "tun": {"enable": False},
         "proxies": proxies,
         "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
