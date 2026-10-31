@@ -33,6 +33,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -71,6 +72,7 @@ DEFAULT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
 DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
+DEFAULT_LOCK_FILE = r"C:\mihomo\feishu-bitable-sync.lock"
 PAGE_PROBE_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -387,6 +389,281 @@ class SyncError(Exception):
         super().__init__(kind)
         self.kind = kind
         self.detail = detail
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+#
+# Windows: a named kernel mutex (Local\mihomo-feishu-bitable-sync) provides the
+# real mutual exclusion, so a crashed holder is taken over via WAIT_ABANDONED
+# with no stale-unlink race. The lock FILE is metadata only (pid/ts/token) and
+# is written after the mutex is held, so stale metadata is simply overwritten.
+#
+# POSIX: the lock file itself is the mutex (O_CREAT|O_EXCL) plus stale-pid
+# takeover, as before.
+
+SYNC_MUTEX_NAME = r"Local\mihomo-feishu-bitable-sync"
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_ACCESS_DENIED = 5
+ERROR_ALREADY_EXISTS = 183
+WAIT_OBJECT_0 = 0x00000000
+WAIT_ABANDONED = 0x00000080
+WAIT_TIMEOUT = 0x00000102
+
+_KERNEL32: Any = None
+
+
+def _kernel32() -> Any:
+    """Load kernel32 once with explicit signatures (no pointer truncation)."""
+    global _KERNEL32
+    if _KERNEL32 is None:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        k32.ReleaseMutex.restype = wintypes.BOOL
+        _KERNEL32 = k32
+    return _KERNEL32
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        k32 = _kernel32()
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if handle:
+            k32.CloseHandle(handle)
+            return True
+        # OpenProcess can fail for a live process we may not fully query
+        # (e.g. another user / elevated). ACCESS_DENIED means "still alive".
+        err = ctypes.get_last_error()
+        return err == ERROR_ACCESS_DENIED
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_meta(path: str) -> tuple[int, str, str]:
+    """Return (pid, ts, token) from the lock file; zeros/empty on failure."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0, "", ""
+    pid = 0
+    ts = ""
+    token = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("pid="):
+            try:
+                pid = int(line[4:].strip())
+            except ValueError:
+                pid = 0
+        elif line.startswith("ts="):
+            ts = line[3:].strip()
+        elif line.startswith("token="):
+            token = line[6:].strip()
+    return pid, ts, token
+
+
+class SyncLock:
+    """Single-instance lock with explicit, token-checked ownership.
+
+    ``release()`` is a no-op unless THIS object actually acquired the lock, and
+    it never unlinks a lock file that carries another process's token.
+    """
+
+    def __init__(self, path: str, log: "Logger") -> None:
+        self.path = str(path)
+        self.log = log
+        self.pid = os.getpid()
+        self.token = secrets.token_hex(8)
+        self.fd: int | None = None      # POSIX: lock file fd
+        self.mutex: int | None = None   # Windows: named mutex handle
+        self.held = False
+
+    # -- helpers ---------------------------------------------------------
+    def _payload(self) -> bytes:
+        return (
+            f"pid={self.pid}\n"
+            f"ts={dt.datetime.now().isoformat(timespec='seconds')}\n"
+            f"token={self.token}\n"
+        ).encode("utf-8")
+
+    def _ensure_dir(self) -> None:
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SyncError("lock_busy", "lock_dir_unavailable") from exc
+
+    def _write_meta(self) -> None:
+        try:
+            with open(self.path, "wb") as handle:
+                handle.write(self._payload())
+        except OSError:
+            # Metadata is advisory; the mutex/file still protects us.
+            self.log.warn(f"lock metadata write failed path={self.path}")
+
+    # -- acquire ---------------------------------------------------------
+    def acquire(self) -> "SyncLock":
+        self._ensure_dir()
+        if sys.platform == "win32":
+            self._acquire_mutex()
+        else:
+            self._acquire_file()
+        self.held = True
+        self.log.info(f"lock acquired path={self.path} pid={self.pid}")
+        return self
+
+    def _acquire_mutex(self) -> None:
+        import ctypes
+
+        k32 = _kernel32()
+        handle = k32.CreateMutexW(None, True, SYNC_MUTEX_NAME)
+        if not handle:
+            err = ctypes.get_last_error()
+            self.log.error(f"lock busy path={self.path} reason=mutex_create_failed err={err}")
+            raise SyncError("lock_busy", f"mutex_create_failed err={err}")
+
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            # Another instance owns (or owned) the mutex. bInitialOwner is
+            # ignored for an existing object, so poll for ownership.
+            rc = k32.WaitForSingleObject(handle, 0)
+            if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
+                k32.CloseHandle(handle)
+                reason = "mutex_timeout" if rc == WAIT_TIMEOUT else f"mutex_wait_failed rc={rc}"
+                self.log.error(f"lock busy path={self.path} reason={reason}")
+                raise SyncError("lock_busy", reason)
+            if rc == WAIT_ABANDONED:
+                self.log.warn(f"lock takeover path={self.path} reason=abandoned_mutex")
+
+        self.mutex = int(handle)
+        old_pid, old_ts, _old_token = _read_lock_meta(self.path)
+        if old_pid and old_pid != self.pid:
+            # Mutex already serializes writers, so stale metadata is safe to
+            # overwrite here (no unlink/recreate race).
+            self.log.warn(
+                f"lock stale metadata overwritten path={self.path} "
+                f"old_pid={old_pid} old_ts={old_ts or '?'}"
+            )
+        self._write_meta()
+
+    def _acquire_file(self) -> None:
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        for _attempt in range(2):
+            try:
+                fd = os.open(self.path, flags)
+            except FileExistsError:
+                holder_pid, holder_ts, _token = _read_lock_meta(self.path)
+                if holder_pid and _pid_alive(holder_pid):
+                    self.log.error(
+                        f"lock busy path={self.path} holder_pid={holder_pid} "
+                        f"holder_ts={holder_ts or '?'}"
+                    )
+                    raise SyncError("lock_busy", f"holder_pid={holder_pid}")
+                self.log.warn(
+                    f"lock stale takeover path={self.path} dead_pid={holder_pid or 0} "
+                    f"holder_ts={holder_ts or '?'}"
+                )
+                try:
+                    os.unlink(self.path)
+                except OSError as exc:
+                    raise SyncError("lock_busy", "stale_unlink_failed") from exc
+                continue
+            except OSError as exc:
+                raise SyncError("lock_busy", f"lock_open_failed:{exc.errno}") from exc
+            try:
+                os.write(fd, self._payload())
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.unlink(self.path)
+                raise SyncError("lock_busy", "lock_write_failed") from None
+            self.fd = fd
+            return
+        raise SyncError("lock_busy", "reacquire_failed")
+
+    # -- release ---------------------------------------------------------
+    def release(self) -> None:
+        if self.fd is None and self.mutex is None:
+            # Never acquired, or already released: touch nothing on disk.
+            self.log.info(f"lock release skipped (not owner) path={self.path}")
+            self.held = False
+            return
+
+        if self.fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+            self.fd = None
+
+        # Unlink only while we still own the mutex and only if the file still
+        # carries OUR token (or our pid when the token is missing).
+        try:
+            if Path(self.path).exists():
+                owner_pid, _ts, owner_token = _read_lock_meta(self.path)
+                mine = (owner_token and owner_token == self.token) or (
+                    not owner_token and owner_pid == self.pid
+                )
+                if mine:
+                    os.unlink(self.path)
+                    self.log.info(f"lock released path={self.path} pid={self.pid}")
+                else:
+                    self.log.warn(
+                        f"lock release skipped (not owner) path={self.path} "
+                        f"owner_pid={owner_pid or 0}"
+                    )
+        except OSError:
+            self.log.warn(f"lock release failed path={self.path}")
+        finally:
+            self._release_mutex()
+            self.held = False
+
+    def _release_mutex(self) -> None:
+        if self.mutex is None:
+            return
+        handle, self.mutex = self.mutex, None
+        k32 = _kernel32()
+        try:
+            k32.ReleaseMutex(handle)
+        finally:
+            k32.CloseHandle(handle)
+
+
+def acquire_sync_lock(path: str, log: "Logger") -> SyncLock:
+    """Acquire the single-instance lock; raise SyncError(lock_busy) if held."""
+    return SyncLock(path, log).acquire()
+
+
+def release_sync_lock(lock: SyncLock | None, log: "Logger") -> None:
+    """Release only if *lock* owns it; safe to call after a failed acquire."""
+    if lock is None:
+        log.info("lock release skipped (not owner)")
+        return
+    lock.release()
+
 
 
 # ---------------------------------------------------------------------------
@@ -1682,16 +1959,24 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
 
 def replace_records(client: FeishuClient, table_id: str, records: list[dict],
                     log: Logger) -> int:
+    """Create new rows first, then delete old ones — never leave the table empty.
+
+    An empty *records* payload with existing rows is refused so a bad run cannot
+    wipe production tables.
+    """
     existing = client.list_records(table_id)
     ids = [r.get("record_id") for r in existing if r.get("record_id")]
+    if not records:
+        if ids:
+            log.warn(f"records replace refused empty_payload keep_old={len(ids)}")
+            return 0
+        log.info("records created=0")
+        return 0
+    created = client.batch_create(table_id, records)
+    log.info(f"records created={created}")
     if ids:
         deleted = client.batch_delete(table_id, ids)
         log.info(f"records deleted={deleted}")
-    if records:
-        created = client.batch_create(table_id, records)
-        log.info(f"records created={created}")
-    else:
-        created = 0
     return created
 
 
@@ -1719,8 +2004,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY)
     parser.add_argument("--source1-cache", action="append", default=None,
                         help="Candidate YAML used when source 1 fails (repeatable)")
-    parser.add_argument("--limit", type=int, default=0, help="Test at most N nodes (0 = all)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Test at most N nodes (0 = all); dry-run only — forbidden with production writes")
     parser.add_argument("--dry-run", action="store_true", help="Collect and test only; never write")
+    parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
+                        help="Single-instance lock file (metadata: pid+ts+token)")
     parser.add_argument("--ensure-tables", action="store_true", help="Only create/repair tables")
     parser.add_argument("--no-speedtest", action="store_true")
     parser.add_argument("--keep-placeholder", action="store_true")
@@ -1750,14 +2038,28 @@ def main(argv: list[str] | None = None) -> int:
     log = Logger(args.log_file, verbose=args.verbose)
     log.info("sync start")
 
+    if args.limit and not args.dry_run:
+        log.error("limit_write_forbidden: --limit cannot write production (use --dry-run)")
+        print("ERROR	limit_write_forbidden")
+        return 2
+
     tables = load_state(args.state_file).get("tables") or {}
     results: list[SourceResult] = []
     node_rows = 0
     region_rows = 0
     error = ""
     sync_ms = int(time.time() * 1000)
+    lock = SyncLock(args.lock_file, log)
 
     try:
+        try:
+            lock.acquire()
+        except SyncError as exc:
+            error = exc.kind
+            log.error(f"sync failed class={exc.kind} detail={exc.detail}")
+            print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
+            return 1
+
         env = read_env_file(args.env_file)
         app_id = (env.get("FEISHU_APP_ID") or "").strip()
         app_secret = (env.get("FEISHU_APP_SECRET") or "").strip()
@@ -2017,6 +2319,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # pragma: no cover - defensive
         error = type(exc).__name__.lower()
         log.error(f"sync failed class={error}")
+    finally:
+        release_sync_lock(lock, log)
 
     print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
     return 1
