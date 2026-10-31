@@ -119,7 +119,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("节点名", FT_TEXT, None),
             ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
             ("协议", FT_TEXT, None),
-            # Free-form from ipinfo.io/json via that node: "CC/Region/City" or "未知".
+            # Free-form from ipinfo.io/json via that node: 中文 国家/地区/城市 or "未知".
             ("实际地区", FT_TEXT, None),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("存活", FT_CHECKBOX, None),
@@ -174,6 +174,137 @@ DE_PATTERN = re.compile(
     r"德国|德國|germany|frankfurt|berlin|🇩🇪|\bDE\b|\bDEU\b",
     re.IGNORECASE,
 )
+
+# --- 实际地区 中文标注 -------------------------------------------------------
+# ISO2 (upper) -> 中文. Unknown codes keep the raw spelling.
+COUNTRY_ZH: dict[str, str] = {
+    "US": "美国", "TW": "台湾", "HK": "香港", "MO": "澳门", "CN": "中国",
+    "JP": "日本", "KR": "韩国", "SG": "新加坡", "MY": "马来西亚",
+    "TH": "泰国", "VN": "越南", "PH": "菲律宾", "ID": "印度尼西亚",
+    "IN": "印度", "PK": "巴基斯坦", "BD": "孟加拉国", "KH": "柬埔寨",
+    "LA": "老挝", "MM": "缅甸", "NP": "尼泊尔", "LK": "斯里兰卡",
+    "MN": "蒙古", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
+    "DE": "德国", "GB": "英国", "UK": "英国", "IE": "爱尔兰",
+    "FR": "法国", "NL": "荷兰", "BE": "比利时", "LU": "卢森堡",
+    "CH": "瑞士", "AT": "奥地利", "IT": "意大利", "ES": "西班牙",
+    "PT": "葡萄牙", "SE": "瑞典", "NO": "挪威", "DK": "丹麦",
+    "FI": "芬兰", "IS": "冰岛", "PL": "波兰", "CZ": "捷克",
+    "SK": "斯洛伐克", "HU": "匈牙利", "RO": "罗马尼亚", "BG": "保加利亚",
+    "GR": "希腊", "HR": "克罗地亚", "SI": "斯洛文尼亚", "RS": "塞尔维亚",
+    "LT": "立陶宛", "LV": "拉脱维亚", "EE": "爱沙尼亚", "UA": "乌克兰",
+    "BY": "白俄罗斯", "MD": "摩尔多瓦", "CY": "塞浦路斯", "MT": "马耳他",
+    "RU": "俄罗斯", "TR": "土耳其", "IL": "以色列", "AE": "阿联酋",
+    "SA": "沙特阿拉伯", "QA": "卡塔尔", "KW": "科威特", "EG": "埃及",
+    "ZA": "南非", "NG": "尼日利亚", "KE": "肯尼亚",
+    "CA": "加拿大", "MX": "墨西哥", "BR": "巴西", "AR": "阿根廷",
+    "CL": "智利", "CO": "哥伦比亚", "PE": "秘鲁", "UY": "乌拉圭",
+    "EC": "厄瓜多尔", "VE": "委内瑞拉", "PA": "巴拿马", "CR": "哥斯达黎加",
+    "AU": "澳大利亚", "NZ": "新西兰", "GU": "关岛", "PR": "波多黎各",
+    "FJ": "斐济", "AM": "亚美尼亚", "GE": "格鲁吉亚", "AZ": "阿塞拜疆",
+}
+
+# Full English country names (lower-case) -> 中文, for payloads without an ISO code.
+COUNTRY_NAME_ZH: dict[str, str] = {
+    "united states": "美国", "united states of america": "美国", "usa": "美国",
+    "taiwan": "台湾", "hong kong": "香港", "macau": "澳门", "macao": "澳门",
+    "china": "中国", "japan": "日本", "south korea": "韩国",
+    "korea, republic of": "韩国", "republic of korea": "韩国",
+    "singapore": "新加坡", "malaysia": "马来西亚", "thailand": "泰国",
+    "vietnam": "越南", "viet nam": "越南", "philippines": "菲律宾",
+    "indonesia": "印度尼西亚", "india": "印度", "pakistan": "巴基斯坦",
+    "germany": "德国", "united kingdom": "英国", "great britain": "英国",
+    "ireland": "爱尔兰", "france": "法国", "netherlands": "荷兰",
+    "the netherlands": "荷兰", "belgium": "比利时", "luxembourg": "卢森堡",
+    "switzerland": "瑞士", "austria": "奥地利", "italy": "意大利",
+    "spain": "西班牙", "portugal": "葡萄牙", "sweden": "瑞典",
+    "norway": "挪威", "denmark": "丹麦", "finland": "芬兰", "iceland": "冰岛",
+    "poland": "波兰", "czechia": "捷克", "czech republic": "捷克",
+    "hungary": "匈牙利", "romania": "罗马尼亚", "greece": "希腊",
+    "russia": "俄罗斯", "russian federation": "俄罗斯", "turkey": "土耳其",
+    "israel": "以色列", "united arab emirates": "阿联酋",
+    "saudi arabia": "沙特阿拉伯", "qatar": "卡塔尔", "egypt": "埃及",
+    "south africa": "南非", "canada": "加拿大", "mexico": "墨西哥",
+    "brazil": "巴西", "argentina": "阿根廷", "chile": "智利",
+    "colombia": "哥伦比亚", "peru": "秘鲁", "australia": "澳大利亚",
+    "new zealand": "新西兰",
+}
+
+# Region / city spellings (lower-case, single-spaced) -> 中文.
+# Missing entries keep the original English/local spelling.
+REGION_CITY_ZH: dict[str, str] = {
+    # --- US states / cities ---
+    "california": "加利福尼亚", "ca": "加利福尼亚",
+    "new york": "纽约", "new york state": "纽约", "ny": "纽约",
+    "texas": "德克萨斯", "tx": "德克萨斯",
+    "washington": "华盛顿", "wa": "华盛顿",
+    "illinois": "伊利诺伊", "il": "伊利诺伊",
+    "florida": "佛罗里达", "fl": "佛罗里达",
+    "georgia": "佐治亚", "ga": "佐治亚",
+    "virginia": "弗吉尼亚", "va": "弗吉尼亚",
+    "ohio": "俄亥俄", "oh": "俄亥俄",
+    "oregon": "俄勒冈", "or": "俄勒冈",
+    "arizona": "亚利桑那", "az": "亚利桑那",
+    "colorado": "科罗拉多", "co": "科罗拉多",
+    "nevada": "内华达", "nv": "内华达",
+    "new jersey": "新泽西", "nj": "新泽西",
+    "massachusetts": "马萨诸塞", "ma": "马萨诸塞",
+    "pennsylvania": "宾夕法尼亚", "pa": "宾夕法尼亚",
+    "north carolina": "北卡罗来纳", "south carolina": "南卡罗来纳",
+    "michigan": "密歇根", "minnesota": "明尼苏达", "missouri": "密苏里",
+    "maryland": "马里兰", "utah": "犹他", "hawaii": "夏威夷",
+    "alaska": "阿拉斯加",
+    "los angeles": "洛杉矶", "san jose": "圣何塞", "seattle": "西雅图",
+    "dallas": "达拉斯", "chicago": "芝加哥", "new york city": "纽约",
+    "ashburn": "阿什本", "silicon valley": "硅谷", "phoenix": "凤凰城",
+    "miami": "迈阿密", "atlanta": "亚特兰大", "las vegas": "拉斯维加斯",
+    "portland": "波特兰", "denver": "丹佛", "san francisco": "旧金山",
+    "fremont": "弗里蒙特", "sunnyvale": "桑尼维尔",
+    "santa clara": "圣克拉拉", "reston": "雷斯顿", "sterling": "斯特灵",
+    "columbus": "哥伦布", "honolulu": "檀香山", "anchorage": "安克雷奇",
+    # --- Taiwan ---
+    "changhua": "彰化", "changhua county": "彰化",
+    "yuanlin": "员林", "yuanlin city": "员林",
+    "taipei": "台北", "taipei city": "台北", "new taipei": "新北",
+    "taichung": "台中", "taichung city": "台中", "tainan": "台南",
+    "kaohsiung": "高雄", "kaohsiung city": "高雄", "taoyuan": "桃园",
+    "hsinchu": "新竹", "keelung": "基隆", "chiayi": "嘉义",
+    "yilan": "宜兰", "hualien": "花莲", "taitung": "台东",
+    "miaoli": "苗栗", "nantou": "南投", "yunlin": "云林",
+    "pingtung": "屏东", "penghu": "澎湖", "kinmen": "金门",
+    # --- Hong Kong / Macau / Singapore ---
+    "hong kong": "香港", "hongkong": "香港", "kowloon": "九龙",
+    "new territories": "新界", "macau": "澳门", "macao": "澳门",
+    "singapore": "新加坡", "central singapore": "新加坡",
+    # --- Japan / Korea ---
+    "tokyo": "东京", "osaka": "大阪", "kyoto": "京都", "hokkaido": "北海道",
+    "aichi": "爱知", "fukuoka": "福冈", "kanagawa": "神奈川",
+    "saitama": "埼玉", "chiba": "千叶", "hyogo": "兵库",
+    "hiroshima": "广岛", "okinawa": "冲绳",
+    "seoul": "首尔", "busan": "釜山", "incheon": "仁川",
+    "gyeonggi": "京畿", "gyeonggi-do": "京畿",
+    # --- Germany ---
+    "hessen": "黑森", "hesse": "黑森", "bavaria": "巴伐利亚",
+    "bayern": "巴伐利亚", "berlin": "柏林", "hamburg": "汉堡",
+    "munich": "慕尼黑", "münchen": "慕尼黑", "saxony": "萨克森",
+    "north rhine-westphalia": "北莱茵-威斯特法伦",
+    "baden-württemberg": "巴登-符腾堡", "lower saxony": "下萨克森",
+    "frankfurt": "法兰克福", "frankfurt am main": "法兰克福",
+    # --- Other common exits ---
+    "london": "伦敦", "manchester": "曼彻斯特", "amsterdam": "阿姆斯特丹",
+    "paris": "巴黎", "sydney": "悉尼", "melbourne": "墨尔本",
+    "mumbai": "孟买", "bangkok": "曼谷", "kuala lumpur": "吉隆坡",
+    "manila": "马尼拉", "hanoi": "河内", "ho chi minh city": "胡志明市",
+    "jakarta": "雅加达", "milan": "米兰", "madrid": "马德里",
+    "sao paulo": "圣保罗", "mexico city": "墨西哥城", "moscow": "莫斯科",
+    "istanbul": "伊斯坦布尔", "dubai": "迪拜", "riyadh": "利雅得",
+    "dublin": "都柏林", "stockholm": "斯德哥尔摩", "zurich": "苏黎世",
+    "vienna": "维也纳", "auckland": "奥克兰",
+    # --- China mainland ---
+    "hunan": "湖南", "guangdong": "广东", "zhejiang": "浙江",
+    "jiangsu": "江苏", "fujian": "福建", "sichuan": "四川",
+    "shanghai": "上海", "beijing": "北京", "shenzhen": "深圳",
+    "guangzhou": "广州", "zhuzhou": "株洲", "changsha": "长沙",
+}
 
 # ---------------------------------------------------------------------------
 # Logging (never writes secrets or URLs)
@@ -1104,15 +1235,33 @@ def _force_proxy_env():
                 os.environ[k] = v
 
 
+def _geo_key(value: str) -> str:
+    """Normalize a geo label for case-insensitive dict lookup."""
+    return re.sub(r"[\s_]+", " ", (value or "").strip().lower())
+
+
+def to_zh_geo_part(kind: str, value: str) -> str:
+    """Map one geo part to Chinese; unknown values keep their original spelling."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if kind == "country":
+        zh = COUNTRY_ZH.get(text.upper())
+        if zh:
+            return zh
+        return COUNTRY_NAME_ZH.get(_geo_key(text), text)
+    return REGION_CITY_ZH.get(_geo_key(text), text)
+
+
 def format_geo_payload(payload: dict) -> str:
-    """Normalize api.ip.sb / ipapi.co / ipinfo.io JSON to CC/Region/City."""
+    """Normalize api.ip.sb / ipapi.co / ipinfo.io JSON to 中文 国家/地区/城市."""
     country = str(
         payload.get("country_code")
         or payload.get("countryCode")
         or payload.get("country")
         or ""
     ).strip()
-    if len(country) > 3:
+    if len(country) > 3 and _geo_key(country) not in COUNTRY_NAME_ZH:
         country = str(
             payload.get("country_code") or payload.get("countryCode") or country[:2]
         ).strip()
@@ -1123,18 +1272,26 @@ def format_geo_payload(payload: dict) -> str:
         or ""
     ).strip()
     city = str(payload.get("city") or "").strip()
-    parts = [part for part in (country, region, city) if part]
+    parts: list[str] = []
+    for part in (
+        to_zh_geo_part("country", country),
+        to_zh_geo_part("region", region),
+        to_zh_geo_part("city", city),
+    ):
+        # Collapse repeats: HK/SG payloads often echo the country in region+city.
+        if part and part not in parts:
+            parts.append(part)
     return "/".join(parts) if parts else ""
 
 
 def format_cf_trace(text: str) -> str:
-    """Parse cloudflare cdn-cgi/trace (loc=CC, ip=...)."""
+    """Parse cloudflare cdn-cgi/trace (loc=CC, ip=...); loc mapped to 中文 country."""
     fields: dict[str, str] = {}
     for line in text.splitlines():
         if "=" in line:
             key, _, val = line.partition("=")
             fields[key.strip()] = val.strip()
-    loc = fields.get("loc") or ""
+    loc = to_zh_geo_part("country", fields.get("loc") or "")
     ip = fields.get("ip") or ""
     if loc and ip:
         return f"{loc}/{ip}"
