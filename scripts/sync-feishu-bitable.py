@@ -89,6 +89,11 @@ FT_CHECKBOX = 7
 DATE_PROPERTY = {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}
 NUMBER_PROPERTY = {"formatter": "0"}
 
+# Feishu table2 「实际地区」 single-select options (display labels).
+ACTUAL_REGION_OPTIONS = (
+    "美国", "新加坡", "台湾", "香港", "日本", "韩国", "英国", "德国", "其他",
+)
+
 TABLE_SPECS: list[dict[str, Any]] = [
     {
         "key": "sources",
@@ -117,6 +122,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("节点名", FT_TEXT, None),
             ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
             ("协议", FT_TEXT, None),
+            ("实际地区", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ACTUAL_REGION_OPTIONS]}),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("存活", FT_CHECKBOX, None),
             ("测速目标", FT_TEXT, None),
@@ -150,7 +156,26 @@ US_PATTERN = re.compile(
     r"virginia|ohio|california|圣何塞|洛杉矶|西雅图|达拉斯|芝加哥|纽约|硅谷|凤凰城",
     re.IGNORECASE,
 )
-
+HK_PATTERN = re.compile(
+    r"香港|hong\s*kong|🇭🇰|\bHK\b|\bHKG\b",
+    re.IGNORECASE,
+)
+JP_PATTERN = re.compile(
+    r"日本|japan|tokyo|osaka|🇯🇵|\bJP\b|\bJPN\b",
+    re.IGNORECASE,
+)
+KR_PATTERN = re.compile(
+    r"韩国|韓國|korea|seoul|🇰🇷|\bKR\b|\bKOR\b",
+    re.IGNORECASE,
+)
+UK_PATTERN = re.compile(
+    r"英国|英國|united\s*kingdom|\bUK\b|\bGBR\b|london|🇬🇧",
+    re.IGNORECASE,
+)
+DE_PATTERN = re.compile(
+    r"德国|德國|germany|frankfurt|berlin|🇩🇪|\bDE\b|\bDEU\b",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Logging (never writes secrets or URLs)
@@ -720,6 +745,31 @@ def node_region_bucket(name: str) -> str:
     return "OTHER"
 
 
+def actual_region(name: str) -> str:
+    """Map node display name → Feishu 「实际地区」 label.
+
+    Broader than region_of (US/SG only). Order: HK/TW/JP/KR/UK/DE before
+    US/SG. Always returns one of ACTUAL_REGION_OPTIONS (default 其他).
+    """
+    text = name or ""
+    checks = (
+        (HK_PATTERN, "香港"),
+        (TW_PATTERN, "台湾"),
+        (JP_PATTERN, "日本"),
+        (KR_PATTERN, "韩国"),
+        (UK_PATTERN, "英国"),
+        (DE_PATTERN, "德国"),
+        (US_PATTERN, "美国"),
+        (SG_PATTERN, "新加坡"),
+    )
+    for pattern, label in checks:
+        if pattern.search(text):
+            return label
+    return "其他"
+
+
+
+
 def interleave_by_region(names: list[str], prefer: tuple[str, ...] = ("TW", "US", "OTHER", "SG")) -> list[str]:
     """Round-robin across region buckets so SG does not burn consecutive slots."""
     buckets: dict[str, list[str]] = {key: [] for key in prefer}
@@ -1200,6 +1250,7 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
                 "节点名": name,
                 "来源": source or "未知",
                 "协议": str(node.get("type") or ""),
+                "实际地区": actual_region(name),
                 "延迟ms": delay if delay else -1,
                 "存活": bool(delay),
                 "测速目标": target,
