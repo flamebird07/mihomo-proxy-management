@@ -89,11 +89,6 @@ FT_CHECKBOX = 7
 DATE_PROPERTY = {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}
 NUMBER_PROPERTY = {"formatter": "0"}
 
-# Feishu table2 「实际地区」 single-select options (display labels).
-ACTUAL_REGION_OPTIONS = (
-    "美国", "新加坡", "台湾", "香港", "日本", "韩国", "英国", "德国", "其他",
-)
-
 TABLE_SPECS: list[dict[str, Any]] = [
     {
         "key": "sources",
@@ -122,7 +117,8 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("节点名", FT_TEXT, None),
             ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
             ("协议", FT_TEXT, None),
-            ("实际地区", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ACTUAL_REGION_OPTIONS]}),
+            # Free-form from ipinfo.io/json via that node: "CC/Region/City" or "未知".
+            ("实际地区", FT_TEXT, None),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("存活", FT_CHECKBOX, None),
             ("测速目标", FT_TEXT, None),
@@ -411,6 +407,11 @@ class FeishuClient:
             "PUT", f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/fields/{field_id}", body=body
         )
 
+    def delete_field(self, table_id: str, field_id: str) -> None:
+        self.call(
+            "DELETE", f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/fields/{field_id}"
+        )
+
     # -- records -----------------------------------------------------------
 
     def list_records(self, table_id: str) -> list[dict]:
@@ -484,6 +485,15 @@ def ensure_fields(client: FeishuClient, table_id: str, fields: list[tuple], log:
     existing = {f.get("field_name"): f for f in client.list_fields(table_id)}
     for name, ftype, prop in fields:
         current = existing.get(name)
+        if current is not None and int(current.get("type") or 0) != int(ftype):
+            # e.g. 实际地区 SINGLE_SELECT → TEXT for free-form ipinfo strings.
+            try:
+                client.delete_field(table_id, current.get("field_id", ""))
+                log.info(f"field deleted for retype name={name} old_type={current.get('type')}")
+                current = None
+                existing.pop(name, None)
+            except SyncError as exc:
+                log.warn(f"field retype delete failed name={name} class={exc.kind}")
         if current is None:
             try:
                 client.create_field(table_id, name, ftype, prop)
@@ -743,29 +753,6 @@ def node_region_bucket(name: str) -> str:
     if SG_PATTERN.search(name):
         return "SG"
     return "OTHER"
-
-
-def actual_region(name: str) -> str:
-    """Map node display name → Feishu 「实际地区」 label.
-
-    Broader than region_of (US/SG only). Order: HK/TW/JP/KR/UK/DE before
-    US/SG. Always returns one of ACTUAL_REGION_OPTIONS (default 其他).
-    """
-    text = name or ""
-    checks = (
-        (HK_PATTERN, "香港"),
-        (TW_PATTERN, "台湾"),
-        (JP_PATTERN, "日本"),
-        (KR_PATTERN, "韩国"),
-        (UK_PATTERN, "英国"),
-        (DE_PATTERN, "德国"),
-        (US_PATTERN, "美国"),
-        (SG_PATTERN, "新加坡"),
-    )
-    for pattern, label in checks:
-        if pattern.search(text):
-            return label
-    return "其他"
 
 
 
@@ -1058,6 +1045,96 @@ def pick_ports(mixed_port: int, controller_port: int) -> tuple[int, int]:
     raise SyncError("no_free_port")
 
 
+DEFAULT_IPINFO_URL = "https://ipinfo.io/json"
+# Per-node ipinfo budget: keep full sync well under ~30 minutes with 84 nodes.
+IPINFO_TIMEOUT_S = 5.0
+IPINFO_TOTAL_BUDGET_S = 600.0  # 10 minutes hard cap for the region pass
+
+
+def select_proxy(api: str, group: str, name: str, token: str | None = None) -> bool:
+    """PUT /proxies/{group} {"name": ...}. Isolated TEST only — never GPT/MUSE/US-FAST."""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = json.dumps({"name": name}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api}/proxies/{urllib.parse.quote(group, safe='')}",
+        data=body,
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def format_ipinfo(payload: dict) -> str:
+    """Store country/region/city from ipinfo.io/json as CC/Region/City."""
+    country = str(payload.get("country") or "").strip()
+    region = str(payload.get("region") or "").strip()
+    city = str(payload.get("city") or "").strip()
+    parts = [part for part in (country, region, city) if part]
+    return "/".join(parts) if parts else ""
+
+
+def fetch_ipinfo_via_mixed(mixed_port: int, timeout_s: float = IPINFO_TIMEOUT_S) -> str:
+    """HTTP GET ipinfo through an isolated mixed-port (already selected node)."""
+    proxy = f"http://127.0.0.1:{mixed_port}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    req = urllib.request.Request(
+        DEFAULT_IPINFO_URL,
+        headers={"User-Agent": "mihomo-feishu-sync/ipinfo", "Accept": "application/json"},
+    )
+    try:
+        with opener.open(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return "未知"
+        text = format_ipinfo(payload)
+        return text or "未知"
+    except Exception:
+        return "未知"
+
+
+def lookup_regions_isolated(
+    api: str,
+    mixed_port: int,
+    names: list[str],
+    log: "Logger",
+    timeout_s: float = IPINFO_TIMEOUT_S,
+    budget_s: float = IPINFO_TOTAL_BUDGET_S,
+) -> dict[str, str]:
+    """Sequential: select TEST → ipinfo.json via mixed port. No live group switches."""
+    regions: dict[str, str] = {}
+    started = time.monotonic()
+    ok = 0
+    for index, name in enumerate(names, 1):
+        if time.monotonic() - started > budget_s:
+            log.warn(
+                f"ipinfo budget_exhausted tried={index - 1} ok={ok} remain={len(names) - index + 1}"
+            )
+            for rest in names[index - 1:]:
+                regions.setdefault(rest, "未知")
+            break
+        if not select_proxy(api, "TEST", name):
+            regions[name] = "未知"
+            continue
+        value = fetch_ipinfo_via_mixed(mixed_port, timeout_s=timeout_s)
+        regions[name] = value
+        if value and value != "未知":
+            ok += 1
+        if index % 20 == 0 or index == len(names):
+            log.info(f"ipinfo progress={index}/{len(names)} ok={ok}")
+    log.info(f"ipinfo done tested={len(regions)} ok={ok}")
+    return regions
+
+
 def request_delay(api: str, name: str, target: str, timeout_ms: int,
                   token: str | None = None) -> int | None:
     query = urllib.parse.urlencode({"url": target, "timeout": str(timeout_ms)})
@@ -1075,7 +1152,7 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
 
 def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: int,
                   controller_port: int, target: str, timeout_ms: int, workers: int,
-                  log: Logger) -> dict[str, int | None]:
+                  log: Logger) -> tuple[dict[str, int | None], dict[str, str]]:
     if not Path(core).exists():
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
@@ -1123,7 +1200,10 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
             delays = dict(
                 zip(names, pool.map(lambda n: request_delay(api, n, target, timeout_ms), names))
             )
-        return delays
+        # Separate pass: egress IP geo via ipinfo through each node (not ChatGPT delay).
+        log.info(f"ipinfo enter nodes={len(names)} timeout_s={IPINFO_TIMEOUT_S}")
+        regions = lookup_regions_isolated(api, mixed, names, log)
+        return delays, regions
     finally:
         process.terminate()
         try:
@@ -1240,17 +1320,21 @@ def build_source_records(results: list[SourceResult], sync_ms: int) -> list[dict
 
 
 def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | None],
-                       target: str, sync_ms: int) -> list[dict]:
+                       target: str, sync_ms: int,
+                       regions: dict[str, str] | None = None) -> list[dict]:
+    regions = regions or {}
     records = []
     for node, source in pool:
         name = node["name"]
         delay = delays.get(name)
+        # ipinfo via node only — never invent from node name; missing → 未知.
+        area = (regions.get(name) or "").strip() or "未知"
         fields = compact(
             {
                 "节点名": name,
                 "来源": source or "未知",
                 "协议": str(node.get("type") or ""),
-                "实际地区": actual_region(name),
+                "实际地区": area,
                 "延迟ms": delay if delay else -1,
                 "存活": bool(delay),
                 "测速目标": target,
@@ -1461,6 +1545,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"pool nodes={len(pool)}")
 
         delays: dict[str, int | None] = {}
+        regions: dict[str, str] = {}
         speedtest_ran = False
         if not pool:
             log.info("speedtest skipped reason=empty_pool")
@@ -1472,9 +1557,11 @@ def main(argv: list[str] | None = None) -> int:
             proxies = [{k: v for k, v in node.items() if not k.startswith("_")} for node, _ in pool]
             log.info(f"speedtest enter mode=isolated nodes={len(names)}")
             try:
-                delays = test_isolated(args.core, names, proxies, args.mixed_port,
-                                       args.controller_port, args.target, args.timeout_ms,
-                                       args.workers, log)
+                delays, regions = test_isolated(
+                    args.core, names, proxies, args.mixed_port,
+                    args.controller_port, args.target, args.timeout_ms,
+                    args.workers, log,
+                )
                 log.info(f"speedtest isolated done tested={len(delays)}")
                 speedtest_ran = True
             except SyncError as exc:
@@ -1486,10 +1573,13 @@ def main(argv: list[str] | None = None) -> int:
                     delays = test_live(args.live_controller, token, names, args.target,
                                        args.timeout_ms, args.workers, log)
                     log.info(f"speedtest live done tested={len(delays)}")
+                    regions = {name: "未知" for name in names}
+                    log.warn("ipinfo skipped reason=live_fallback_no_group_switch")
                     speedtest_ran = True
                 except SyncError as live_exc:
                     log.error(f"speedtest unavailable class={live_exc.kind}")
                     delays = {}
+                    regions = {}
         for node, _ in pool:
             node["_delay"] = delays.get(node["name"])
 
@@ -1579,7 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- records -----------------------------------------------------
         source_records = build_source_records(results, sync_ms)
-        node_records = build_node_records(pool, delays, args.target, sync_ms)
+        node_records = build_node_records(pool, delays, args.target, sync_ms, regions)
         groups = load_group_members(args.config, log)
         region_records = build_region_records(pool, delays, groups, sync_ms)
         node_rows = len(node_records)
