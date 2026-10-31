@@ -99,6 +99,10 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("流量剩余", FT_TEXT, None),
             ("到期时间", FT_TEXT, None),
             ("失败原因", FT_TEXT, None),
+            ("页面网址", FT_TEXT, None),
+            ("页面可达", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("可达", "不可达", "未配置")]}),
+            ("页面HTTP状态", FT_NUMBER, NUMBER_PROPERTY),
+            ("页面探测延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("同步时间", FT_DATE_TIME, DATE_PROPERTY),
         ],
     },
@@ -516,6 +520,11 @@ class SourceResult:
         self.error = ""
         self.traffic = ""
         self.expire = ""
+        # Landing-page probe (SOURCE_PAGE_URL_N); public URLs only.
+        self.page_url = ""
+        self.page_reach = "未配置"  # 可达 / 不可达 / 未配置
+        self.page_http = 0
+        self.page_delay_ms = 0
 
     @property
     def alive(self) -> int:
@@ -551,6 +560,64 @@ def http_fetch(url: str, ua: str, timeout: int,
         return 0, "", {}, _classify_reason(exc)
     except Exception as exc:  # pragma: no cover - defensive
         return 0, "", {}, _classify_reason(exc)
+
+
+
+def _page_status_ok(status: int) -> bool:
+    """Portal login walls (401/403) still count as reachable."""
+    return (200 <= status <= 399) or status in (401, 403)
+
+
+def probe_page(url: str, ua: str, timeout: int,
+               proxy: str | None) -> tuple[str, int, int, str]:
+    """Probe a public landing page via optional local proxy.
+
+    Returns (reachability, http_status, delay_ms, class). class is safe to log.
+    Empty url -> 未配置. Network failure or non-OK status -> 不可达.
+    """
+    if not (url or "").strip():
+        return "未配置", 0, 0, "unconfigured"
+
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    headers = {"User-Agent": ua or convert_sub.DEFAULT_USER_AGENT}
+
+    def _one(method: str) -> tuple[int, str]:
+        request = urllib.request.Request(url, headers=headers, method=method)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", 0) or 0)
+                try:
+                    response.read(64)
+                except Exception:
+                    pass
+            return status, ""
+        except urllib.error.HTTPError as exc:
+            return int(exc.code), f"http_{int(exc.code)}"
+        except urllib.error.URLError as exc:
+            return 0, _classify_reason(exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            return 0, _classify_reason(exc)
+
+    started = time.monotonic()
+    status, err = _one("HEAD")
+    # Some portals reject HEAD; fall back to GET once.
+    if status == 0 or (err and not _page_status_ok(status)):
+        if err in {"timeout", "network_error"} or status == 0 or status in (405, 501):
+            status2, err2 = _one("GET")
+            if status2 or not err2:
+                status, err = status2, err2
+    delay_ms = max(0, int((time.monotonic() - started) * 1000))
+
+    if err in {"timeout", "network_error"} and status == 0:
+        return "不可达", 0, delay_ms, err
+    if _page_status_ok(status):
+        return "可达", status, delay_ms, "ok"
+    if status:
+        return "不可达", status, delay_ms, f"http_{status}"
+    return "不可达", 0, delay_ms, err or "no_status"
 
 
 def _format_bytes(value: int) -> str:
@@ -894,6 +961,10 @@ def build_source_records(results: list[SourceResult], sync_ms: int) -> list[dict
                 "流量剩余": result.traffic,
                 "到期时间": result.expire,
                 "失败原因": result.error,
+                "页面网址": result.page_url,
+                "页面可达": result.page_reach,
+                "页面HTTP状态": result.page_http if result.page_reach != "未配置" else 0,
+                "页面探测延迟ms": result.page_delay_ms if result.page_reach != "未配置" else 0,
                 "同步时间": sync_ms,
             }
         )
@@ -1050,10 +1121,29 @@ def main(argv: list[str] | None = None) -> int:
 
         # --- sources -----------------------------------------------------
         sources_env = read_env_file(args.sources_env)
+        # Optional overlay from live env (same key names) when present.
+        live_overlay = read_env_file(args.live_env)
+        for key, value in live_overlay.items():
+            if key.startswith("SOURCE_PAGE_URL_") and (value or "").strip():
+                sources_env[key] = value
+        page_timeout = min(int(args.fetch_timeout), 15)
         for index in (1, 2, 3):
             url = (sources_env.get(f"SUBSCRIPTION_URL_{index}") or "").strip()
             ua = (sources_env.get(f"SUBSCRIPTION_UA_{index}") or "").strip() or convert_sub.DEFAULT_USER_AGENT
             result = collect_source(index, url, ua, args.fetch_timeout, args.fetch_proxy, log)
+            page_url = (sources_env.get(f"SOURCE_PAGE_URL_{index}") or "").strip()
+            result.page_url = page_url
+            reach, page_status, page_delay, page_class = probe_page(
+                page_url, ua, page_timeout, args.fetch_proxy
+            )
+            result.page_reach = reach
+            result.page_http = page_status
+            result.page_delay_ms = page_delay
+            # Log status/class/delay only — never dump the full URL into the summary.
+            log.info(
+                f"source#{index} page_probe status={page_status} class={page_class} "
+                f"delay_ms={page_delay} reach={reach}"
+            )
             results.append(result)
 
         # --- source 1 cache fallback ------------------------------------
