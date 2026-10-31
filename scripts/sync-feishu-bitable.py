@@ -69,6 +69,10 @@ DEFAULT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
 DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
+PAGE_PROBE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 PLACEHOLDER_TABLE_ID = "tbldzw2ismrKCEAC"
 PLACEHOLDER_TABLE_NAME = "数据表"
@@ -139,6 +143,7 @@ RETRY_CODES = {1254290, 1254291, 1254607, 99991400, 1310213}
 TOKEN_CODES = {99991661, 99991663, 99991664, 99991668}
 
 SG_PATTERN = re.compile(r"新加坡|狮城|獅城|singapore|🇸🇬|\bSGP?\b", re.IGNORECASE)
+TW_PATTERN = re.compile(r"台湾|台灣|taiwan|🇹🇼|\bTW\b", re.IGNORECASE)
 US_PATTERN = re.compile(
     r"美国|美國|united states|\bUSA?\b|🇺🇸|los angeles|san jose|seattle|dallas|chicago|"
     r"new york|ashburn|silicon valley|phoenix|miami|atlanta|las vegas|portland|denver|"
@@ -522,6 +527,7 @@ class SourceResult:
         self.expire = ""
         # Landing-page probe (SOURCE_PAGE_URL_N); public URLs only.
         self.page_url = ""
+        self.page_urls: list[str] = []  # primary → backup chain
         self.page_reach = "未配置"  # 可达 / 不可达 / 未配置
         self.page_http = 0
         self.page_delay_ms = 0
@@ -651,21 +657,126 @@ def list_live_leaf_names(api: str, token: str | None, log: "Logger") -> list[str
     return names
 
 
+
+def normalize_page_url(url: str) -> str:
+    """Strip fragment; IDN-encode non-ASCII hosts (e.g. 咖啡云.net)."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    raw = urllib.parse.urldefrag(raw).url
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return raw
+    host = parts.hostname or ""
+    if host and any(ord(ch) > 127 for ch in host):
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except Exception:
+            ascii_host = host
+        # Rebuild netloc preserving port/userinfo if any.
+        port = parts.port
+        netloc = ascii_host if port is None else f"{ascii_host}:{port}"
+        raw = urllib.parse.urlunsplit(
+            (parts.scheme, netloc, parts.path, parts.query, "")
+        )
+    return raw
+
+
+def parse_page_urls(sources_env: dict[str, str], index: int) -> list[str]:
+    """Unified multi-URL parse for SOURCE_PAGE_URL_N (comma/whitespace) + _N_1/_N_2/_N_3."""
+    chunks: list[str] = []
+    primary = (sources_env.get(f"SOURCE_PAGE_URL_{index}") or "").strip()
+    if primary:
+        chunks.append(primary)
+    for suffix in (1, 2, 3):
+        extra = (sources_env.get(f"SOURCE_PAGE_URL_{index}_{suffix}") or "").strip()
+        if extra:
+            chunks.append(extra)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        # Split on comma or any whitespace; keep order.
+        for part in re.split(r"[\s,]+", chunk):
+            part = part.strip()
+            if not part:
+                continue
+            normalized = normalize_page_url(part)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            urls.append(normalized)
+    return urls
+
+
+def node_region_bucket(name: str) -> str:
+    """Coarse region for page-probe scatter (TW/US preferred over SG)."""
+    if TW_PATTERN.search(name):
+        return "TW"
+    if US_PATTERN.search(name):
+        return "US"
+    if SG_PATTERN.search(name):
+        return "SG"
+    return "OTHER"
+
+
+def interleave_by_region(names: list[str], prefer: tuple[str, ...] = ("TW", "US", "OTHER", "SG")) -> list[str]:
+    """Round-robin across region buckets so SG does not burn consecutive slots."""
+    buckets: dict[str, list[str]] = {key: [] for key in prefer}
+    for name in names:
+        buckets.setdefault(node_region_bucket(name), [])
+        bucket = node_region_bucket(name)
+        if bucket not in buckets:
+            buckets[bucket] = []
+        buckets[bucket].append(name)
+    order = [key for key in prefer if buckets.get(key)]
+    for key in buckets:
+        if key not in order and buckets[key]:
+            order.append(key)
+    result: list[str] = []
+    indexes = {key: 0 for key in order}
+    while True:
+        progressed = False
+        for key in order:
+            idx = indexes[key]
+            series = buckets.get(key) or []
+            if idx < len(series):
+                result.append(series[idx])
+                indexes[key] = idx + 1
+                progressed = True
+        if not progressed:
+            break
+    return result
+
+
 def pick_page_probe_candidates(
     result: "SourceResult",
     live_names: list[str],
     delays: dict[str, int | None],
     limit: int = 12,
+    preferred_names: list[str] | None = None,
 ) -> list[str]:
-    """Prefer this source's nodes (alive first), then other live leafs. Cap at limit."""
+    """Prefer AUTO-FOREIGN (caller-given) members, then this source's nodes, then live leafs.
+
+    Region-interleaved so SINGAPORE does not burn consecutive early slots.
+    """
     live_set = set(live_names)
+    seen: set[str] = set()
+    preferred: list[str] = []
+    for name in preferred_names or []:
+        if name in live_set and name not in seen:
+            seen.add(name)
+            preferred.append(name)
+    # Put url-test/select "now" already first in preferred_names by caller.
+    pref_alive = [n for n in preferred if delays.get(n)]
+    pref_rest = [n for n in preferred if n not in set(pref_alive)]
+    seed = interleave_by_region(pref_alive) + interleave_by_region(pref_rest)
+
     source_names = [
         node.get("name")
         for node in result.nodes
         if isinstance(node.get("name"), str) and node.get("name") in live_set
     ]
-    # Dedupe preserving order
-    seen: set[str] = set()
     ordered: list[str] = []
     for name in source_names:
         if name not in seen:
@@ -673,13 +784,17 @@ def pick_page_probe_candidates(
             ordered.append(name)
     alive = [n for n in ordered if delays.get(n)]
     rest = [n for n in ordered if n not in set(alive)]
-    candidates = alive + rest
-    for name in live_names:
-        if len(candidates) >= limit:
-            break
-        if name not in seen:
-            seen.add(name)
-            candidates.append(name)
+    seed = seed + interleave_by_region(alive) + interleave_by_region(rest)
+    for name in seed:
+        seen.add(name)
+    extras = [n for n in live_names if n not in seen]
+    extras = interleave_by_region(extras)
+    # AUTO-FOREIGN "now" stays pinned first; preferred members next (region
+    # interleaved), then source/live leafs (region interleaved).
+    pinned = preferred[:1]
+    pref_others = [n for n in seed if n in set(preferred) and n not in pinned]
+    others = [n for n in seed + extras if n not in set(preferred)]
+    candidates = pinned + interleave_by_region(pref_others) + interleave_by_region(others)
     return candidates[:limit]
 
 
@@ -694,21 +809,31 @@ def probe_page_via_nodes(
 ) -> tuple[bool, int, str | None, int]:
     """Try /proxies/{node}/delay for the page URL. Does not switch select groups.
 
+    On failure, deprioritize the rest of that node's region so TW/US still get budget.
     Returns (ok, delay_ms, node_name_or_None, tried_count).
     """
     target = strip_url_fragment(url)
     if not target or not candidates:
         return False, 0, None, 0
+    pending = list(candidates)
     tried = 0
     deadline = time.monotonic() + max(5.0, budget_s)
-    for name in candidates:
+    while pending:
         if time.monotonic() >= deadline:
             log.info(f"page_probe_nodes budget_exhausted tried={tried}")
             break
+        name = pending.pop(0)
         tried += 1
         delay = request_delay(api, name, target, timeout_ms, token)
         if delay and delay > 0:
             return True, int(delay), name, tried
+        # Deprioritize remaining nodes in the same region bucket.
+        failed_bucket = node_region_bucket(name)
+        same: list[str] = []
+        others: list[str] = []
+        for item in pending:
+            (same if node_region_bucket(item) == failed_bucket else others).append(item)
+        pending = others + same
     return False, 0, None, tried
 
 
@@ -1223,19 +1348,42 @@ def main(argv: list[str] | None = None) -> int:
             url = (sources_env.get(f"SUBSCRIPTION_URL_{index}") or "").strip()
             ua = (sources_env.get(f"SUBSCRIPTION_UA_{index}") or "").strip() or convert_sub.DEFAULT_USER_AGENT
             result = collect_source(index, url, ua, args.fetch_timeout, args.fetch_proxy, log)
-            page_url = (sources_env.get(f"SOURCE_PAGE_URL_{index}") or "").strip()
-            result.page_url = page_url
-            reach, page_status, page_delay, page_class = probe_page(
-                page_url, ua, page_timeout, args.fetch_proxy
-            )
-            result.page_reach = reach
-            result.page_http = page_status
-            result.page_delay_ms = page_delay
-            # Log status/class/delay only — never dump the full URL into the summary.
-            log.info(
-                f"source#{index} page_probe status={page_status} class={page_class} "
-                f"delay_ms={page_delay} reach={reach}"
-            )
+            page_urls = parse_page_urls(sources_env, index)
+            result.page_urls = page_urls
+            result.page_url = page_urls[0] if page_urls else ""
+            if not page_urls:
+                result.page_reach = "未配置"
+                result.page_http = 0
+                result.page_delay_ms = 0
+                log.info(
+                    f"source#{index} page_probe status=0 class=unconfigured "
+                    f"delay_ms=0 reach=未配置"
+                )
+            else:
+                # First pass: try each URL via fetch_proxy with browser Chrome UA.
+                found = False
+                last_status, last_delay, last_class = 0, 0, "network_error"
+                for page_url in page_urls:
+                    reach, page_status, page_delay, page_class = probe_page(
+                        page_url, PAGE_PROBE_UA, page_timeout, args.fetch_proxy
+                    )
+                    last_status, last_delay, last_class = page_status, page_delay, page_class
+                    # TLS/urllib failure is fine — node delay is authoritative later.
+                    log.info(
+                        f"source#{index} page_probe status={page_status} class={page_class} "
+                        f"delay_ms={page_delay} reach={reach} urls={len(page_urls)}"
+                    )
+                    if reach == "可达":
+                        result.page_url = page_url
+                        result.page_reach = "可达"
+                        result.page_http = page_status
+                        result.page_delay_ms = page_delay
+                        found = True
+                        break
+                if not found:
+                    result.page_reach = "不可达"
+                    result.page_http = last_status
+                    result.page_delay_ms = last_delay
             results.append(result)
 
         # --- source 1 cache fallback ------------------------------------
@@ -1262,22 +1410,32 @@ def main(argv: list[str] | None = None) -> int:
         log.info(f"pool nodes={len(pool)}")
 
         delays: dict[str, int | None] = {}
-        if pool and not args.no_speedtest:
+        speedtest_ran = False
+        if not pool:
+            log.info("speedtest skipped reason=empty_pool")
+        elif args.no_speedtest:
+            # Page-probe / quick runs must NOT wipe table2/table3 delays.
+            log.info("speedtest skipped reason=--no-speedtest")
+        else:
             names = [node["name"] for node, _ in pool]
             proxies = [{k: v for k, v in node.items() if not k.startswith("_")} for node, _ in pool]
+            log.info(f"speedtest enter mode=isolated nodes={len(names)}")
             try:
                 delays = test_isolated(args.core, names, proxies, args.mixed_port,
                                        args.controller_port, args.target, args.timeout_ms,
                                        args.workers, log)
                 log.info(f"speedtest isolated done tested={len(delays)}")
+                speedtest_ran = True
             except SyncError as exc:
                 log.warn(f"speedtest isolated failed class={exc.kind}; trying live controller")
                 live_env = read_env_file(args.live_env)
                 token = (live_env.get("SECRET") or "").strip() or None
                 try:
+                    log.info(f"speedtest enter mode=live nodes={len(names)}")
                     delays = test_live(args.live_controller, token, names, args.target,
                                        args.timeout_ms, args.workers, log)
                     log.info(f"speedtest live done tested={len(delays)}")
+                    speedtest_ran = True
                 except SyncError as live_exc:
                     log.error(f"speedtest unavailable class={live_exc.kind}")
                     delays = {}
@@ -1307,31 +1465,65 @@ def main(argv: list[str] | None = None) -> int:
             # Per-node delay budget: 5–8s; keep total page-retry under ~2 minutes.
             node_timeout_ms = min(8000, max(5000, int(args.timeout_ms)))
             per_source_budget = 40.0  # ~2 min total across 3 sources
-            for result in unreachable:
-                candidates = pick_page_probe_candidates(result, live_names, delays, limit=12)
-                ok, delay_ms, node_name, tried = probe_page_via_nodes(
-                    args.live_controller,
-                    node_token,
-                    result.page_url,
-                    candidates,
-                    node_timeout_ms,
-                    log,
-                    budget_s=per_source_budget,
+            # Prefer AUTO-FOREIGN (url-test, page domains route there): "now" first, then members.
+            auto_foreign_preferred: list[str] = []
+            try:
+                headers = {"Authorization": f"Bearer {node_token}"} if node_token else {}
+                req = urllib.request.Request(
+                    f"{args.live_controller.rstrip('/')}/proxies/AUTO-FOREIGN", headers=headers
                 )
-                if ok and node_name:
-                    # Keep first-pass HTTP status (or 0); mark reachable via a node path.
-                    result.page_reach = "可达"
-                    result.page_delay_ms = delay_ms
-                    log.info(
-                        f"source#{result.index} page_probe status={result.page_http} "
-                        f"class=node_ok delay_ms={delay_ms} reach=可达 "
-                        f"node={node_name} tried={tried}"
-                    )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    af_group = json.loads(resp.read().decode("utf-8", "replace"))
+                now = af_group.get("now")
+                all_members = [m for m in (af_group.get("all") or []) if isinstance(m, str)]
+                if now and now in all_members:
+                    auto_foreign_preferred = [now] + [m for m in all_members if m != now]
                 else:
+                    auto_foreign_preferred = all_members
+                # Drop nested group names from preferred.
+                live_set = set(live_names)
+                auto_foreign_preferred = [m for m in auto_foreign_preferred if m in live_set]
+                log.info(f"page_probe_nodes prefer_group=AUTO-FOREIGN count={len(auto_foreign_preferred)}")
+            except Exception:
+                log.warn("page_probe_nodes AUTO-FOREIGN prefer unavailable")
+
+            for result in unreachable:
+                url_chain = result.page_urls or ([result.page_url] if result.page_url else [])
+                candidates = pick_page_probe_candidates(
+                    result, live_names, delays, limit=12, preferred_names=auto_foreign_preferred
+                )
+                # Split budget across remaining URLs so backups still get TW/US slots.
+                per_url_budget = max(12.0, per_source_budget / max(1, len(url_chain)))
+                total_tried = 0
+                succeeded = False
+                for page_url in url_chain:
+                    ok, delay_ms, node_name, tried = probe_page_via_nodes(
+                        args.live_controller,
+                        node_token,
+                        page_url,
+                        candidates,
+                        node_timeout_ms,
+                        log,
+                        budget_s=per_url_budget,
+                    )
+                    total_tried += tried
+                    if ok and node_name:
+                        result.page_url = page_url
+                        result.page_reach = "可达"
+                        result.page_delay_ms = delay_ms
+                        # Keep first-pass HTTP status (or 0).
+                        log.info(
+                            f"source#{result.index} page_probe status={result.page_http} "
+                            f"class=node_ok delay_ms={delay_ms} reach=可达 "
+                            f"node={node_name} tried={tried} total_tried={total_tried}"
+                        )
+                        succeeded = True
+                        break
+                if not succeeded:
                     log.info(
                         f"source#{result.index} page_probe status={result.page_http} "
                         f"class=node_fail delay_ms={result.page_delay_ms} "
-                        f"reach=不可达 tried={tried}"
+                        f"reach=不可达 tried={total_tried} urls={len(url_chain)}"
                     )
 
         # --- records -----------------------------------------------------
@@ -1351,8 +1543,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         # --- write -------------------------------------------------------
-        for key, records in (("sources", source_records), ("nodes", node_records),
-                             ("gpt_regions", region_records)):
+        # Page-probe / --no-speedtest runs still refresh 表1, but must not
+        # replace 表2/表3 with empty delays (that was the 12:45 wipe).
+        write_keys: list[tuple[str, list]] = [("sources", source_records)]
+        if speedtest_ran:
+            write_keys.append(("nodes", node_records))
+            write_keys.append(("gpt_regions", region_records))
+        else:
+            log.info(
+                "table write skip keys=nodes,gpt_regions "
+                "reason=speedtest_not_run (preserve last delays)"
+            )
+        for key, records in write_keys:
             table_id = (tables.get(key) or {}).get("table_id")
             if not table_id:
                 raise SyncError("api_error", f"missing_table_id:{key}")
