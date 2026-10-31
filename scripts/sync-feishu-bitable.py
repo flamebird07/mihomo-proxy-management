@@ -619,14 +619,13 @@ class SyncLock:
                 os.close(self.fd)
             self.fd = None
 
-        # Unlink only while we still own the mutex and only if the file still
-        # carries OUR token (or our pid when the token is missing).
+        # Unlink only while we still own the mutex, only if this object held the
+        # lock, and only if the file still carries OUR token. A missing or
+        # mismatched token means the file is not provably ours: leave it alone.
         try:
             if Path(self.path).exists():
                 owner_pid, _ts, owner_token = _read_lock_meta(self.path)
-                mine = (owner_token and owner_token == self.token) or (
-                    not owner_token and owner_pid == self.pid
-                )
+                mine = self.held and bool(owner_token) and owner_token == self.token
                 if mine:
                     os.unlink(self.path)
                     self.log.info(f"lock released path={self.path} pid={self.pid}")
