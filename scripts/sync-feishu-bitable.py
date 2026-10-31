@@ -620,6 +620,98 @@ def probe_page(url: str, ua: str, timeout: int,
     return "不可达", 0, delay_ms, err or "no_status"
 
 
+
+def strip_url_fragment(url: str) -> str:
+    """Delay probes should not send #fragment; keep scheme/host/path/query."""
+    return urllib.parse.urldefrag((url or "").strip()).url
+
+
+def list_live_leaf_names(api: str, token: str | None, log: "Logger") -> list[str]:
+    """Read-only leaf proxy names from the live controller (no group switch)."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        request = urllib.request.Request(f"{api.rstrip('/')}/proxies", headers=headers)
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        log.warn("page_probe_nodes controller_unreachable")
+        return []
+    skip_types = {"selector", "urltest", "fallback", "loadbalance", "relay", "compatible"}
+    skip_names = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
+    names: list[str] = []
+    for name, meta in (data.get("proxies") or {}).items():
+        if not isinstance(name, str) or name in skip_names:
+            continue
+        ptype = str((meta or {}).get("type") or "").lower()
+        if ptype in skip_types:
+            continue
+        names.append(name)
+    names.sort()
+    log.info(f"page_probe_nodes live_leafs={len(names)}")
+    return names
+
+
+def pick_page_probe_candidates(
+    result: "SourceResult",
+    live_names: list[str],
+    delays: dict[str, int | None],
+    limit: int = 12,
+) -> list[str]:
+    """Prefer this source's nodes (alive first), then other live leafs. Cap at limit."""
+    live_set = set(live_names)
+    source_names = [
+        node.get("name")
+        for node in result.nodes
+        if isinstance(node.get("name"), str) and node.get("name") in live_set
+    ]
+    # Dedupe preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in source_names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    alive = [n for n in ordered if delays.get(n)]
+    rest = [n for n in ordered if n not in set(alive)]
+    candidates = alive + rest
+    for name in live_names:
+        if len(candidates) >= limit:
+            break
+        if name not in seen:
+            seen.add(name)
+            candidates.append(name)
+    return candidates[:limit]
+
+
+def probe_page_via_nodes(
+    api: str,
+    token: str | None,
+    url: str,
+    candidates: list[str],
+    timeout_ms: int,
+    log: "Logger",
+    budget_s: float = 50.0,
+) -> tuple[bool, int, str | None, int]:
+    """Try /proxies/{node}/delay for the page URL. Does not switch select groups.
+
+    Returns (ok, delay_ms, node_name_or_None, tried_count).
+    """
+    target = strip_url_fragment(url)
+    if not target or not candidates:
+        return False, 0, None, 0
+    tried = 0
+    deadline = time.monotonic() + max(5.0, budget_s)
+    for name in candidates:
+        if time.monotonic() >= deadline:
+            log.info(f"page_probe_nodes budget_exhausted tried={tried}")
+            break
+        tried += 1
+        delay = request_delay(api, name, target, timeout_ms, token)
+        if delay and delay > 0:
+            return True, int(delay), name, tried
+    return False, 0, None, tried
+
+
 def _format_bytes(value: int) -> str:
     if value <= 0:
         return ""
@@ -1202,6 +1294,45 @@ def main(argv: list[str] | None = None) -> int:
                 key = (node.get("type"), node.get("server"), node.get("port"))
                 if key in delay_by_endpoint:
                     node["_delay"] = delay_by_endpoint[key]
+
+        # --- page probe node retry (read-only delay API; no group switch) ---
+        unreachable = [
+            result for result in results
+            if result.page_reach == "不可达" and (result.page_url or "").strip()
+        ]
+        if unreachable:
+            live_env = read_env_file(args.live_env)
+            node_token = (live_env.get("SECRET") or "").strip() or None
+            live_names = list_live_leaf_names(args.live_controller, node_token, log)
+            # Per-node delay budget: 5–8s; keep total page-retry under ~2 minutes.
+            node_timeout_ms = min(8000, max(5000, int(args.timeout_ms)))
+            per_source_budget = 40.0  # ~2 min total across 3 sources
+            for result in unreachable:
+                candidates = pick_page_probe_candidates(result, live_names, delays, limit=12)
+                ok, delay_ms, node_name, tried = probe_page_via_nodes(
+                    args.live_controller,
+                    node_token,
+                    result.page_url,
+                    candidates,
+                    node_timeout_ms,
+                    log,
+                    budget_s=per_source_budget,
+                )
+                if ok and node_name:
+                    # Keep first-pass HTTP status (or 0); mark reachable via a node path.
+                    result.page_reach = "可达"
+                    result.page_delay_ms = delay_ms
+                    log.info(
+                        f"source#{result.index} page_probe status={result.page_http} "
+                        f"class=node_ok delay_ms={delay_ms} reach=可达 "
+                        f"node={node_name} tried={tried}"
+                    )
+                else:
+                    log.info(
+                        f"source#{result.index} page_probe status={result.page_http} "
+                        f"class=node_fail delay_ms={result.page_delay_ms} "
+                        f"reach=不可达 tried={tried}"
+                    )
 
         # --- records -----------------------------------------------------
         source_records = build_source_records(results, sync_ms)
