@@ -5,7 +5,8 @@ Three tables are maintained in one Bitable app (one sync batch per run):
 
   1. 订阅源状态   - one fixed row per subscription source (飞兔/星辰/CoffeeCloud)
   2. 可测速节点   - every parsed node with its ChatGPT-trace delay
-  3. GPT可用地区组 - Singapore/US nodes whose ChatGPT trace test succeeded
+  3. GPT可用地区组 - Nodes whose ChatGPT trace test succeeded AND whose measured
+     egress (ipinfo through that node) is Singapore/US
 
 Security contract
 -----------------
@@ -135,6 +136,8 @@ TABLE_SPECS: list[dict[str, Any]] = [
         "fields": [
             ("节点名", FT_TEXT, None),
             ("地区组", FT_SINGLE_SELECT, {"options": [{"name": "新加坡"}, {"name": "美国"}]}),
+            # Full 中文 egress path (国家/地区/城市) from ipinfo; 地区组 stays coarse.
+            ("实际地区", FT_TEXT, None),
             ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("GPT可用", FT_CHECKBOX, None),
@@ -1834,6 +1837,19 @@ def region_of(name: str) -> str | None:
     return None
 
 
+def group_from_actual_area(area: str) -> str | None:
+    """Coarse 地区组 from the measured egress path (国家/地区/城市), not the node name."""
+    text = (area or "").strip()
+    if not text or text == "未知":
+        return None
+    country = text.split("/", 1)[0].strip() or text
+    if SG_PATTERN.search(country):
+        return "新加坡"
+    if US_PATTERN.search(country):
+        return "美国"
+    return None
+
+
 def load_group_members(config_path: str, log: Logger) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = {}
     path = Path(config_path)
@@ -1927,20 +1943,25 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
 
 
 def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | None],
-                         groups: dict[str, list[str]], sync_ms: int) -> list[dict]:
+                         groups: dict[str, list[str]], sync_ms: int,
+                         regions: dict[str, str] | None = None) -> list[dict]:
+    regions = regions or {}
     records = []
     for node, source in pool:
         name = node["name"]
         delay = delays.get(name)
         if not delay:
             continue
-        region = region_of(name)
+        # Gate on measured egress only — never on the node name; 未知/non-US-SG is out.
+        area = (regions.get(name) or "").strip() or "未知"
+        region = group_from_actual_area(area)
         if not region:
             continue
         fields = compact(
             {
                 "节点名": name,
                 "地区组": region,
+                "实际地区": area,
                 "来源": source or "未知",
                 "延迟ms": delay,
                 "GPT可用": True,
@@ -2277,7 +2298,7 @@ def main(argv: list[str] | None = None) -> int:
         source_records = build_source_records(results, sync_ms)
         node_records = build_node_records(pool, delays, args.target, sync_ms, regions)
         groups = load_group_members(args.config, log)
-        region_records = build_region_records(pool, delays, groups, sync_ms)
+        region_records = build_region_records(pool, delays, groups, sync_ms, regions)
         node_rows = len(node_records)
         region_rows = len(region_records)
         alive_total = sum(1 for _, d in delays.items() if d)
