@@ -140,6 +140,7 @@ proxy-groups:
 # Rules
 # =====================================================================
 rules:
+  - DOMAIN-SUFFIX,superboss.cc,DIRECT
   - GEOSITE,private,DIRECT
   - GEOIP,private,DIRECT,no-resolve
 

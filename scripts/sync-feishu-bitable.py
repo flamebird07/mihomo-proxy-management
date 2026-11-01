@@ -13,8 +13,9 @@ Security contract
 * Subscription URLs, FEISHU_APP_SECRET and tenant_access_token are never
   printed, logged or persisted by this script.
 * Log lines carry only HTTP status codes, row counts and error
-  classifications (http_403 / token_error / timeout / network_error /
-  parse_error / api_error).
+  classifications (http_403 / token_error / timeout / tls_error / dns_error /
+  connection_reset / connection_refused / network_error / parse_error /
+  api_error).
 * The state file keeps table_id values only (no credentials).
 * stdout carries the operator summary only; progress goes to the log file.
 
@@ -37,6 +38,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -74,6 +76,36 @@ DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
 DEFAULT_LOCK_FILE = r"C:\mihomo\feishu-bitable-sync.lock"
+DEFAULT_PROVIDER_DIR = r"C:\mihomo\providers"
+
+# Fetch resilience: each transport path gets FETCH_MAX_ATTEMPTS tries with an
+# exponential backoff between them (10s, then 20s).
+FETCH_MAX_ATTEMPTS = 3
+FETCH_BACKOFF_BASE_S = 10.0
+FETCH_BACKOFF_FACTOR = 2.0
+# Server-side rejections are final; throttling/5xx may be transient.
+FETCH_RETRYABLE_HTTP = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 524})
+
+# Transport-level classes (as opposed to http_N / parse_error).
+NETWORK_CLASSES = frozenset({
+    "network_error", "timeout", "tls_error", "dns_error",
+    "connection_reset", "connection_refused",
+})
+
+# Last-known-good cache may only carry node fields a mihomo proxy needs.
+# Anything else (subscription URL, token, env) must never reach the file.
+CACHE_PROXY_FIELDS = frozenset({
+    "name", "type", "server", "port", "uuid", "cipher", "password",
+    "protocol", "protocol-param", "obfs", "obfs-param", "obfs-password",
+    "network", "tls", "servername", "sni", "alpn", "skip-cert-verify",
+    "client-fingerprint", "flow", "packet-encoding", "reality-opts",
+    "ws-opts", "h2-opts", "grpc-opts", "http-opts", "smux",
+    "plugin", "plugin-opts", "udp", "udp-relay-mode", "congestion-controller",
+    "heartbeat-interval", "reduce-rtt", "up", "down", "fast-open",
+    "tfo", "mptcp", "min-idle-session", "idle-session-check-interval",
+    "idle-session-timeout", "interface-name", "routing-mark", "ip",
+})
+
 PAGE_PROBE_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -984,14 +1016,69 @@ class SourceResult:
         return sum(1 for node in self.nodes if node.get("_delay"))
 
 
+_TLS_TYPES = (ssl.SSLError,)  # SSLEOFError / SSLZeroReturnError / SSLCertVerificationError subclass it
+
+# Text signatures for failures that do not surface as a dedicated exception
+# type (Windows schannel, OpenSSL wrapped in OSError, proxy tunnels, ...).
+_TLS_MARKERS = (
+    "schannel", "rc=35", "handshake", "ssl/tls", "tlsv1", "ssl error",
+    "sslsyscall", "wrong version number", "record layer failure",
+    "unexpected eof", "eof occurred in violation of protocol", "alert",
+)
+_DNS_MARKERS = ("getaddrinfo", "name or service not known", "nodename nor servname",
+                "no such host", "domain name")
+_RESET_MARKERS = ("connection reset", "connection aborted", "10054", "10053",
+                  "wsaeconnreset", "broken pipe")
+_REFUSED_MARKERS = ("connection refused", "10061", "wsaeconnrefused", "actively refused")
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """exc + its URLError reason + cause/context, depth-limited, no repeats."""
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending and len(chain) < 8:
+        item = pending.pop(0)
+        if item is None or not isinstance(item, BaseException):
+            continue
+        if any(item is seen for seen in chain):
+            continue
+        chain.append(item)
+        pending.append(getattr(item, "reason", None))
+        pending.append(item.__cause__)
+        pending.append(item.__context__)
+    return chain
+
+
+def _chain_text(chain: list[BaseException]) -> str:
+    return " ".join(
+        f"{type(item).__name__.lower()} {str(item).lower()}" for item in chain
+    )
+
+
 def _classify_reason(exc: BaseException) -> str:
-    reason = getattr(exc, "reason", None)
-    if isinstance(reason, (socket.timeout, TimeoutError)):
+    """Classify a transport failure into a loggable, stable label."""
+    chain = _exception_chain(exc)
+    if any(isinstance(item, _TLS_TYPES) for item in chain):
+        return "tls_error"
+    if any(isinstance(item, socket.gaierror) for item in chain):
+        return "dns_error"
+    if any(isinstance(item, ConnectionRefusedError) for item in chain):
+        return "connection_refused"
+    if any(isinstance(item, (ConnectionResetError, ConnectionAbortedError)) for item in chain):
+        return "connection_reset"
+    if any(isinstance(item, (socket.timeout, TimeoutError)) for item in chain):
         return "timeout"
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        return "timeout"
-    text = type(exc).__name__.lower()
-    return "timeout" if "timeout" in text else "network_error"
+
+    text = _chain_text(chain)
+    if any(marker in text for marker in _TLS_MARKERS):
+        return "tls_error"
+    if any(marker in text for marker in _DNS_MARKERS):
+        return "dns_error"
+    if any(marker in text for marker in _REFUSED_MARKERS):
+        return "connection_refused"
+    if any(marker in text for marker in _RESET_MARKERS):
+        return "connection_reset"
+    return "timeout" if ("timeout" in text or "timed out" in text) else "network_error"
 
 
 def http_fetch(url: str, ua: str, timeout: int,
@@ -1013,6 +1100,7 @@ def http_fetch(url: str, ua: str, timeout: int,
         return 0, "", {}, _classify_reason(exc)
     except Exception as exc:  # pragma: no cover - defensive
         return 0, "", {}, _classify_reason(exc)
+
 
 
 
@@ -1058,13 +1146,13 @@ def probe_page(url: str, ua: str, timeout: int,
     status, err = _one("HEAD")
     # Some portals reject HEAD; fall back to GET once.
     if status == 0 or (err and not _page_status_ok(status)):
-        if err in {"timeout", "network_error"} or status == 0 or status in (405, 501):
+        if err in NETWORK_CLASSES or status == 0 or status in (405, 501):
             status2, err2 = _one("GET")
             if status2 or not err2:
                 status, err = status2, err2
     delay_ms = max(0, int((time.monotonic() - started) * 1000))
 
-    if err in {"timeout", "network_error"} and status == 0:
+    if err in NETWORK_CLASSES and status == 0:
         return "不可达", 0, delay_ms, err
     if _page_status_ok(status):
         return "可达", status, delay_ms, "ok"
@@ -1198,6 +1286,52 @@ def interleave_by_region(names: list[str], prefer: tuple[str, ...] = ("TW", "US"
     return result
 
 
+def interleave_by_source(
+    items: list[str] | list[tuple[str, str]],
+    source_of: dict[str, str] | None = None,
+) -> list[str]:
+    """Round-robin across subscription sources so no source owns consecutive slots.
+
+    Accepts either (name, source) pairs or bare names plus a source_of mapping.
+    Bucket order follows first appearance, i.e. pool order (飞兔 → 星辰 → CoffeeCloud).
+    """
+    buckets: dict[str, list[str]] = {}
+    for item in items:
+        if isinstance(item, tuple):
+            name, source = str(item[0]), str(item[1] or "")
+        else:
+            name = str(item)
+            source = str((source_of or {}).get(name) or "")
+        buckets.setdefault(source, []).append(name)
+    if not buckets:
+        return []
+    result: list[str] = []
+    indexes = {key: 0 for key in buckets}
+    while True:
+        progressed = False
+        for key, series in buckets.items():
+            idx = indexes[key]
+            if idx < len(series):
+                result.append(series[idx])
+                indexes[key] = idx + 1
+                progressed = True
+        if not progressed:
+            break
+    return result
+
+
+def order_names_for_ipinfo(
+    names: list[str],
+    delays: dict[str, int | None],
+    source_of: dict[str, str] | None = None,
+) -> list[str]:
+    """Geo order: delay-alive leaves first, source-interleaved; then the dead ones."""
+    alive = [name for name in names if (delays.get(name) or 0) > 0]
+    alive_set = set(alive)
+    dead = [name for name in names if name not in alive_set]
+    return interleave_by_source(alive, source_of) + interleave_by_source(dead, source_of)
+
+
 def pick_page_probe_candidates(
     result: "SourceResult",
     live_names: list[str],
@@ -1324,18 +1458,58 @@ def parse_userinfo(headers: dict[str, str]) -> tuple[str, str]:
     return traffic, expire
 
 
+def _is_retryable(status: int, err: str) -> bool:
+    """Transient enough to spend another attempt: transport errors, 429, 5xx."""
+    if not err:
+        return False
+    if err.startswith("http_"):
+        return status in FETCH_RETRYABLE_HTTP
+    return err in NETWORK_CLASSES
+
+
+def _fetch_via_path(index: int, url: str, ua: str, timeout: int,
+                    proxy: str | None, path_name: str, log: Logger,
+                    attempts: int = FETCH_MAX_ATTEMPTS,
+                    backoff_base: float = FETCH_BACKOFF_BASE_S,
+                    backoff_factor: float = FETCH_BACKOFF_FACTOR):
+    """One fetch path, up to `attempts` tries with exponential backoff.
+
+    Returns (status, text, headers, err) for the last attempt; a success returns
+    immediately, so a healthy path never burns all its attempts.
+    """
+    status, text, headers, err = 0, "", {}, "network_error"
+    for attempt in range(1, attempts + 1):
+        status, text, headers, err = http_fetch(url, ua, timeout, proxy)
+        log.info(f"source#{index} attempt={attempt} path={path_name} class={err or 'ok'} status={status}")
+        if not err:
+            return status, text, headers, ""
+        if not _is_retryable(status, err) or attempt >= attempts:
+            break
+        delay = backoff_base * (backoff_factor ** (attempt - 1))
+        log.info(f"source#{index} backoff={int(delay)}s path={path_name} class={err}")
+        time.sleep(delay)
+    return status, text, headers, err
+
+
 def collect_source(index: int, url: str, ua: str, timeout: int,
-                   fallback_proxy: str | None, log: Logger) -> SourceResult:
+                   fallback_proxy: str | None, log: Logger,
+                   attempts: int = FETCH_MAX_ATTEMPTS,
+                   backoff_base: float = FETCH_BACKOFF_BASE_S) -> SourceResult:
     result = SourceResult(index, SOURCE_NAMES.get(index, f"源{index}"))
     if not url:
         result.error = "url_missing"
         log.warn(f"source#{index} url_missing")
         return result
 
-    status, text, headers, err = http_fetch(url, ua, timeout, None)
+    # Direct first; the proxy path only runs once direct is exhausted or final.
+    status, text, headers, err = _fetch_via_path(
+        index, url, ua, timeout, None, "direct", log, attempts, backoff_base
+    )
     if err and fallback_proxy:
-        log.info(f"source#{index} direct failed class={err}; retry via local proxy")
-        status2, text2, headers2, err2 = http_fetch(url, ua, timeout, fallback_proxy)
+        log.info(f"source#{index} direct exhausted class={err}; retry via local proxy")
+        status2, text2, headers2, err2 = _fetch_via_path(
+            index, url, ua, timeout, fallback_proxy, "proxy", log, attempts, backoff_base
+        )
         if not err2:
             status, text, headers, err = status2, text2, headers2, ""
         else:
@@ -1414,6 +1588,78 @@ def load_cache_nodes(paths: list[str], log: Logger) -> list[dict]:
             nodes = valid
             break
     return nodes
+
+
+def source_cache_path(index: int, cache_dir: str | None = None) -> Path:
+    return Path(cache_dir or DEFAULT_PROVIDER_DIR) / f"source{index}-cache.yaml"
+
+
+def _guard_tokens_for(url: str) -> tuple[str, ...]:
+    """Materials that must never appear inside a cache file (URL + token values)."""
+    tokens = [url] if url else []
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url or "").query)
+    for key, values in query.items():
+        if any(marker in key.lower() for marker in ("token", "key", "secret", "auth", "pass")):
+            tokens.extend(value for value in values if len(value) >= 6)
+    return tuple(dict.fromkeys(token for token in tokens if token))
+
+
+def _cache_proxy_fields(node: dict, guard_tokens: tuple[str, ...] = ()) -> dict:
+    """Project a parsed node onto cache-safe fields; secrets never get through."""
+    safe: dict[str, Any] = {}
+    for key, value in node.items():
+        if key not in CACHE_PROXY_FIELDS or value is None:
+            continue
+        if guard_tokens and any(token and token in str(value) for token in guard_tokens):
+            continue
+        safe[key] = value
+    return safe
+
+
+def write_source_cache(index: int, nodes: list[dict], log: Logger,
+                       cache_dir: str | None = None,
+                       guard_tokens: tuple[str, ...] = ()) -> Path | None:
+    """Persist last-known-good nodes so a later fetch failure can fall back."""
+    if yaml is None:
+        log.warn(f"source#{index} cache write skipped reason=yaml_missing")
+        return None
+    payload = []
+    for node in nodes:
+        fields = _cache_proxy_fields(node, guard_tokens)
+        if fields.get("name") and fields.get("type"):
+            payload.append(fields)
+    if not payload:
+        log.warn(f"source#{index} cache write skipped reason=no_valid_nodes")
+        return None
+    path = source_cache_path(index, cache_dir)
+    document = yaml.safe_dump({"proxies": payload}, allow_unicode=True, sort_keys=False)
+    for token in guard_tokens:
+        if token and token in document:
+            # Defensive: a node field carries the subscription URL/token itself.
+            log.warn(f"source#{index} cache write aborted reason=secret_in_node")
+            return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(document, encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, ValueError):
+        log.warn(f"source#{index} cache write failed class=io_error")
+        return None
+    log.info(f"source#{index} cache written nodes={len(payload)} file={path.name}")
+    return path
+
+
+def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> bool:
+    """Fall back to a cached node list, keeping the original error visible."""
+    cached = load_cache_nodes(paths, log)
+    if not cached:
+        return False
+    result.nodes = cached
+    result.result = "缓存"
+    result.error = f"{result.error or 'fetch_failed'}; using cache"
+    log.info(f"source#{result.index} cache_fallback nodes={len(cached)} class=cache_used")
+    return True
 
 
 def build_pool(results: list[SourceResult]) -> list[tuple[dict, str]]:
@@ -1667,6 +1913,15 @@ def validate_region_diversity(
     return regions
 
 
+def _count_by_source(names: list[str], source_of: dict[str, str] | None) -> str:
+    """Render `飞兔=1 星辰=2 CoffeeCloud=21` in first-appearance order."""
+    counts: dict[str, int] = {}
+    for name in names:
+        source = (source_of or {}).get(name) or "unknown"
+        counts[source] = counts.get(source, 0) + 1
+    return " ".join(f"{source}={count}" for source, count in counts.items())
+
+
 def lookup_regions_isolated(
     api: str,
     mixed_port: int,
@@ -1674,24 +1929,68 @@ def lookup_regions_isolated(
     log: "Logger",
     timeout_s: float = IPINFO_TIMEOUT_S,
     budget_s: float = IPINFO_TOTAL_BUDGET_S,
+    source_of: dict[str, str] | None = None,
+    skip_dead: bool = False,
+    delays: dict[str, int | None] | None = None,
 ) -> dict[str, str]:
-    """Sequential: PUT TEST to leaf (mode=rule) -> geo via that mixed-port. No live switches."""
+    """Sequential: PUT TEST to leaf (mode=rule) -> geo via that mixed-port. No live switches.
+
+    `names` is expected pre-ordered (delay-alive first, source-interleaved).
+    skip_dead marks delay-failed leaves 未知 without spending geo budget; it is
+    off by default because a ChatGPT delay failure is not a geo failure.
+    """
     regions: dict[str, str] = {}
     started = time.monotonic()
     ok = 0
+    source_of = source_of or {}
+    source_order: list[str] = []
+    for name in names:
+        source = source_of.get(name) or "unknown"
+        if source not in source_order:
+            source_order.append(source)
+    tried_by_source = {source: 0 for source in source_order}
+    ok_by_source = {source: 0 for source in source_order}
+    total_by_source = {source: 0 for source in source_order}
+    skipped_by_source = {source: 0 for source in source_order}
+    remain_by_source = {source: 0 for source in source_order}
+    for name in names:
+        source = source_of.get(name) or "unknown"
+        total_by_source[source] = total_by_source.get(source, 0) + 1
+    skipped = 0
+    remain_count = 0
+    if skip_dead and delays is not None:
+        for name in names:
+            if (delays.get(name) or 0) <= 0:
+                regions[name] = "未知"
+                skipped += 1
+                source = source_of.get(name) or "unknown"
+                skipped_by_source[source] = skipped_by_source.get(source, 0) + 1
+        pending = [name for name in names if name not in regions]
+        if skipped:
+            log.info(f"ipinfo skip_dead count={skipped} pending={len(pending)}")
+    else:
+        pending = list(names)
     direct_geo = probe_direct_geo(timeout_s=timeout_s)
     if direct_geo:
         log.info(f"ipinfo direct_fingerprint={direct_geo}")
     else:
         log.warn("ipinfo direct_fingerprint unavailable")
-    for index, name in enumerate(names, 1):
+    for index, name in enumerate(pending, 1):
         if time.monotonic() - started > budget_s:
+            remain = pending[index - 1 :]
+            remain_count = len(remain)
+            for rest in remain:
+                source = source_of.get(rest) or "unknown"
+                remain_by_source[source] = remain_by_source.get(source, 0) + 1
             log.warn(
-                f"ipinfo budget_exhausted tried={index - 1} ok={ok} remain={len(names) - index + 1}"
+                f"ipinfo budget_exhausted attempted={index - 1} ok={ok} remain={len(remain)}"
             )
-            for rest in names[index - 1 :]:
+            log.warn(f"ipinfo remain_by_source {_count_by_source(remain, source_of)}")
+            for rest in remain:
                 regions.setdefault(rest, "未知")
             break
+        source = source_of.get(name) or "unknown"
+        tried_by_source[source] = tried_by_source.get(source, 0) + 1
         if not select_proxy(api, "TEST", name):
             regions[name] = "未知"
             continue
@@ -1711,10 +2010,33 @@ def lookup_regions_isolated(
         regions[name] = value
         if value and value != "未知":
             ok += 1
-        if index % 20 == 0 or index == len(names):
-            log.info(f"ipinfo progress={index}/{len(names)} ok={ok}")
-    log.info(f"ipinfo done tested={len(regions)} ok={ok}")
-    return validate_region_diversity(regions, names, log, direct_geo=direct_geo)
+            ok_by_source[source] = ok_by_source.get(source, 0) + 1
+        if index % 20 == 0 or index == len(pending):
+            log.info(f"ipinfo progress={index}/{len(pending)} ok={ok}")
+    regions = validate_region_diversity(regions, names, log, direct_geo=direct_geo)
+    # final_unknown counts what the caller will actually write, i.e. after the
+    # diversity gate may have blanked the whole table.
+    final_unknown = {source: 0 for source in source_order}
+    for name in names:
+        source = source_of.get(name) or "unknown"
+        if (regions.get(name) or "未知") == "未知":
+            final_unknown[source] = final_unknown.get(source, 0) + 1
+    for source in source_order:
+        tried = tried_by_source.get(source, 0)
+        source_ok = ok_by_source.get(source, 0)
+        log.info(
+            f"ipinfo by_source source={source} "
+            f"total={total_by_source.get(source, 0)} tried={tried} ok={source_ok} "
+            f"failed_after_try={tried - source_ok} "
+            f"skipped_dead={skipped_by_source.get(source, 0)} "
+            f"remain_budget={remain_by_source.get(source, 0)} "
+            f"final_unknown={final_unknown.get(source, 0)}"
+        )
+    log.info(
+        f"ipinfo done planned={len(names)} attempted={sum(tried_by_source.values())} "
+        f"ok={ok} skipped={skipped} remain={remain_count}"
+    )
+    return regions
 
 
 
@@ -1735,7 +2057,8 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
 
 def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: int,
                   controller_port: int, target: str, timeout_ms: int, workers: int,
-                  log: Logger) -> tuple[dict[str, int | None], dict[str, str]]:
+                  log: Logger, source_of: dict[str, str] | None = None,
+                  ipinfo_skip_dead: bool = False) -> tuple[dict[str, int | None], dict[str, str]]:
     if not Path(core).exists():
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
@@ -1785,8 +2108,21 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
                 zip(names, pool.map(lambda n: request_delay(api, n, target, timeout_ms), names))
             )
         # Separate pass: egress IP geo via ipinfo through each node (not ChatGPT delay).
-        log.info(f"ipinfo enter nodes={len(names)} timeout_s={IPINFO_TIMEOUT_S}")
-        regions = lookup_regions_isolated(api, mixed, names, log)
+        ordered = order_names_for_ipinfo(names, delays, source_of)
+        alive = [name for name in names if (delays.get(name) or 0) > 0]
+        sample = " ".join(
+            f"{name}({(source_of or {}).get(name) or '?'})" for name in ordered[:12]
+        )
+        log.info(f"ipinfo plan alive={len(alive)} dead={len(names) - len(alive)}")
+        log.info(f"ipinfo order_sample {sample}")
+        log.info(
+            f"ipinfo enter nodes={len(names)} timeout_s={IPINFO_TIMEOUT_S} "
+            f"skip_dead={ipinfo_skip_dead}"
+        )
+        regions = lookup_regions_isolated(
+            api, mixed, ordered, log,
+            source_of=source_of, skip_dead=ipinfo_skip_dead, delays=delays,
+        )
         return delays, regions
     finally:
         process.terminate()
@@ -2024,6 +2360,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY)
     parser.add_argument("--source1-cache", action="append", default=None,
                         help="Candidate YAML used when source 1 fails (repeatable)")
+    parser.add_argument("--source2-cache", action="append", default=None,
+                        help="Candidate YAML used when source 2 fails (repeatable)")
+    parser.add_argument("--source3-cache", action="append", default=None,
+                        help="Candidate YAML used when source 3 fails (repeatable)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Test at most N nodes (0 = all); dry-run only — forbidden with production writes")
     parser.add_argument("--dry-run", action="store_true", help="Collect and test only; never write")
@@ -2031,6 +2371,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Single-instance lock file (metadata: pid+ts+token)")
     parser.add_argument("--ensure-tables", action="store_true", help="Only create/repair tables")
     parser.add_argument("--no-speedtest", action="store_true")
+    parser.add_argument("--ipinfo-skip-dead", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Skip geo for delay-failed leaves (mark 未知); default off "
+                             "— delay failure is ChatGPT reachability, not geo failure")
     parser.add_argument("--keep-placeholder", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
@@ -2106,10 +2450,21 @@ def main(argv: list[str] | None = None) -> int:
             if key.startswith("SOURCE_PAGE_URL_") and (value or "").strip():
                 sources_env[key] = value
         page_timeout = min(int(args.fetch_timeout), 15)
+        cache_read_paths = {
+            2: args.source2_cache or [str(source_cache_path(2))],
+            3: args.source3_cache or [str(source_cache_path(3))],
+        }
         for index in (1, 2, 3):
             url = (sources_env.get(f"SUBSCRIPTION_URL_{index}") or "").strip()
             ua = (sources_env.get(f"SUBSCRIPTION_UA_{index}") or "").strip() or convert_sub.DEFAULT_USER_AGENT
             result = collect_source(index, url, ua, args.fetch_timeout, args.fetch_proxy, log)
+            # --- last-known-good cache (source 2/3, same level as source 1) ---
+            if index in (2, 3):
+                if result.result == "成功":
+                    write_source_cache(index, result.nodes, log,
+                                       guard_tokens=_guard_tokens_for(url))
+                elif result.result == "失败" and result.error != "url_missing":
+                    apply_source_cache(result, cache_read_paths[index], log)
             page_urls = parse_page_urls(sources_env, index)
             result.page_urls = page_urls
             result.page_url = page_urls[0] if page_urls else ""
@@ -2182,12 +2537,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             names = [node["name"] for node, _ in pool]
             proxies = [{k: v for k, v in node.items() if not k.startswith("_")} for node, _ in pool]
+            source_of = {node["name"]: source for node, source in pool}
             log.info(f"speedtest enter mode=isolated nodes={len(names)}")
             try:
                 delays, regions = test_isolated(
                     args.core, names, proxies, args.mixed_port,
                     args.controller_port, args.target, args.timeout_ms,
                     args.workers, log,
+                    source_of=source_of, ipinfo_skip_dead=args.ipinfo_skip_dead,
                 )
                 log.info(f"speedtest isolated done tested={len(delays)}")
                 speedtest_ran = True
