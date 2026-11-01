@@ -108,6 +108,20 @@ proxy-groups:
     tolerance: 100
     timeout: 5000
 
+  - name: CODEBUDDY
+    type: fallback
+    url: https://www.codebuddy.ai/
+    interval: 60
+    proxies:
+      - DIRECT
+      - 香港05-×0.3
+      - 台湾08-×1
+      - 新加坡01-×0.3
+      - 台湾03-×0.3
+      - 香港01-×0.3
+      - 台湾01-×0.3
+      - 日本06-×1
+
   - name: US-FAST
     type: url-test
     filter: "(?i)美|us|usa|🇺🇸"
@@ -132,6 +146,7 @@ proxy-groups:
     proxies:
       - PROXY
       - AUTO-FOREIGN
+      - CODEBUDDY
       - US-FAST
       - VIETNAM
       - DIRECT
@@ -158,6 +173,14 @@ rules:
   - GEOSITE,tiktok,VIETNAM
   - DOMAIN-SUFFIX,tiktok.com,VIETNAM
   - DOMAIN-SUFFIX,tiktokv.com,VIETNAM
+
+  # CodeBuddy 专组 / 订阅边缘 IP（与生产配置同步）
+  - DOMAIN-SUFFIX,codebuddy.ai,CODEBUDDY
+  - IP-CIDR,104.21.95.252/32,AUTO-FOREIGN,no-resolve
+  - IP-CIDR,172.67.171.232/32,AUTO-FOREIGN,no-resolve
+  - IP-CIDR,46.82.174.69/32,AUTO-FOREIGN,no-resolve
+  - IP-CIDR,8.7.198.46/32,AUTO-FOREIGN,no-resolve
+  - IP-CIDR,43.207.232.3/32,AUTO-FOREIGN,no-resolve
 
   # 国内
   - GEOSITE,cn,DIRECT

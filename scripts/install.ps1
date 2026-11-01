@@ -17,6 +17,7 @@ param(
     [switch]$SkipDownload,    # 跳过二进制下载（仅重新生成配置 + 注册计划任务）
     [switch]$SkipTask,        # 跳过注册计划任务
     [switch]$SkipConfigRender, # 保留 install_dir 中已存在的 config.yaml（手工维护的内联节点配置）
+    [switch]$SkipStart,       # 跳过结尾的杀进程+立即启动（保留现有运行实例）
     [switch]$Force            # 强制重新下载
 )
 
@@ -186,10 +187,16 @@ if (-not $SkipTask) {
     # 多个任务同时拉起 mihomo 是双进程的直接来源之一。
     # Remove every legacy task whose action launches mihomo (incl. old
     # MihomoProxy50 / MihomoProxy) - multiple starters cause duplicate processes.
+    # 只匹配可执行文件本身是 mihomo 二进制的任务；不能按 "mihomo" 子串匹配
+    # 路径/参数，否则会误杀 Feishu 同步任务（其 bat 路径含 mihomo-proxy-management）。
+    # Match only tasks whose executable IS a mihomo binary; a loose substring
+    # match on paths would wrongly unregister the Feishu sync task.
     foreach ($tk in (Get-ScheduledTask)) {
         $launchesMihomo = $false
         foreach ($a in $tk.Actions) {
-            if ("$($a.Execute) $($a.Arguments)" -match '(?i)mihomo') { $launchesMihomo = $true }
+            $exeName = ''
+            try { $exeName = [System.IO.Path]::GetFileName($a.Execute) } catch {}
+            if ($exeName -match '(?i)^mihomo(-windows-amd64[^\\/]*)?\.exe$') { $launchesMihomo = $true }
         }
         if ($launchesMihomo) {
             Unregister-ScheduledTask -TaskName $tk.TaskName -Confirm:$false
@@ -226,15 +233,19 @@ if ($foreignStarters) {
 }
 
 # ---------- 立即启动一次 ----------
-Write-Section 'Starting mihomo'
-Get-MihomoProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
-Start-ScheduledTask -TaskName $script:TaskName
-if (Wait-MihomoReady -TimeoutSec 20) {
-    $v = Get-MihomoVersion
-    Write-Ok "mihomo 已启动，版本 / started, version: $v"
+if ($SkipStart) {
+    Write-Ok '跳过启动（-SkipStart），保留现有运行实例 / skipping start, keeping running instance'
 } else {
-    Write-Warn 'mihomo 启动超时，检查 logs\mihomo.log / check logs\mihomo.log'
+    Write-Section 'Starting mihomo'
+    Get-MihomoProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    Start-ScheduledTask -TaskName $script:TaskName
+    if (Wait-MihomoReady -TimeoutSec 20) {
+        $v = Get-MihomoVersion
+        Write-Ok "mihomo 已启动，版本 / started, version: $v"
+    } else {
+        Write-Warn 'mihomo 启动超时，检查 logs\mihomo.log / check logs\mihomo.log'
+    }
 }
 
 Write-Section 'Done'

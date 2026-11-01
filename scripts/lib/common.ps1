@@ -143,6 +143,9 @@ function Test-EnvConfigured {
 
 function Render-Config {
     # 用 subscription.env 替换模板中的占位符，输出到 install_dir\config.yaml
+    # 写入前后有三道防护门（崩溃保护）：
+    #   Gate1 覆盖前先做时间戳备份；Gate3 校验 proxy-groups 引用；Gate2 mihomo -t。
+    #   任一门失败都会回滚到备份（或删除刚写入的全新文件）并抛错，绝不留下坏配置。
     param([string]$EnvPath, [string]$TemplatePath, [string]$OutPath)
     $env = Read-EnvFile $EnvPath
     $url  = if ($env['SUBSCRIPTION_URL'])    { $env['SUBSCRIPTION_URL'] }    else { '' }
@@ -157,7 +160,59 @@ function Render-Config {
 
     $dir = Split-Path $OutPath -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Set-Content -Path $OutPath -Value $out -Encoding UTF8 -NoNewline
+
+    # ---------- Gate 1: 覆盖前备份 / timestamped backup before overwrite ----------
+    $backup = $null
+    if (Test-Path -LiteralPath $OutPath) {
+        $backup = ('{0}.bak-guard-{1}' -f $OutPath, (Get-Date).ToString('yyyyMMdd-HHmmss'))
+        Copy-Item -LiteralPath $OutPath -Destination $backup -Force
+        Write-Ok "已备份现有 config.yaml / backed up existing config -> $(Split-Path $backup -Leaf)"
+    }
+
+    Set-Content -LiteralPath $OutPath -Value $out -Encoding UTF8 -NoNewline
+
+    try {
+        # ---------- Gate 3: proxy-groups 引用校验 / group-ref check ----------
+        # 需要 python；缺失时跳过（Gate2 的 mihomo -t 仍会兜底捕获悬空引用）。
+        $checker = Join-Path $PSScriptRoot 'check_group_refs.py'
+        $python = $null
+        try { $python = @(Get-Command python -CommandType Application -ErrorAction Stop)[0].Source } catch {}
+        if ($python -and (Test-Path $checker)) {
+            $refOut = & $python $checker $OutPath --json 2>&1
+            if ($LASTEXITCODE -eq 1) {
+                throw "proxy-groups 引用校验失败（存在悬空成员）/ dangling group refs: $refOut"
+            } elseif ($LASTEXITCODE -ne 0) {
+                Write-Warn "group-ref 检查器异常（exit $LASTEXITCODE）/ checker error: $refOut"
+            } else {
+                Write-Ok 'proxy-groups 引用校验通过 / group-ref check passed'
+            }
+        } else {
+            Write-Warn '跳过 group-ref 校验（python 或检查器不可用）/ skipped (python/checker unavailable)'
+        }
+
+        # ---------- Gate 2: mihomo -t（重载前必须通过）/ config test ----------
+        $mihomoExe = Join-Path $dir 'mihomo.exe'
+        if (-not (Test-Path $mihomoExe)) { $mihomoExe = Get-MihomoExePath }
+        if (Test-Path $mihomoExe) {
+            $testOut = & $mihomoExe -t -d $dir 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "mihomo -t 校验失败 / config test failed: $testOut"
+            }
+            Write-Ok 'mihomo -t 校验通过 / config test passed'
+        } else {
+            Write-Warn '跳过 mihomo -t（未找到 mihomo.exe）/ skipped (mihomo.exe not found)'
+        }
+    } catch {
+        # 任一门失败：回滚到上一个可用配置（或删除刚写入的全新坏文件）后抛出。
+        if ($backup) {
+            Copy-Item -LiteralPath $backup -Destination $OutPath -Force
+            Write-Err "已从备份回滚 config.yaml / restored from backup: $(Split-Path $backup -Leaf)"
+        } elseif (Test-Path -LiteralPath $OutPath) {
+            Remove-Item -LiteralPath $OutPath -Force
+            Write-Err '已删除未通过校验的新 config.yaml / removed rejected new config'
+        }
+        throw
+    }
 }
 
 # mihomo 可能以两个二进制名运行（历史遗留的 mihomo-windows-amd64.exe），
