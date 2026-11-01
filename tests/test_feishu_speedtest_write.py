@@ -1,6 +1,10 @@
 """Tests for the split Feishu entrypoints in scripts/sync-feishu-bitable.py.
 
 Covered contracts:
+  * the daily default (no flags) is the full path: speed test on, 表1/表2/表3
+  * the default speed-test target is https://grok.com/cdn-cgi/trace
+  * run-feishu-bitable-sync.bat (daily task) never passes --no-speedtest or
+    --speedtest-write; run-feishu-speedtest.bat is an optional manual entry
   * --speedtest-write parses, defaults off, and is mutually exclusive with
     --no-speedtest (argparse exits non-zero)
   * select_write_keys picks the tables each mode may replace:
@@ -237,6 +241,35 @@ class MainFlowMockClientTests(unittest.TestCase):
         self.assertEqual(state["replaced_ids"], [])
         state["isolated"].assert_called_once()
         state["live"].assert_called_once()  # existing fallback path reused
+
+
+class DailyEntrypointTests(unittest.TestCase):
+    """The scheduled daily path must measure delays; grok.com is the target."""
+
+    SCRIPT_DIR = os.path.join(HERE, os.pardir, "scripts")
+
+    def test_default_target_is_grok_trace(self):
+        self.assertEqual(sync.DEFAULT_TARGET, "https://grok.com/cdn-cgi/trace")
+        self.assertEqual(sync.parse_args([]).target, "https://grok.com/cdn-cgi/trace")
+
+    def test_daily_bat_runs_full_sync(self):
+        path = os.path.join(self.SCRIPT_DIR, "run-feishu-bitable-sync.bat")
+        with open(path, encoding="utf-8") as fh:
+            lines = [line.strip().lower() for line in fh]
+        commands = [line for line in lines if line.startswith("python ")]
+        sync_cmd = [line for line in commands if "sync-feishu-bitable.py" in line]
+        self.assertEqual(len(sync_cmd), 1)
+        self.assertNotIn("--no-speedtest", sync_cmd[0])
+        self.assertNotIn("--speedtest-write", sync_cmd[0])
+
+    def test_manual_speedtest_bat_is_optional(self):
+        path = os.path.join(self.SCRIPT_DIR, "run-feishu-speedtest.bat")
+        with open(path, encoding="utf-8") as fh:
+            lines = [line.strip().lower() for line in fh]
+        commands = [line for line in lines if line.startswith("python ")]
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--speedtest-write", commands[0])
+        self.assertNotIn("--no-speedtest", commands[0])
 
 
 if __name__ == "__main__":

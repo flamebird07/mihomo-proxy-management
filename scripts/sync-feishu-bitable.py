@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Sync mihomo three-source status + ChatGPT speed test into a Feishu Bitable.
+"""Sync mihomo three-source status + Grok speed test into a Feishu Bitable.
 
 Three tables are maintained in one Bitable app (one sync batch per run):
 
   1. 订阅源状态   - one fixed row per subscription source (飞兔/星辰/CoffeeCloud)
-  2. 可测速节点   - every parsed node with its ChatGPT-trace delay
-  3. GPT可用地区组 - Nodes whose ChatGPT trace test succeeded AND whose measured
+  2. 可测速节点   - every parsed node with its Grok-trace delay
+  3. GPT可用地区组 - Nodes whose Grok trace test succeeded AND whose measured
      egress (ipinfo through that node) is Singapore/US
 
 Security contract
@@ -21,15 +21,16 @@ Security contract
 
 Usage
 -----
-  python sync-feishu-bitable.py                     # full sync (表1 + 表2/表3 when tested)
+  python sync-feishu-bitable.py                     # daily default: 表1 + speed test + 表2/表3
   python sync-feishu-bitable.py --dry-run           # collect + test, no write
   python sync-feishu-bitable.py --ensure-tables     # only create tables
-  python sync-feishu-bitable.py --no-speedtest      # 表1 only, skip the speed test
-  python sync-feishu-bitable.py --speedtest-write   # speed test, write 表2/表3 only
+  python sync-feishu-bitable.py --no-speedtest      # 表1 only, skip the speed test (manual only)
+  python sync-feishu-bitable.py --speedtest-write   # speed test, write 表2/表3 only (manual only)
 
-Two entrypoints split the writes so a 30-min 表1 refresh never races a long
-speedtest on the same rows: run-feishu-bitable-sync.bat uses --no-speedtest,
-run-feishu-speedtest.bat uses --speedtest-write.
+The scheduled daily sync (run-feishu-bitable-sync.bat, task MihomoFeishuBitableSync)
+runs the default full path: speed test and write 表1/表2/表3. --no-speedtest and
+--speedtest-write are optional manual switches, not the default. run-feishu-speedtest.bat
+is an optional manual entrypoint that refreshes 表2/表3 without touching 表1.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ DEFAULT_STATE_FILE = r"C:\mihomo\feishu-bitable-tables.json"
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\feishu-bitable-sync.log"
 DEFAULT_SOURCES_ENV = str(SCRIPT_DIR.parent / "config" / "subscription.env")
 DEFAULT_CORE = r"C:\mihomo\mihomo.exe"
-DEFAULT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
+DEFAULT_TARGET = "https://grok.com/cdn-cgi/trace"
 DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
@@ -1814,7 +1815,7 @@ def build_pool(
 
 
 # ---------------------------------------------------------------------------
-# Speed test (ChatGPT trace) via mihomo controller
+# Speed test (Grok trace) via mihomo controller
 # ---------------------------------------------------------------------------
 
 def _port_free(port: int) -> bool:
@@ -2096,7 +2097,7 @@ def lookup_regions_isolated(
 
     `names` is expected pre-ordered (delay-alive first, source-interleaved).
     skip_dead marks delay-failed leaves 未知 without spending geo budget; it is
-    off by default because a ChatGPT delay failure is not a geo failure.
+    off by default because a Grok delay failure is not a geo failure.
     Dead leaves (delay<=0, when delays are known) get a short per-probe timeout and
     a sub-budget (dead_budget_ratio of budget_s, optional max attempts); over-budget
     dead leaves are marked 未知 with a `dead_budget` log. After pass1, alive leaves
@@ -2313,7 +2314,7 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
             delays = dict(
                 zip(names, pool.map(lambda n: request_delay(api, n, target, timeout_ms), names))
             )
-        # Separate pass: egress IP geo via ipinfo through each node (not ChatGPT delay).
+        # Separate pass: egress IP geo via ipinfo through each node (not Grok delay).
         ordered = order_names_for_ipinfo(names, delays, source_of)
         alive = [name for name in names if (delays.get(name) or 0) > 0]
         sample = " ".join(
@@ -2554,8 +2555,9 @@ def select_write_keys(speedtest_ran: bool, speedtest_write: bool,
     """Which tables this run may replace.
 
     A run that never measured delays must not touch 表2/表3 — that was the
-    12:45 wipe. speedtest-write runs own 表2/表3 only, leaving 表1 to the
-    periodic sync bat so the two entrypoints never race on the same rows.
+    12:45 wipe. The daily default run measures delays and replaces all three
+    tables. --speedtest-write is an optional manual mode that owns 表2/表3
+    only, leaving 表1 untouched.
     """
     if not speedtest_ran:
         return [] if speedtest_write else [("sources", source_records)]
@@ -2603,14 +2605,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     speedtest_mode = parser.add_mutually_exclusive_group()
     speedtest_mode.add_argument(
         "--no-speedtest", action="store_true",
-        help="Skip the speed test; refresh 表1 only, 表2/表3 keep their last delays")
+        help="Skip the speed test; refresh 表1 only, 表2/表3 keep their last delays "
+             "(manual only; daily sync runs the speed test)")
     speedtest_mode.add_argument(
         "--speedtest-write", action="store_true",
         help="Run the speed test but write 表2/表3 only; 表1 stays with the sync entrypoint")
     parser.add_argument("--ipinfo-skip-dead", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Skip geo for delay-failed leaves (mark 未知); default off "
-                             "— delay failure is ChatGPT reachability, not geo failure")
+                             "— delay failure is Grok reachability, not geo failure")
     parser.add_argument("--ipinfo-budget-s", type=float, default=IPINFO_TOTAL_BUDGET_S,
                         help="Wall-clock cap for the geo region pass, seconds (default 600)")
     parser.add_argument("--ipinfo-dead-max", type=int, default=0,

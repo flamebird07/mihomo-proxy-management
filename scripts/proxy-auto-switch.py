@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proxy auto-failover for mihomo select groups GPT / MUSE / US-FAST.
 
-Runs after sync-feishu-bitable.py in the half-hour pipeline. Measures ChatGPT
+Runs after sync-feishu-bitable.py in the half-hour pipeline. Measures Grok
 trace delay via the live controller, classifies US vs SG from node names
 (same heuristics as sync-feishu-bitable.py), then applies:
 
@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONTROLLER = "http://127.0.0.1:9090"
-DEFAULT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
+DEFAULT_TARGET = "https://grok.com/cdn-cgi/trace"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
 DEFAULT_STATE_FILE = r"C:\mihomo\state\proxy-failover-state.json"
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\proxy-failover.log"

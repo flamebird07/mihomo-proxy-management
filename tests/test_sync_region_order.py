@@ -289,7 +289,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
         regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, delays=delays, geo_for=self.GEO,
         )
-        # Default is off: a ChatGPT delay failure must not skip the geo probe.
+        # Default is off: a Grok delay failure must not skip the geo probe.
         self.assertEqual(regions["a2"], self.GEO["a2"])
         self.assertEqual(regions["c1"], self.GEO["c1"])
 

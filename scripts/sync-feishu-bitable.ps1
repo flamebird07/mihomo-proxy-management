@@ -1,11 +1,12 @@
 # scripts/sync-feishu-bitable.ps1
 # Thin wrapper: run sync-feishu-bitable.py; register/remove Windows scheduled task.
+# Default (no switches) is the daily path: speed test on, writes 表1/表2/表3.
 # Usage:
 #   .\sync-feishu-bitable.ps1
 #   .\sync-feishu-bitable.ps1 -DryRun
 #   .\sync-feishu-bitable.ps1 -EnsureTables
-#   .\sync-feishu-bitable.ps1 -NoSpeedtest
-#   .\sync-feishu-bitable.ps1 -SpeedtestWrite
+#   .\sync-feishu-bitable.ps1 -NoSpeedtest      # manual only: 表1 only, no speed test
+#   .\sync-feishu-bitable.ps1 -SpeedtestWrite   # manual only: 表2/表3 only, no 表1
 #   .\sync-feishu-bitable.ps1 -RegisterTask
 #   .\sync-feishu-bitable.ps1 -RemoveTask
 
