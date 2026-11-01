@@ -21,9 +21,15 @@ Security contract
 
 Usage
 -----
-  python sync-feishu-bitable.py                     # full sync
+  python sync-feishu-bitable.py                     # full sync (表1 + 表2/表3 when tested)
   python sync-feishu-bitable.py --dry-run           # collect + test, no write
   python sync-feishu-bitable.py --ensure-tables     # only create tables
+  python sync-feishu-bitable.py --no-speedtest      # 表1 only, skip the speed test
+  python sync-feishu-bitable.py --speedtest-write   # speed test, write 表2/表3 only
+
+Two entrypoints split the writes so a 30-min 表1 refresh never races a long
+speedtest on the same rows: run-feishu-bitable-sync.bat uses --no-speedtest,
+run-feishu-speedtest.bat uses --speedtest-write.
 """
 
 from __future__ import annotations
@@ -2538,6 +2544,28 @@ def replace_records(client: FeishuClient, table_id: str, records: list[dict],
     return created
 
 
+# Tables this script may replace, in write order.
+WRITE_TABLE_KEYS = ("sources", "nodes", "gpt_regions")
+
+
+def select_write_keys(speedtest_ran: bool, speedtest_write: bool,
+                      source_records: list, node_records: list,
+                      region_records: list) -> list[tuple[str, list]]:
+    """Which tables this run may replace.
+
+    A run that never measured delays must not touch 表2/表3 — that was the
+    12:45 wipe. speedtest-write runs own 表2/表3 only, leaving 表1 to the
+    periodic sync bat so the two entrypoints never race on the same rows.
+    """
+    if not speedtest_ran:
+        return [] if speedtest_write else [("sources", source_records)]
+    if speedtest_write:
+        return [("nodes", node_records), ("gpt_regions", region_records)]
+    return [("sources", source_records),
+            ("nodes", node_records),
+            ("gpt_regions", region_records)]
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2572,7 +2600,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
                         help="Single-instance lock file (metadata: pid+ts+token)")
     parser.add_argument("--ensure-tables", action="store_true", help="Only create/repair tables")
-    parser.add_argument("--no-speedtest", action="store_true")
+    speedtest_mode = parser.add_mutually_exclusive_group()
+    speedtest_mode.add_argument(
+        "--no-speedtest", action="store_true",
+        help="Skip the speed test; refresh 表1 only, 表2/表3 keep their last delays")
+    speedtest_mode.add_argument(
+        "--speedtest-write", action="store_true",
+        help="Run the speed test but write 表2/表3 only; 表1 stays with the sync entrypoint")
     parser.add_argument("--ipinfo-skip-dead", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="Skip geo for delay-failed leaves (mark 未知); default off "
@@ -2882,16 +2916,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         # --- write -------------------------------------------------------
-        # Page-probe / --no-speedtest runs still refresh 表1, but must not
-        # replace 表2/表3 with empty delays (that was the 12:45 wipe).
-        write_keys: list[tuple[str, list]] = [("sources", source_records)]
-        if speedtest_ran:
-            write_keys.append(("nodes", node_records))
-            write_keys.append(("gpt_regions", region_records))
-        else:
+        write_keys = select_write_keys(
+            speedtest_ran, args.speedtest_write,
+            source_records, node_records, region_records,
+        )
+        selected = {key for key, _ in write_keys}
+        skipped = [key for key in WRITE_TABLE_KEYS if key not in selected]
+        log.info(f"table write mode={'speedtest_write' if args.speedtest_write else 'sync'} "
+                 f"selected={','.join(key for key, _ in write_keys) or 'none'} "
+                 f"skipped={','.join(skipped) or 'none'}")
+        if not speedtest_ran and any(key in skipped for key in ("nodes", "gpt_regions")):
             log.info(
                 "table write skip keys=nodes,gpt_regions "
                 "reason=speedtest_not_run (preserve last delays)"
+            )
+        if args.speedtest_write and "sources" in skipped:
+            log.info(
+                "table write skip keys=sources "
+                "reason=speedtest_write_mode (表1 owned by the sync entrypoint)"
             )
         for key, records in write_keys:
             table_id = (tables.get(key) or {}).get("table_id")

@@ -4,6 +4,8 @@
 #   .\sync-feishu-bitable.ps1
 #   .\sync-feishu-bitable.ps1 -DryRun
 #   .\sync-feishu-bitable.ps1 -EnsureTables
+#   .\sync-feishu-bitable.ps1 -NoSpeedtest
+#   .\sync-feishu-bitable.ps1 -SpeedtestWrite
 #   .\sync-feishu-bitable.ps1 -RegisterTask
 #   .\sync-feishu-bitable.ps1 -RemoveTask
 
@@ -13,6 +15,8 @@ param(
     [switch]$RemoveTask,
     [switch]$DryRun,
     [switch]$EnsureTables,
+    [switch]$NoSpeedtest,
+    [switch]$SpeedtestWrite,
     [ValidateRange(5, 1440)]
     [int]$IntervalMinutes = 30
 )
@@ -61,9 +65,13 @@ function Remove-SyncTask {
 if ($RegisterTask) { exit (Register-SyncTask) }
 if ($RemoveTask) { exit (Remove-SyncTask) }
 
+if ($NoSpeedtest -and $SpeedtestWrite) { Write-Error '-NoSpeedtest and -SpeedtestWrite are mutually exclusive'; exit 2 }
+
 $argsPy = @($scriptPy)
 if ($DryRun) { $argsPy += '--dry-run' }
 if ($EnsureTables) { $argsPy += '--ensure-tables' }
+if ($NoSpeedtest) { $argsPy += '--no-speedtest' }
+if ($SpeedtestWrite) { $argsPy += '--speedtest-write' }
 
 Push-Location $repoRoot
 try {
