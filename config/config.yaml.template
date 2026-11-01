@@ -154,6 +154,7 @@ rules:
   - DOMAIN-SUFFIX,chatgpt.com,US-FAST
 
   # TikTok
+  - DOMAIN-SUFFIX,jinritemai.com,DIRECT
   - GEOSITE,tiktok,VIETNAM
   - DOMAIN-SUFFIX,tiktok.com,VIETNAM
   - DOMAIN-SUFFIX,tiktokv.com,VIETNAM
