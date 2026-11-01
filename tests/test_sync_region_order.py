@@ -9,6 +9,10 @@ Covered contracts:
     per source, skip_dead on/off, and default-off still attempts dead leaves
   * by_source log fields + `ipinfo done planned/attempted/skipped/remain`
   * --ipinfo-skip-dead default is off (opt-in switch, --no- still works)
+  * Stage 2B: dead-leaf time sub-budget / max-probe cap (`dead_budget` log),
+    pass2 re-probe of alive+unknown leaves while budget remains,
+    meta/info row filtering in build_pool, stale mihomo-feishu-* temp dir
+    cleanup, --ipinfo-budget-s / --ipinfo-dead-max passthrough defaults
 
 No network: probe_direct_geo / select_proxy / fetch_geo_via_mixed / urlopen
 are stubbed.
@@ -18,7 +22,9 @@ import importlib.util
 import json
 import os
 import sys
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,18 +101,26 @@ class LookupHarness(unittest.TestCase):
     """Runs lookup_regions_isolated against stubs."""
 
     def run_lookup(self, names, source_of=None, delays=None, geo_for=None,
-                   skip_dead=False, budget_s=1000.0, clock=None, select_ok=None):
+                   skip_dead=False, budget_s=1000.0, clock=None, select_ok=None,
+                   geo_seq=None, dead_max_probes=0, dead_budget_ratio=0.2):
         log = RecordingLog()
         geo_for = geo_for or {}
+        geo_seq = geo_seq or {}
         select_ok = select_ok or {}
-        state = {"now": None}
+        state = {"now": None, "calls": {}}
 
         def fake_select(_api, _group, name, _token=None):
             state["now"] = name
             return select_ok.get(name, True)
 
         def fake_geo(_mixed_port, timeout_s=None):
-            return geo_for.get(state["now"], "未知")
+            name = state["now"]
+            state["calls"][name] = state["calls"].get(name, 0) + 1
+            seq = geo_seq.get(name)
+            if seq:
+                idx = min(state["calls"][name] - 1, len(seq) - 1)
+                return seq[idx]
+            return geo_for.get(name, "未知")
 
         def fake_urlopen(_url, timeout=None):
             return _FakeResponse({"now": state["now"]})
@@ -125,12 +139,13 @@ class LookupHarness(unittest.TestCase):
             regions = sync.lookup_regions_isolated(
                 "http://127.0.0.1:1", 7890, names, log,
                 source_of=source_of, skip_dead=skip_dead, delays=delays,
-                budget_s=budget_s,
+                budget_s=budget_s, dead_budget_ratio=dead_budget_ratio,
+                dead_max_probes=dead_max_probes,
             )
         finally:
             for item in reversed(patches):
                 item.stop()
-        return regions, log
+        return regions, log, state
 
 
 class InterleaveBySourceTests(unittest.TestCase):
@@ -222,7 +237,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
     }
 
     def test_budget_exhaustion_counts_remain_per_source(self):
-        regions, log = self.run_lookup(
+        regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, geo_for=self.GEO,
             budget_s=2.0, clock=_ticking_clock(),
         )
@@ -244,7 +259,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
         self.assertIn("ipinfo remain_by_source B=1 CoffeeCloud=2", text)
 
     def test_budget_exhausted_immediately_marks_all_unknown(self):
-        regions, log = self.run_lookup(
+        regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, geo_for=self.GEO, budget_s=-1.0,
         )
         self.assertTrue(all(regions[name] == "未知" for name in self.NAMES))
@@ -252,7 +267,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
 
     def test_skip_dead_on_never_attempts_dead_leaves(self):
         delays = {"a1": 100, "a2": None, "b1": 120, "c1": None, "c2": 130}
-        regions, log = self.run_lookup(
+        regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, delays=delays, geo_for=self.GEO,
             skip_dead=True,
         )
@@ -271,7 +286,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
 
     def test_skip_dead_off_by_default_attempts_dead_leaves(self):
         delays = {"a1": 100, "a2": None, "b1": 120, "c1": None, "c2": 130}
-        regions, log = self.run_lookup(
+        regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, delays=delays, geo_for=self.GEO,
         )
         # Default is off: a ChatGPT delay failure must not skip the geo probe.
@@ -287,7 +302,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
 
     def test_by_source_fields(self):
         select_ok = {"b1": False}
-        regions, log = self.run_lookup(
+        regions, log, _state = self.run_lookup(
             self.NAMES, self.SOURCE_OF, geo_for=self.GEO, select_ok=select_ok,
         )
         self.assertEqual(regions["b1"], "未知")
@@ -313,7 +328,7 @@ class LookupRegionsIsolatedTests(LookupHarness):
         # Identical geo for every leaf trips validate_region_diversity, which
         # blanks the whole table; final_unknown must report that, not the ok count.
         same = {name: "新加坡/9.9.9.9" for name in self.NAMES}
-        regions, log = self.run_lookup(self.NAMES, self.SOURCE_OF, geo_for=same)
+        regions, log, _state = self.run_lookup(self.NAMES, self.SOURCE_OF, geo_for=same)
         self.assertTrue(all(regions[name] == "未知" for name in self.NAMES))
         by_source = _by_source_lines(log)
         self.assertEqual(by_source["A"]["final_unknown"], 2)
@@ -339,6 +354,225 @@ class SkipDeadDefaultTests(unittest.TestCase):
 
         params = inspect.signature(sync.lookup_regions_isolated).parameters
         self.assertFalse(params["skip_dead"].default)
+
+
+class DeadBudgetTests(LookupHarness):
+    """Delay-dead leaves: short timeout + ≤20% sub-budget (+ optional max N)."""
+
+    NAMES = ["a1", "d1", "d2", "d3"]
+    SOURCE_OF = {"a1": "A", "d1": "A", "d2": "A", "d3": "A"}
+    GEO = {
+        "a1": "新加坡/1.1.1.1",
+        "d1": "日本/2.2.2.2",
+        "d2": "美国/3.3.3.3",
+        "d3": "香港/4.4.4.4",
+    }
+    DELAYS = {"a1": 50, "d1": None, "d2": 0, "d3": None}
+
+    def _dead_log_line(self, log):
+        lines = [m for _lvl, m in log.lines if "ipinfo dead_budget" in m]
+        self.assertTrue(lines, "dead_budget summary line missing")
+        return lines[0]
+
+    def test_dead_time_sub_budget_stops_later_dead_probes(self):
+        # Ticking clock: each monotonic() burns 1s. budget=10 → dead cap=2s.
+        # Per dead probe the clock is called: header + before + after = 3 ticks
+        # but only (after-before)=2s is counted as dead time... verify with the
+        # actual call pattern: d1 consumes ticks 3,4 → 1.0s; d2 ticks 6,7 → 1.0s;
+        # after d2, dead_spent=2.0 >= cap → d3 skipped as dead_budget, not probed.
+        regions, log, state = self.run_lookup(
+            self.NAMES, self.SOURCE_OF, delays=self.DELAYS, geo_for=self.GEO,
+            budget_s=10.0, clock=_ticking_clock(),
+        )
+        self.assertEqual(regions["a1"], self.GEO["a1"])
+        self.assertEqual(regions["d1"], self.GEO["d1"])
+        self.assertEqual(regions["d2"], self.GEO["d2"])
+        self.assertEqual(regions["d3"], "未知")
+        self.assertNotIn("d3", state["calls"], "d3 must not be probed after cap")
+        line = self._dead_log_line(log)
+        self.assertIn("probed=2", line)
+        self.assertIn("skipped=1", line)
+        text = log.text()
+        self.assertIn("dead_skipped=1", text)
+        # skipped_dead (the flag path) must stay distinct from dead_budget.
+        by_source = _by_source_lines(log)
+        self.assertEqual(by_source["A"]["skipped_dead"], 0)
+
+    def test_dead_max_probes_caps_attempt_count(self):
+        regions, log, state = self.run_lookup(
+            self.NAMES, self.SOURCE_OF, delays=self.DELAYS, geo_for=self.GEO,
+            dead_max_probes=1,
+        )
+        self.assertEqual(regions["d1"], self.GEO["d1"])
+        self.assertEqual(regions["d2"], "未知")
+        self.assertEqual(regions["d3"], "未知")
+        self.assertEqual(state["calls"].get("d2"), None)
+        line = self._dead_log_line(log)
+        self.assertIn("probed=1", line)
+        self.assertIn("skipped=2", line)
+
+    def test_alive_nodes_ignore_dead_budget(self):
+        delays = {name: 100 for name in self.NAMES}
+        regions, log, state = self.run_lookup(
+            self.NAMES, self.SOURCE_OF, delays=delays, geo_for=self.GEO,
+            dead_max_probes=1,
+        )
+        for name in self.NAMES:
+            self.assertEqual(regions[name], self.GEO[name])
+        self.assertIn("probed=0", self._dead_log_line(log))
+
+
+class Pass2Tests(LookupHarness):
+    """After pass1, alive-but-unknown leaves are re-probed while budget remains."""
+
+    NAMES = ["a1", "b1", "d1"]
+    SOURCE_OF = {"a1": "A", "b1": "B", "d1": "A"}
+    GEO = {"a1": "美国/3.3.3.3", "b1": "日本/2.2.2.2", "d1": "香港/4.4.4.4"}
+    DELAYS = {"a1": 50, "b1": 60, "d1": None}
+
+    def test_pass2_recovers_alive_unknown(self):
+        regions, log, state = self.run_lookup(
+            self.NAMES, self.SOURCE_OF, delays=self.DELAYS,
+            geo_seq={"a1": ["未知", "美国/3.3.3.3"]}, geo_for=self.GEO,
+        )
+        self.assertEqual(regions["a1"], "美国/3.3.3.3")
+        self.assertEqual(state["calls"]["a1"], 2, "a1 probed twice (pass1 fail + pass2)")
+        self.assertIn("ipinfo pass2 targets=1 tried=1 ok=1", log.text())
+        self.assertIn("pass2_tried=1 pass2_ok=1", log.text())
+
+    def test_pass2_excludes_dead_and_already_ok(self):
+        regions, log, state = self.run_lookup(
+            self.NAMES, self.SOURCE_OF, delays=self.DELAYS,
+            geo_seq={"d1": ["未知", "never"]}, geo_for={k: v for k, v in self.GEO.items() if k != "d1"},
+        )
+        # d1 is dead+unknown: pass2 must not re-probe it (delay>0 gate).
+        self.assertEqual(state["calls"].get("d1"), 1)
+        self.assertEqual(state["calls"].get("b1"), 1)
+        self.assertIn("ipinfo pass2 targets=0 tried=0 ok=0", log.text())
+
+    def test_pass2_skipped_when_budget_exhausted(self):
+        names = ["a1", "a2", "a3"]
+        source_of = {n: "A" for n in names}
+        delays = {n: 50 for n in names}
+        geo = {"a1": "未知", "a2": "日本/2.2.2.2", "a3": "美国/3.3.3.3"}
+        regions, log, state = self.run_lookup(
+            names, source_of, delays=delays, geo_for=geo,
+            budget_s=2.0, clock=_ticking_clock(),
+        )
+        # pass1: a1 probed (unknown), a2 probed, a3 hits budget_exhausted.
+        self.assertIn("ipinfo budget_exhausted attempted=2", log.text())
+        # pass2 gate: no wall-clock left → nothing re-probed.
+        self.assertEqual(state["calls"].get("a1"), 1)
+        self.assertIn("ipinfo pass2 targets=2 tried=0 ok=0", log.text())
+
+
+class MetaFilterTests(unittest.TestCase):
+    INFO_NAMES = [
+        "📱剩余流量：128GB",
+        "流量重置时间",
+        "到期时间: 2026-11-01",
+        "官网 www.example.com",
+        "Traffic 50GB Left",
+        "Expire 2026/12/31",
+        "Reset Quota Here",
+        "Official Website",
+    ]
+    NODE_NAMES = [
+        "🇺🇸 美国-01",
+        "CoffeeCloud-JP-优化",
+        "TW-HS-3",
+        "Singapore 02",
+    ]
+
+    def test_info_rows_flagged(self):
+        for name in self.INFO_NAMES:
+            self.assertTrue(sync.is_meta_info_name(name), name)
+
+    def test_real_nodes_not_flagged(self):
+        for name in self.NODE_NAMES:
+            self.assertFalse(sync.is_meta_info_name(name), name)
+
+    def test_empty_name_not_flagged(self):
+        self.assertFalse(sync.is_meta_info_name(""))
+
+    def test_build_pool_drops_meta_rows(self):
+        src = sync.SourceResult(3, "CoffeeCloud")
+        src.nodes = [
+            {"name": "🇺🇸 美国-01", "type": "ss", "server": "h1", "port": 1},
+            {"name": "剩余流量：128GB", "type": "ss", "server": "h2", "port": 2},
+            {"name": "Expire 2026", "type": "ss", "server": "h3", "port": 3},
+            {"name": "JP-02", "type": "ss", "server": "h4", "port": 4},
+        ]
+        log = RecordingLog()
+        pool = sync.build_pool([src], log=log)
+        names = [node["name"] for node, _ in pool]
+        self.assertEqual(names, ["🇺🇸 美国-01", "JP-02"])
+        self.assertIn("pool meta_skipped count=2", log.text())
+
+    def test_build_pool_without_log_still_filters(self):
+        src = sync.SourceResult(3, "CoffeeCloud")
+        src.nodes = [{"name": "官网入口", "type": "ss", "server": "h", "port": 1}]
+        self.assertEqual(sync.build_pool([src]), [])
+
+
+class CorpseCleanupTests(unittest.TestCase):
+    def test_find_stale_dirs_only_matching_and_old(self):
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as root:
+            old_dir = Path(root) / "mihomo-feishu-old"
+            fresh_dir = Path(root) / "mihomo-feishu-fresh"
+            other_dir = Path(root) / "not-mihomo"
+            for d in (old_dir, fresh_dir, other_dir):
+                d.mkdir()
+            stale = sync.find_stale_corpse_dirs(
+                [root], max_age_s=1800.0, now=time.time(),
+            )
+            self.assertEqual(stale, [])
+            # age them artificially
+            past = time.time() - 7200
+            os.utime(old_dir, (past, past))
+            stale = sync.find_stale_corpse_dirs([root], max_age_s=1800.0)
+            self.assertEqual([p.name for p in stale], ["mihomo-feishu-old"])
+
+    def test_cleanup_removes_stale_keeps_production(self):
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as root:
+            old_dir = Path(root) / "mihomo-feishu-old"
+            fresh_dir = Path(root) / "mihomo-feishu-fresh"
+            prod = Path(root) / "mihomo-production"
+            for d in (old_dir, fresh_dir, prod):
+                d.mkdir()
+                (d / "config.yaml").write_text("x", encoding="utf-8")
+            past = time.time() - 7200
+            os.utime(old_dir, (past, past))
+            log = RecordingLog()
+            with patch.object(sync, "_kill_corpse_processes", lambda _log: 2):
+                procs, dirs = sync.cleanup_temp_corpses(log, temp_roots=[root])
+            self.assertEqual((procs, dirs), (2, 1))
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(fresh_dir.exists())
+            self.assertTrue(prod.exists())
+
+
+class Stage2BFlagTests(unittest.TestCase):
+    def test_ipinfo_budget_s_default_and_override(self):
+        self.assertEqual(sync.parse_args([]).ipinfo_budget_s, sync.IPINFO_TOTAL_BUDGET_S)
+        self.assertEqual(sync.parse_args(["--ipinfo-budget-s", "120"]).ipinfo_budget_s, 120.0)
+
+    def test_ipinfo_dead_max_default(self):
+        self.assertEqual(sync.parse_args([]).ipinfo_dead_max, 0)
+        self.assertEqual(sync.parse_args(["--ipinfo-dead-max", "8"]).ipinfo_dead_max, 8)
+
+    def test_dead_constants(self):
+        self.assertEqual(sync.IPINFO_DEAD_TIMEOUT_S, 2.0)
+        self.assertEqual(sync.IPINFO_DEAD_BUDGET_RATIO, 0.2)
+
+    def test_test_isolated_pass_through_defaults(self):
+        import inspect
+
+        params = inspect.signature(sync.test_isolated).parameters
+        self.assertEqual(params["ipinfo_budget_s"].default, sync.IPINFO_TOTAL_BUDGET_S)
+        self.assertEqual(params["ipinfo_dead_max"].default, 0)
 
 
 if __name__ == "__main__":

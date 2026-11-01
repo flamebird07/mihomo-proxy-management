@@ -699,6 +699,103 @@ def release_sync_lock(lock: SyncLock | None, log: "Logger") -> None:
     lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Corpse cleanup (temp isolated instances only — production 6440/7890/9090
+# and every live mihomo process must NEVER be touched by this path)
+# ---------------------------------------------------------------------------
+
+CORPSE_DIR_PREFIX = "mihomo-feishu-"
+
+
+def _kill_corpse_processes(log: "Logger") -> int:
+    """Terminate stray processes whose command line references a mihomo-feishu- temp dir."""
+    killed = 0
+    try:
+        if os.name == "nt":
+            ps = (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.ProcessId -ne $PID -and $_.Name -match 'mihomo' -and "
+                "$_.CommandLine -match 'mihomo-feishu-' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for line in (out.stdout or "").splitlines():
+                if line.strip().isdigit():
+                    killed += 1
+        else:
+            out = subprocess.run(
+                ["sh", "-c", "ps -eo pid=,args= | grep 'mihomo-feishu-' | grep -v grep"],
+                capture_output=True, text=True, timeout=20,
+            )
+            for line in (out.stdout or "").splitlines():
+                parts = line.strip().split(None, 1)
+                if not parts or not parts[0].isdigit():
+                    continue
+                pid = int(parts[0])
+                try:
+                    os.kill(pid, 15)
+                    killed += 1
+                except OSError:
+                    pass
+    except Exception as exc:
+        log.warn(f"cleanup corpses procs_failed class={type(exc).__name__}")
+    return killed
+
+
+def find_stale_corpse_dirs(
+    temp_roots: list[str],
+    max_age_s: float = 1800.0,
+    now: float | None = None,
+) -> list[Path]:
+    """mihomo-feishu-* dirs under temp roots older than max_age_s (never the fresh one)."""
+    hits: list[Path] = []
+    current = now if now is not None else time.time()
+    for root in temp_roots:
+        base = Path(root)
+        try:
+            if not base.is_dir():
+                continue
+            children = list(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.name.startswith(CORPSE_DIR_PREFIX) or not child.is_dir():
+                continue
+            try:
+                age = current - child.stat().st_mtime
+            except OSError:
+                continue
+            if age >= max_age_s:
+                hits.append(child)
+    return hits
+
+
+def cleanup_temp_corpses(
+    log: "Logger",
+    temp_roots: list[str] | None = None,
+    max_age_s: float = 1800.0,
+) -> tuple[int, int]:
+    """Best-effort: kill stray temp-instance processes, then drop stale temp dirs.
+
+    Only targets anything named `mihomo-feishu-*`; production ports 6440/7890/9090
+    and production processes are out of scope by construction.
+    """
+    killed = _kill_corpse_processes(log)
+    roots = temp_roots or [tempfile.gettempdir()]
+    dirs_removed = 0
+    for path in find_stale_corpse_dirs(roots, max_age_s=max_age_s):
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            dirs_removed += 1
+        except OSError:
+            pass
+    return killed, dirs_removed
+
+
 
 # ---------------------------------------------------------------------------
 # Feishu client
@@ -1662,12 +1759,38 @@ def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> b
     return True
 
 
-def build_pool(results: list[SourceResult]) -> list[tuple[dict, str]]:
+# Info/plan rows shipped as "nodes" by some subscriptions (traffic quota, expiry,
+# official-site links…). They are never real proxies, so they must not enter the
+# geo probe pool nor the speedtest-eligible node table.
+META_INFO_PATTERNS: tuple[str, ...] = (
+    "流量", "剩余", "到期", "官网", "重置", "用量", "使用量", "余额",
+    "公告", "通知", "查询", "续费", "购买", "注册", "域名", "已用完",
+    "traffic", "expire", "expiry", "reset", "official", "quota", "usage",
+    "renew", "register", "purchase", "announce", "notice", "website",
+    "homepage", "token",
+)
+
+
+def is_meta_info_name(name: str) -> bool:
+    lowered = str(name or "").lower()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in META_INFO_PATTERNS)
+
+
+def build_pool(
+    results: list[SourceResult],
+    log: "Logger | None" = None,
+) -> list[tuple[dict, str]]:
     pool: list[tuple[dict, str]] = []
     seen_keys: set[tuple] = set()
     used_names: set[str] = set()
+    meta_skipped = 0
     for result in results:
         for node in result.nodes:
+            if is_meta_info_name(node.get("name") or ""):
+                meta_skipped += 1
+                continue
             key = (node.get("type"), node.get("server"), node.get("port"))
             if key in seen_keys:
                 continue
@@ -1679,6 +1802,8 @@ def build_pool(results: list[SourceResult]) -> list[tuple[dict, str]]:
                 suffix += 1
             used_names.add(candidate)
             pool.append(({**node, "name": candidate}, result.name))
+    if log is not None and meta_skipped:
+        log.info(f"pool meta_skipped count={meta_skipped}")
     return pool
 
 
@@ -1706,6 +1831,8 @@ def pick_ports(mixed_port: int, controller_port: int) -> tuple[int, int]:
 # Per-node geo via isolated mixed-port (mode=rule + TEST select). Never use live :7890.
 IPINFO_TIMEOUT_S = 5.0
 IPINFO_TOTAL_BUDGET_S = 600.0  # 10 minutes hard cap for the region pass
+IPINFO_DEAD_TIMEOUT_S = 2.0    # short per-probe cap for delay-dead leaves
+IPINFO_DEAD_BUDGET_RATIO = 0.2  # dead probes may burn ≤20% of the geo budget
 GEO_ENDPOINTS = (
     "https://api.ip.sb/geoip",
     "https://ipapi.co/json/",
@@ -1922,6 +2049,29 @@ def _count_by_source(names: list[str], source_of: dict[str, str] | None) -> str:
     return " ".join(f"{source}={count}" for source, count in counts.items())
 
 
+def _probe_region_once(
+    api: str,
+    mixed_port: int,
+    name: str,
+    timeout_s: float,
+    log: "Logger",
+) -> str:
+    """Select leaf on TEST, verify `now`, fetch geo via mixed port. 未知 on any failure."""
+    if not select_proxy(api, "TEST", name):
+        return "未知"
+    try:
+        with urllib.request.urlopen(
+            f"{api}/proxies/{urllib.parse.quote('TEST', safe='')}", timeout=3
+        ) as resp:
+            now = json.loads(resp.read().decode("utf-8", "replace")).get("now")
+        if now != name:
+            log.warn(f"ipinfo select_mismatch want={name} now={now}")
+            return "未知"
+    except Exception:
+        return "未知"
+    return fetch_geo_via_mixed(mixed_port, timeout_s=timeout_s)
+
+
 def lookup_regions_isolated(
     api: str,
     mixed_port: int,
@@ -1932,12 +2082,19 @@ def lookup_regions_isolated(
     source_of: dict[str, str] | None = None,
     skip_dead: bool = False,
     delays: dict[str, int | None] | None = None,
+    dead_timeout_s: float = IPINFO_DEAD_TIMEOUT_S,
+    dead_budget_ratio: float = IPINFO_DEAD_BUDGET_RATIO,
+    dead_max_probes: int = 0,
 ) -> dict[str, str]:
     """Sequential: PUT TEST to leaf (mode=rule) -> geo via that mixed-port. No live switches.
 
     `names` is expected pre-ordered (delay-alive first, source-interleaved).
     skip_dead marks delay-failed leaves 未知 without spending geo budget; it is
     off by default because a ChatGPT delay failure is not a geo failure.
+    Dead leaves (delay<=0, when delays are known) get a short per-probe timeout and
+    a sub-budget (dead_budget_ratio of budget_s, optional max attempts); over-budget
+    dead leaves are marked 未知 with a `dead_budget` log. After pass1, alive leaves
+    still 未知 are re-probed while wall-clock budget remains (pass2).
     """
     regions: dict[str, str] = {}
     started = time.monotonic()
@@ -1970,6 +2127,10 @@ def lookup_regions_isolated(
             log.info(f"ipinfo skip_dead count={skipped} pending={len(pending)}")
     else:
         pending = list(names)
+    dead_cap = max(0.0, budget_s * dead_budget_ratio)
+    dead_spent = 0.0
+    dead_probed = 0
+    dead_skipped = 0
     direct_geo = probe_direct_geo(timeout_s=timeout_s)
     if direct_geo:
         log.info(f"ipinfo direct_fingerprint={direct_geo}")
@@ -1989,30 +2150,66 @@ def lookup_regions_isolated(
             for rest in remain:
                 regions.setdefault(rest, "未知")
             break
+        is_dead = delays is not None and (delays.get(name) or 0) <= 0
+        if is_dead and (
+            dead_spent >= dead_cap
+            or (dead_max_probes > 0 and dead_probed >= dead_max_probes)
+        ):
+            regions[name] = "未知"
+            dead_skipped += 1
+            continue
         source = source_of.get(name) or "unknown"
         tried_by_source[source] = tried_by_source.get(source, 0) + 1
-        if not select_proxy(api, "TEST", name):
-            regions[name] = "未知"
-            continue
-        try:
-            with urllib.request.urlopen(
-                f"{api}/proxies/{urllib.parse.quote('TEST', safe='')}", timeout=3
-            ) as resp:
-                now = json.loads(resp.read().decode("utf-8", "replace")).get("now")
-            if now != name:
-                log.warn(f"ipinfo select_mismatch want={name} now={now}")
-                regions[name] = "未知"
-                continue
-        except Exception:
-            regions[name] = "未知"
-            continue
-        value = fetch_geo_via_mixed(mixed_port, timeout_s=timeout_s)
+        if is_dead:
+            probe_started = time.monotonic()
+        value = _probe_region_once(
+            api, mixed_port, name, dead_timeout_s if is_dead else timeout_s, log
+        )
+        if is_dead:
+            dead_spent += time.monotonic() - probe_started
+            dead_probed += 1
         regions[name] = value
         if value and value != "未知":
             ok += 1
             ok_by_source[source] = ok_by_source.get(source, 0) + 1
         if index % 20 == 0 or index == len(pending):
             log.info(f"ipinfo progress={index}/{len(pending)} ok={ok}")
+    # Pass2: alive leaves still unknown after pass1 get one more attempt, only
+    # while the overall wall-clock budget remains. Dead leaves are excluded.
+    pass2_tried = 0
+    pass2_ok = 0
+    targets: list[str] = []
+    if delays is not None:
+        targets = [
+            name for name in pending
+            if (delays.get(name) or 0) > 0
+            and (regions.get(name) or "").strip() in ("", "未知")
+        ]
+    if targets:
+        targets = interleave_by_source(targets, source_of)
+        left = budget_s - (time.monotonic() - started)
+        for name in targets:
+            if time.monotonic() - started > budget_s:
+                break
+            pass2_tried += 1
+            value = _probe_region_once(api, mixed_port, name, timeout_s, log)
+            if value and value != "未知":
+                regions[name] = value
+                ok += 1
+                source = source_of.get(name) or "unknown"
+                ok_by_source[source] = ok_by_source.get(source, 0) + 1
+                pass2_ok += 1
+        log.info(
+            f"ipinfo pass2 targets={len(targets)} tried={pass2_tried} ok={pass2_ok} "
+            f"budget_left={left:.1f}s"
+        )
+    else:
+        log.info("ipinfo pass2 targets=0 tried=0 ok=0 budget_left=0.0s")
+    if delays is not None:
+        log.info(
+            f"ipinfo dead_budget probed={dead_probed} skipped={dead_skipped} "
+            f"spent={dead_spent:.1f}s cap={dead_cap:.1f}s max_probes={dead_max_probes}"
+        )
     regions = validate_region_diversity(regions, names, log, direct_geo=direct_geo)
     # final_unknown counts what the caller will actually write, i.e. after the
     # diversity gate may have blanked the whole table.
@@ -2034,7 +2231,8 @@ def lookup_regions_isolated(
         )
     log.info(
         f"ipinfo done planned={len(names)} attempted={sum(tried_by_source.values())} "
-        f"ok={ok} skipped={skipped} remain={remain_count}"
+        f"ok={ok} skipped={skipped} remain={remain_count} "
+        f"pass2_tried={pass2_tried} pass2_ok={pass2_ok} dead_skipped={dead_skipped}"
     )
     return regions
 
@@ -2058,7 +2256,9 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
 def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: int,
                   controller_port: int, target: str, timeout_ms: int, workers: int,
                   log: Logger, source_of: dict[str, str] | None = None,
-                  ipinfo_skip_dead: bool = False) -> tuple[dict[str, int | None], dict[str, str]]:
+                  ipinfo_skip_dead: bool = False,
+                  ipinfo_budget_s: float = IPINFO_TOTAL_BUDGET_S,
+                  ipinfo_dead_max: int = 0) -> tuple[dict[str, int | None], dict[str, str]]:
     if not Path(core).exists():
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
@@ -2117,11 +2317,13 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         log.info(f"ipinfo order_sample {sample}")
         log.info(
             f"ipinfo enter nodes={len(names)} timeout_s={IPINFO_TIMEOUT_S} "
-            f"skip_dead={ipinfo_skip_dead}"
+            f"skip_dead={ipinfo_skip_dead} budget_s={ipinfo_budget_s} "
+            f"dead_max={ipinfo_dead_max}"
         )
         regions = lookup_regions_isolated(
             api, mixed, ordered, log,
             source_of=source_of, skip_dead=ipinfo_skip_dead, delays=delays,
+            budget_s=ipinfo_budget_s, dead_max_probes=ipinfo_dead_max,
         )
         return delays, regions
     finally:
@@ -2375,6 +2577,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=False,
                         help="Skip geo for delay-failed leaves (mark 未知); default off "
                              "— delay failure is ChatGPT reachability, not geo failure")
+    parser.add_argument("--ipinfo-budget-s", type=float, default=IPINFO_TOTAL_BUDGET_S,
+                        help="Wall-clock cap for the geo region pass, seconds (default 600)")
+    parser.add_argument("--ipinfo-dead-max", type=int, default=0,
+                        help="Max geo probes for delay-dead leaves (0 = time sub-budget only)")
     parser.add_argument("--keep-placeholder", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
@@ -2423,6 +2629,12 @@ def main(argv: list[str] | None = None) -> int:
             log.error(f"sync failed class={exc.kind} detail={exc.detail}")
             print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
             return 1
+
+        try:
+            procs_killed, dirs_removed = cleanup_temp_corpses(log)
+            log.info(f"cleanup corpses procs={procs_killed} dirs={dirs_removed}")
+        except Exception as exc:  # never fatal: cleanup is best-effort
+            log.warn(f"cleanup corpses failed class={type(exc).__name__}")
 
         env = read_env_file(args.env_file)
         app_id = (env.get("FEISHU_APP_ID") or "").strip()
@@ -2521,7 +2733,7 @@ def main(argv: list[str] | None = None) -> int:
                 first.error = f"{first.error or 'fetch_failed'}; using cache"
 
         # --- pool + speed test ------------------------------------------
-        pool = build_pool(results)
+        pool = build_pool(results, log=log)
         if args.limit and len(pool) > args.limit:
             pool = pool[: args.limit]
         log.info(f"pool nodes={len(pool)}")
@@ -2545,6 +2757,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.controller_port, args.target, args.timeout_ms,
                     args.workers, log,
                     source_of=source_of, ipinfo_skip_dead=args.ipinfo_skip_dead,
+                    ipinfo_budget_s=args.ipinfo_budget_s,
+                    ipinfo_dead_max=args.ipinfo_dead_max,
                 )
                 log.info(f"speedtest isolated done tested={len(delays)}")
                 speedtest_ran = True
