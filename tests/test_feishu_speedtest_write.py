@@ -164,6 +164,7 @@ class MainFlowMockClientTests(unittest.TestCase):
             "--sources-env", os.path.join(tmp, "missing-sources.env"),
             "--live-env", os.path.join(tmp, "missing-live.env"),
             "--state-file", os.path.join(tmp, "missing-state.json"),
+            "--gpt-history-file", os.path.join(tmp, "gpt-history.json"),
             "--lock-file", os.path.join(tmp, "sync.lock"),
         ] + extra_argv
 

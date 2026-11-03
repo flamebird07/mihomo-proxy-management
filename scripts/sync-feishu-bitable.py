@@ -79,6 +79,12 @@ DEFAULT_LOG_FILE = r"C:\mihomo\logs\feishu-bitable-sync.log"
 DEFAULT_SOURCES_ENV = str(SCRIPT_DIR.parent / "config" / "subscription.env")
 DEFAULT_CORE = r"C:\mihomo\mihomo.exe"
 DEFAULT_TARGET = "https://grok.com/cdn-cgi/trace"
+CHATGPT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
+OPENAI_TARGET = "https://api.openai.com"
+DEFAULT_GPT_HISTORY_FILE = r"C:\mihomo\feishu-gpt-history.json"
+GPT_REQUIRED_CONSECUTIVE = 2
+SPEEDTEST_MAX_WORKERS = 4
+SPEEDTEST_TOTAL_BUDGET_S = 600.0
 DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
@@ -164,6 +170,8 @@ TABLE_SPECS: list[dict[str, Any]] = [
             # Free-form from ipinfo.io/json via that node: 中文 国家/地区/城市 or "未知".
             ("实际地区", FT_TEXT, None),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
+            ("chatgpt延迟ms", FT_NUMBER, NUMBER_PROPERTY),
+            ("openai延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("存活", FT_CHECKBOX, None),
             ("测速目标", FT_TEXT, None),
             ("同步时间", FT_DATE_TIME, DATE_PROPERTY),
@@ -180,6 +188,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "西瓜加速", "未知")]}),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("GPT可用", FT_CHECKBOX, None),
+            ("连续通过轮数", FT_NUMBER, NUMBER_PROPERTY),
             ("代理组", FT_TEXT, None),
             ("同步时间", FT_DATE_TIME, DATE_PROPERTY),
         ],
@@ -1424,15 +1433,34 @@ def interleave_by_source(
     return result
 
 
+def rotate_each_source(
+    names: list[str], source_of: dict[str, str] | None, offset: int
+) -> list[str]:
+    """Rotate each source bucket before interleaving so repeated runs do not starve tails."""
+    if not names or not offset:
+        return list(names)
+    buckets: dict[str, list[str]] = {}
+    for name in names:
+        buckets.setdefault(str((source_of or {}).get(name) or ""), []).append(name)
+    rotated: list[tuple[str, str]] = []
+    for source, series in buckets.items():
+        start = offset % len(series)
+        rotated.extend((name, source) for name in series[start:] + series[:start])
+    return interleave_by_source(rotated)
+
+
 def order_names_for_ipinfo(
     names: list[str],
     delays: dict[str, int | None],
     source_of: dict[str, str] | None = None,
+    rotation_offset: int = 0,
 ) -> list[str]:
     """Geo order: delay-alive leaves first, source-interleaved; then the dead ones."""
     alive = [name for name in names if (delays.get(name) or 0) > 0]
     alive_set = set(alive)
     dead = [name for name in names if name not in alive_set]
+    alive = rotate_each_source(alive, source_of, rotation_offset)
+    dead = rotate_each_source(dead, source_of, rotation_offset)
     return interleave_by_source(alive, source_of) + interleave_by_source(dead, source_of)
 
 
@@ -1694,6 +1722,19 @@ def load_cache_nodes(paths: list[str], log: Logger) -> list[dict]:
     return nodes
 
 
+def cache_file_time(paths: list[str]) -> str:
+    """Return the first available cache mtime without exposing its path/content."""
+    for raw in paths:
+        path = Path(raw)
+        try:
+            if path.exists():
+                stamp = dt.datetime.fromtimestamp(path.stat().st_mtime)
+                return stamp.strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            continue
+    return "未知"
+
+
 def source_cache_path(index: int, cache_dir: str | None = None) -> Path:
     return Path(cache_dir or DEFAULT_PROVIDER_DIR) / f"source{index}-cache.yaml"
 
@@ -1761,7 +1802,10 @@ def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> b
         return False
     result.nodes = cached
     result.result = "缓存"
-    result.error = f"{result.error or 'fetch_failed'}; using cache"
+    result.error = (
+        f"{result.error or 'fetch_failed'}; using cache; "
+        f"缓存文件时间={cache_file_time(paths)}"
+    )
     log.info(f"source#{result.index} cache_fallback nodes={len(cached)} class=cache_used")
     return True
 
@@ -2247,8 +2291,12 @@ def lookup_regions_isolated(
 
 
 def request_delay(api: str, name: str, target: str, timeout_ms: int,
-                  token: str | None = None) -> int | None:
-    query = urllib.parse.urlencode({"url": target, "timeout": str(timeout_ms)})
+                  token: str | None = None,
+                  expected: str | None = None) -> int | None:
+    query_values = {"url": target, "timeout": str(timeout_ms)}
+    if expected:
+        query_values["expected"] = expected
+    query = urllib.parse.urlencode(query_values)
     endpoint = f"{api}/proxies/{urllib.parse.quote(name, safe='')}/delay?{query}"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     request = urllib.request.Request(endpoint, headers=headers)
@@ -2259,6 +2307,71 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
         return value if value > 0 else None
     except Exception:
         return None
+
+
+def combine_reachable_delays(
+    names: list[str], *delay_sets: dict[str, int | None]
+) -> dict[str, int | None]:
+    """Use any successful target to prioritize geo, without changing Grok alive counts."""
+    combined: dict[str, int | None] = {}
+    for name in names:
+        values = [int(delays.get(name) or 0) for delays in delay_sets]
+        best = max(values, default=0)
+        combined[name] = best if best > 0 else None
+    return combined
+
+
+def test_delay_targets(
+    api: str,
+    names: list[str],
+    targets: dict[str, str],
+    timeout_ms: int,
+    workers: int,
+    log: Logger,
+    budget_s: float = SPEEDTEST_TOTAL_BUDGET_S,
+    token: str | None = None,
+) -> dict[str, dict[str, int | None]]:
+    """Probe all node/target pairs with <=4 workers and a bounded wall-clock budget."""
+    safe_workers = max(1, min(int(workers), SPEEDTEST_MAX_WORKERS))
+    if safe_workers != workers:
+        log.info(f"speedtest workers_clamped requested={workers} effective={safe_workers}")
+    results = {label: {name: None for name in names} for label in targets}
+    if not names or not targets or budget_s <= 0:
+        return results
+    tasks = [(name, label, target) for name in names for label, target in targets.items()]
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=safe_workers)
+    futures = {
+        executor.submit(
+            request_delay, api, name, target, timeout_ms, token,
+            "200-299/421" if label == "openai" else None,
+        ): (name, label)
+        for name, label, target in tasks
+    }
+    # Leave enough time for at most one in-flight request wave to finish cleanly.
+    reserve_s = (max(1, timeout_ms) / 1000.0) + 6.0
+    wait_s = max(0.0, budget_s - reserve_s)
+    done, pending = concurrent.futures.wait(futures, timeout=wait_s)
+    for future in done:
+        name, label = futures[future]
+        try:
+            results[label][name] = future.result()
+        except Exception:
+            results[label][name] = None
+    for future in pending:
+        future.cancel()
+    executor.shutdown(wait=True, cancel_futures=True)
+    completed_by_label = {label: 0 for label in targets}
+    for future in done:
+        completed_by_label[futures[future][1]] += 1
+    for label, values in results.items():
+        ok = sum(1 for value in values.values() if value)
+        log.info(
+            f"speedtest target={label} tested={completed_by_label[label]} "
+            f"ok={ok} pending={len(pending)}"
+        )
+    if pending:
+        log.warn(f"speedtest budget_exhausted pending={len(pending)} budget_s={budget_s:.1f}")
+    return results
 
 
 class _QuotedString(str):
@@ -2300,7 +2413,9 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
                   log: Logger, source_of: dict[str, str] | None = None,
                   ipinfo_skip_dead: bool = False,
                   ipinfo_budget_s: float = IPINFO_TOTAL_BUDGET_S,
-                  ipinfo_dead_max: int = 0) -> tuple[dict[str, int | None], dict[str, str]]:
+                  ipinfo_dead_max: int = 0,
+                  include_reachability: bool = False,
+                  total_budget_s: float = SPEEDTEST_TOTAL_BUDGET_S):
     if not Path(core).exists():
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
@@ -2345,13 +2460,28 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
                 time.sleep(0.3)
         if not ready:
             raise SyncError("core_not_ready")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            delays = dict(
-                zip(names, pool.map(lambda n: request_delay(api, n, target, timeout_ms), names))
-            )
+        rotation = int(time.time() // (30 * 60))
+        fair_names = rotate_each_source(names, source_of, rotation)
+        target_results = test_delay_targets(
+            api,
+            fair_names,
+            {"grok": target, "chatgpt": CHATGPT_TARGET, "openai": OPENAI_TARGET},
+            timeout_ms,
+            workers,
+            log,
+            budget_s=total_budget_s,
+        )
+        delays = target_results["grok"]
+        chatgpt_delays = target_results["chatgpt"]
+        openai_delays = target_results["openai"]
         # Separate pass: egress IP geo via ipinfo through each node (not Grok delay).
-        ordered = order_names_for_ipinfo(names, delays, source_of)
-        alive = [name for name in names if (delays.get(name) or 0) > 0]
+        geo_delays = combine_reachable_delays(
+            names, delays, chatgpt_delays, openai_delays
+        )
+        ordered = order_names_for_ipinfo(
+            names, geo_delays, source_of, rotation_offset=rotation
+        )
+        alive = [name for name in names if (geo_delays.get(name) or 0) > 0]
         sample = " ".join(
             f"{name}({(source_of or {}).get(name) or '?'})" for name in ordered[:12]
         )
@@ -2362,11 +2492,19 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
             f"skip_dead={ipinfo_skip_dead} budget_s={ipinfo_budget_s} "
             f"dead_max={ipinfo_dead_max}"
         )
-        regions = lookup_regions_isolated(
-            api, mixed, ordered, log,
-            source_of=source_of, skip_dead=ipinfo_skip_dead, delays=delays,
-            budget_s=ipinfo_budget_s, dead_max_probes=ipinfo_dead_max,
-        )
+        # The <=10 minute cap above governs the three delay targets.  Geo has
+        # its own existing budget so a slow target pass cannot starve ipinfo.
+        if ipinfo_budget_s > 0:
+            regions = lookup_regions_isolated(
+                api, mixed, ordered, log,
+                source_of=source_of, skip_dead=ipinfo_skip_dead, delays=geo_delays,
+                budget_s=ipinfo_budget_s, dead_max_probes=ipinfo_dead_max,
+            )
+        else:
+            regions = {name: "未知" for name in names}
+            log.warn("ipinfo skipped reason=budget_disabled")
+        if include_reachability:
+            return delays, regions, chatgpt_delays, openai_delays
         return delays, regions
     finally:
         process.terminate()
@@ -2382,7 +2520,8 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
 
 
 def test_live(api: str, token: str | None, names: list[str], target: str,
-              timeout_ms: int, workers: int, log: Logger) -> dict[str, int | None]:
+              timeout_ms: int, workers: int, log: Logger,
+              include_reachability: bool = False):
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
         request = urllib.request.Request(f"{api}/proxies", headers=headers)
@@ -2394,15 +2533,23 @@ def test_live(api: str, token: str | None, names: list[str], target: str,
     testable = [name for name in names if name in available]
     log.info(f"live controller available={len(available)} testable={len(testable)}")
     if not testable:
-        return {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        delays = dict(
-            zip(
-                testable,
-                pool.map(lambda n: request_delay(api, n, target, timeout_ms, token), testable),
-            )
-        )
-    return delays
+        return ({}, {}, {}) if include_reachability else {}
+    targets = {"grok": target, "chatgpt": CHATGPT_TARGET, "openai": OPENAI_TARGET} \
+        if include_reachability else {"single": target}
+    values = test_delay_targets(
+        api, testable, targets, timeout_ms, workers, log, token=token
+    )
+    if include_reachability:
+        return values["grok"], values["chatgpt"], values["openai"]
+    return values["single"]
+
+
+def test_live_targets(api: str, token: str | None, names: list[str], target: str,
+                      timeout_ms: int, workers: int, log: Logger):
+    return test_live(
+        api, token, names, target, timeout_ms, workers, log,
+        include_reachability=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2450,6 +2597,35 @@ def load_group_members(config_path: str, log: Logger) -> dict[str, list[str]]:
     return groups
 
 
+def align_source4_names(results: list[SourceResult], config_path: str, log: Logger) -> None:
+    """Use production config names for source 4 by server+port; config stays read-only."""
+    result = next((item for item in results if item.index == 4), None)
+    path = Path(config_path)
+    if result is None or not result.nodes or not path.exists() or yaml is None:
+        return
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace")) or {}
+    except Exception:
+        log.warn("source#4 config_name_align failed class=parse_error")
+        return
+    names: dict[tuple[str, str], str] = {}
+    for proxy in data.get("proxies") or []:
+        if not isinstance(proxy, dict):
+            continue
+        name = proxy.get("name")
+        server = proxy.get("server")
+        port = proxy.get("port")
+        if isinstance(name, str) and server is not None and port is not None:
+            names[(str(server).strip().lower(), str(port).strip())] = name
+    matched = 0
+    for node in result.nodes:
+        key = (str(node.get("server") or "").strip().lower(), str(node.get("port") or "").strip())
+        if key in names:
+            node["name"] = names[key]
+            matched += 1
+    log.info(f"source#4 config_name_align matched={matched} unmatched={len(result.nodes) - matched}")
+
+
 def pick_group(node_name: str, region: str, groups: dict[str, list[str]]) -> str:
     keywords = ("SINGAPORE", "SG", "新加坡", "狮城") if region == "新加坡" else (
         "US", "USA", "AMERICA", "GPT", "美国"
@@ -2466,6 +2642,68 @@ def pick_group(node_name: str, region: str, groups: dict[str, list[str]]) -> str
 # ---------------------------------------------------------------------------
 # Record building
 # ---------------------------------------------------------------------------
+
+
+def load_gpt_history(path: str, log: Logger) -> dict:
+    history_path = Path(path)
+    if not history_path.exists():
+        return {"version": 1, "nodes": {}}
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        log.warn("gpt_history load failed class=parse_error")
+        return {"version": 1, "nodes": {}}
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    return {"version": 1, "nodes": nodes if isinstance(nodes, dict) else {}}
+
+
+def advance_gpt_history(
+    names: list[str],
+    chatgpt_delays: dict[str, int | None],
+    openai_delays: dict[str, int | None],
+    sync_ms: int,
+    history: dict,
+) -> tuple[dict[str, int], dict[str, bool], dict]:
+    """Append one boolean result per node and derive consecutive-pass counts."""
+    old_nodes = history.get("nodes") if isinstance(history, dict) else {}
+    old_nodes = old_nodes if isinstance(old_nodes, dict) else {}
+    next_nodes: dict[str, list[dict[str, Any]]] = {}
+    streaks: dict[str, int] = {}
+    passed: dict[str, bool] = {}
+    for name in names:
+        both_ok = bool(chatgpt_delays.get(name)) and bool(openai_delays.get(name))
+        events = old_nodes.get(name)
+        safe_events = [
+            {"time": int(event["time"]), "passed": bool(event["passed"])}
+            for event in (events if isinstance(events, list) else [])
+            if isinstance(event, dict)
+            and isinstance(event.get("time"), (int, float))
+            and isinstance(event.get("passed"), bool)
+        ]
+        safe_events.append({"time": int(sync_ms), "passed": both_ok})
+        safe_events = safe_events[-100:]
+        streak = 0
+        for event in reversed(safe_events):
+            if not event["passed"]:
+                break
+            streak += 1
+        next_nodes[name] = safe_events
+        streaks[name] = streak
+        passed[name] = both_ok
+    return streaks, passed, {"version": 1, "nodes": next_nodes}
+
+
+def save_gpt_history(path: str, history: dict, log: Logger) -> None:
+    history_path = Path(path)
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = history_path.with_suffix(history_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(history_path)
+    except OSError as exc:
+        log.warn(f"gpt_history save failed class={type(exc).__name__.lower()}")
+        return
+    log.info(f"gpt_history saved nodes={len(history.get('nodes') or {})}")
 
 def compact(fields: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if v is not None and v != ""}
@@ -2498,8 +2736,12 @@ def build_source_records(results: list[SourceResult], sync_ms: int) -> list[dict
 
 def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | None],
                        target: str, sync_ms: int,
-                       regions: dict[str, str] | None = None) -> list[dict]:
+                       regions: dict[str, str] | None = None,
+                       chatgpt_delays: dict[str, int | None] | None = None,
+                       openai_delays: dict[str, int | None] | None = None) -> list[dict]:
     regions = regions or {}
+    chatgpt_delays = chatgpt_delays or {}
+    openai_delays = openai_delays or {}
     records = []
     for node, source in pool:
         name = node["name"]
@@ -2513,6 +2755,8 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
                 "协议": str(node.get("type") or ""),
                 "实际地区": area,
                 "延迟ms": delay if delay else -1,
+                "chatgpt延迟ms": chatgpt_delays.get(name) or -1,
+                "openai延迟ms": openai_delays.get(name) or -1,
                 "存活": bool(delay),
                 "测速目标": target,
                 "同步时间": sync_ms,
@@ -2524,14 +2768,16 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
 
 def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | None],
                          groups: dict[str, list[str]], sync_ms: int,
-                         regions: dict[str, str] | None = None) -> list[dict]:
+                         regions: dict[str, str] | None = None,
+                         current_passed: dict[str, bool] | None = None,
+                         streaks: dict[str, int] | None = None) -> list[dict]:
     regions = regions or {}
+    current_passed = current_passed or {}
+    streaks = streaks or {}
     records = []
     for node, source in pool:
         name = node["name"]
         delay = delays.get(name)
-        if not delay:
-            continue
         # Gate on measured egress only — never on the node name; 未知/non-US-SG is out.
         area = (regions.get(name) or "").strip() or "未知"
         region = group_from_actual_area(area)
@@ -2543,8 +2789,10 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
                 "地区组": region,
                 "实际地区": area,
                 "来源": source or "未知",
-                "延迟ms": delay,
-                "GPT可用": True,
+                "延迟ms": delay or -1,
+                "GPT可用": bool(current_passed.get(name))
+                and streaks.get(name, 0) >= GPT_REQUIRED_CONSECUTIVE,
+                "连续通过轮数": streaks.get(name, 0),
                 "代理组": pick_group(name, region, groups),
                 "同步时间": sync_ms,
             }
@@ -2617,13 +2865,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument("--timeout-ms", type=int, default=7000)
     parser.add_argument("--fetch-timeout", type=int, default=30)
-    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--workers", type=int, default=SPEEDTEST_MAX_WORKERS,
+                        help="Concurrent delay probes (hard-capped at 4)")
     parser.add_argument("--core", default=DEFAULT_CORE)
     parser.add_argument("--mixed-port", type=int, default=17890)
     parser.add_argument("--controller-port", type=int, default=19090)
     parser.add_argument("--live-controller", default=DEFAULT_LIVE_CONTROLLER)
     parser.add_argument("--live-env", default=DEFAULT_LIVE_ENV)
     parser.add_argument("--config", default=r"C:\mihomo\config.yaml")
+    parser.add_argument("--gpt-history-file", default=DEFAULT_GPT_HISTORY_FILE,
+                        help="Local boolean history for the GPT consecutive-pass gate")
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY)
     parser.add_argument("--source1-cache", action="append", default=None,
                         help="Candidate YAML used when source 1 fails (repeatable)")
@@ -2814,15 +3065,21 @@ def main(argv: list[str] | None = None) -> int:
             if cached:
                 first.nodes = cached
                 first.result = "缓存"
-                first.error = f"{first.error or 'fetch_failed'}; using cache"
+                first.error = (
+                    f"{first.error or 'fetch_failed'}; using cache; "
+                    f"缓存文件时间={cache_file_time(cache_paths)}"
+                )
 
         # --- pool + speed test ------------------------------------------
+        align_source4_names(results, args.config, log)
         pool = build_pool(results, log=log)
         if args.limit and len(pool) > args.limit:
             pool = pool[: args.limit]
         log.info(f"pool nodes={len(pool)}")
 
         delays: dict[str, int | None] = {}
+        chatgpt_delays: dict[str, int | None] = {}
+        openai_delays: dict[str, int | None] = {}
         regions: dict[str, str] = {}
         speedtest_ran = False
         if not pool:
@@ -2836,14 +3093,18 @@ def main(argv: list[str] | None = None) -> int:
             source_of = {node["name"]: source for node, source in pool}
             log.info(f"speedtest enter mode=isolated nodes={len(names)}")
             try:
-                delays, regions = test_isolated(
+                isolated_result = test_isolated(
                     args.core, names, proxies, args.mixed_port,
                     args.controller_port, args.target, args.timeout_ms,
                     args.workers, log,
                     source_of=source_of, ipinfo_skip_dead=args.ipinfo_skip_dead,
                     ipinfo_budget_s=args.ipinfo_budget_s,
                     ipinfo_dead_max=args.ipinfo_dead_max,
+                    include_reachability=True,
                 )
+                delays, regions = isolated_result[:2]
+                if len(isolated_result) >= 4:
+                    chatgpt_delays, openai_delays = isolated_result[2:4]
                 log.info(f"speedtest isolated done tested={len(delays)}")
                 speedtest_ran = True
             except SyncError as exc:
@@ -2852,8 +3113,14 @@ def main(argv: list[str] | None = None) -> int:
                 token = (live_env.get("SECRET") or "").strip() or None
                 try:
                     log.info(f"speedtest enter mode=live nodes={len(names)}")
-                    delays = test_live(args.live_controller, token, names, args.target,
-                                       args.timeout_ms, args.workers, log)
+                    live_result = test_live(
+                        args.live_controller, token, names, args.target,
+                        args.timeout_ms, args.workers, log,
+                        include_reachability=True,
+                    )
+                    delays = live_result[0]
+                    if len(live_result) >= 3:
+                        chatgpt_delays, openai_delays = live_result[1:3]
                     log.info(f"speedtest live done tested={len(delays)}")
                     regions = {name: "未知" for name in names}
                     log.warn("ipinfo skipped reason=live_fallback_no_group_switch")
@@ -2861,6 +3128,8 @@ def main(argv: list[str] | None = None) -> int:
                 except SyncError as live_exc:
                     log.error(f"speedtest unavailable class={live_exc.kind}")
                     delays = {}
+                    chatgpt_delays = {}
+                    openai_delays = {}
                     regions = {}
         for node, _ in pool:
             node["_delay"] = delays.get(node["name"])
@@ -2875,6 +3144,10 @@ def main(argv: list[str] | None = None) -> int:
                 key = (node.get("type"), node.get("server"), node.get("port"))
                 if key in delay_by_endpoint:
                     node["_delay"] = delay_by_endpoint[key]
+            log.info(
+                f"source#{result.index} measured nodes={len(result.nodes)} "
+                f"alive={result.alive} cache={str(result.result == '缓存').lower()}"
+            )
 
         # --- page probe node retry (read-only delay API; no group switch) ---
         unreachable = [
@@ -2950,10 +3223,42 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
         # --- records -----------------------------------------------------
+        streaks: dict[str, int] = {}
+        current_passed: dict[str, bool] = {}
+        next_gpt_history: dict | None = None
+        if speedtest_ran:
+            names = [node["name"] for node, _source in pool]
+            old_gpt_history = load_gpt_history(args.gpt_history_file, log)
+            streaks, current_passed, next_gpt_history = advance_gpt_history(
+                names, chatgpt_delays, openai_delays, sync_ms, old_gpt_history
+            )
+            both_ok = sum(1 for value in current_passed.values() if value)
+            qualified = sum(
+                1 for name, value in current_passed.items()
+                if value and streaks.get(name, 0) >= GPT_REQUIRED_CONSECUTIVE
+            )
+            log.info(
+                f"gpt_gate current_both_ok={both_ok} qualified={qualified} "
+                f"required={GPT_REQUIRED_CONSECUTIVE}"
+            )
         source_records = build_source_records(results, sync_ms)
-        node_records = build_node_records(pool, delays, args.target, sync_ms, regions)
+        node_records = build_node_records(
+            pool, delays, args.target, sync_ms, regions,
+            chatgpt_delays, openai_delays,
+        )
+        if node_records:
+            sample_fields = node_records[0].get("fields") or {}
+            if sample_fields:
+                log.info(
+                    "table2 sample "
+                    f"delay_ms={sample_fields.get('延迟ms', -1)} "
+                    f"chatgpt_ms={sample_fields.get('chatgpt延迟ms', -1)} "
+                    f"openai_ms={sample_fields.get('openai延迟ms', -1)}"
+                )
         groups = load_group_members(args.config, log)
-        region_records = build_region_records(pool, delays, groups, sync_ms, regions)
+        region_records = build_region_records(
+            pool, delays, groups, sync_ms, regions, current_passed, streaks
+        )
         node_rows = len(node_records)
         region_rows = len(region_records)
         alive_total = sum(1 for _, d in delays.items() if d)
@@ -2991,6 +3296,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise SyncError("api_error", f"missing_table_id:{key}")
             count = replace_records(client, table_id, records, log)
             log.info(f"table {key} rows={count}")
+
+        if next_gpt_history is not None:
+            save_gpt_history(args.gpt_history_file, next_gpt_history, log)
 
         log.info("sync ok")
         print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, "")
