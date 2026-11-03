@@ -3,7 +3,7 @@
 
 Three tables are maintained in one Bitable app (one sync batch per run):
 
-  1. 订阅源状态   - one fixed row per subscription source (飞兔/星辰/CoffeeCloud)
+  1. 订阅源状态   - one fixed row per subscription source (飞兔/星辰/CoffeeCloud/西瓜加速)
   2. 可测速节点   - every parsed node with its Grok-trace delay
   3. GPT可用地区组 - Nodes whose Grok trace test succeeded AND whose measured
      egress (ipinfo through that node) is Singapore/US
@@ -121,7 +121,7 @@ PAGE_PROBE_UA = (
 PLACEHOLDER_TABLE_ID = "tbldzw2ismrKCEAC"
 PLACEHOLDER_TABLE_NAME = "数据表"
 
-SOURCE_NAMES = {1: "飞兔", 2: "星辰", 3: "CoffeeCloud"}
+SOURCE_NAMES = {1: "飞兔", 2: "星辰", 3: "CoffeeCloud", 4: "西瓜加速"}
 
 # Feishu Bitable field types
 FT_TEXT = 1
@@ -159,7 +159,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
         "name": "可测速节点",
         "fields": [
             ("节点名", FT_TEXT, None),
-            ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
+            ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "西瓜加速", "未知")]}),
             ("协议", FT_TEXT, None),
             # Free-form from ipinfo.io/json via that node: 中文 国家/地区/城市 or "未知".
             ("实际地区", FT_TEXT, None),
@@ -177,7 +177,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("地区组", FT_SINGLE_SELECT, {"options": [{"name": "新加坡"}, {"name": "美国"}]}),
             # Full 中文 egress path (国家/地区/城市) from ipinfo; 地区组 stays coarse.
             ("实际地区", FT_TEXT, None),
-            ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "未知")]}),
+            ("来源", FT_SINGLE_SELECT, {"options": [{"name": n} for n in ("飞兔", "星辰", "CoffeeCloud", "西瓜加速", "未知")]}),
             ("延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("GPT可用", FT_CHECKBOX, None),
             ("代理组", FT_TEXT, None),
@@ -1772,6 +1772,7 @@ def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> b
 META_INFO_PATTERNS: tuple[str, ...] = (
     "流量", "剩余", "到期", "官网", "重置", "用量", "使用量", "余额",
     "公告", "通知", "查询", "续费", "购买", "注册", "域名", "已用完",
+    "防丢失", "网不通", "招募",
     "traffic", "expire", "expiry", "reset", "official", "quota", "usage",
     "renew", "register", "purchase", "announce", "notice", "website",
     "homepage", "token",
@@ -2260,6 +2261,40 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
         return None
 
 
+class _QuotedString(str):
+    """str subclass whose YAML dump always carries explicit double quotes."""
+
+
+# Strings like reality-opts short-id "12e45678" round-trip as plain scalars in
+# PyYAML but get re-parsed as numbers by mihomo's YAML reader, breaking the
+# node. Anything a YAML consumer could resolve to non-str must be dumped quoted.
+_NUMERIC_LIKE_STR = re.compile(
+    r"^(?:[-+]?(?:\d[\d_]*(?:\.[\d_]*)?|\.[\d_]+)(?:[eE][-+]?\d+)?"
+    r"|0[xXbBoO][0-9a-fA-F_]+)$"
+)
+
+
+def _quote_numeric_like(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _quote_numeric_like(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_quote_numeric_like(v) for v in value]
+    if isinstance(value, str) and not isinstance(value, _QuotedString) \
+            and _NUMERIC_LIKE_STR.match(value):
+        return _QuotedString(value)
+    return value
+
+
+if yaml is not None:
+    yaml.add_representer(
+        _QuotedString,
+        lambda dumper, data: dumper.represent_scalar(
+            "tag:yaml.org,2002:str", str(data), style='"'
+        ),
+        Dumper=yaml.SafeDumper,
+    )
+
+
 def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: int,
                   controller_port: int, target: str, timeout_ms: int, workers: int,
                   log: Logger, source_of: dict[str, str] | None = None,
@@ -2281,7 +2316,7 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         "external-controller": f"127.0.0.1:{controller}",
         "dns": {"enable": True, "enhanced-mode": "redir-host", "nameserver": ["8.8.8.8", "1.1.1.1"]},
         "tun": {"enable": False},
-        "proxies": proxies,
+        "proxies": _quote_numeric_like(proxies),
         "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
         "rules": ["MATCH,TEST"],
     }
@@ -2596,6 +2631,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Candidate YAML used when source 2 fails (repeatable)")
     parser.add_argument("--source3-cache", action="append", default=None,
                         help="Candidate YAML used when source 3 fails (repeatable)")
+    parser.add_argument("--source4-cache", action="append", default=None,
+                        help="Candidate YAML for source 4 (西瓜加速; repeatable)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Test at most N nodes (0 = all); dry-run only — forbidden with production writes")
     parser.add_argument("--dry-run", action="store_true", help="Collect and test only; never write")
@@ -2702,8 +2739,9 @@ def main(argv: list[str] | None = None) -> int:
         cache_read_paths = {
             2: args.source2_cache or [str(source_cache_path(2))],
             3: args.source3_cache or [str(source_cache_path(3))],
+            4: args.source4_cache or [str(source_cache_path(4))],
         }
-        for index in (1, 2, 3):
+        for index in (1, 2, 3, 4):
             url = (sources_env.get(f"SUBSCRIPTION_URL_{index}") or "").strip()
             ua = (sources_env.get(f"SUBSCRIPTION_UA_{index}") or "").strip() or convert_sub.DEFAULT_USER_AGENT
             result = collect_source(index, url, ua, args.fetch_timeout, args.fetch_proxy, log)
@@ -2714,6 +2752,15 @@ def main(argv: list[str] | None = None) -> int:
                                        guard_tokens=_guard_tokens_for(url))
                 elif result.result == "失败" and result.error != "url_missing":
                     apply_source_cache(result, cache_read_paths[index], log)
+            elif index == 4:
+                # 西瓜加速 has no subscription URL: source4-cache.yaml IS its node
+                # list, so url_missing here is expected and the cache fallback
+                # (拉取结果=缓存) must never fail the round.
+                if result.result == "成功":
+                    write_source_cache(index, result.nodes, log,
+                                       guard_tokens=_guard_tokens_for(url))
+                else:
+                    apply_source_cache(result, cache_read_paths[4], log)
             page_urls = parse_page_urls(sources_env, index)
             result.page_urls = page_urls
             result.page_url = page_urls[0] if page_urls else ""
