@@ -4,7 +4,7 @@
 Three tables are maintained in one Bitable app (one sync batch per run):
 
   1. 订阅源状态   - one fixed row per subscription source (飞兔/星辰/CoffeeCloud/西瓜加速)
-  2. 可测速节点   - every parsed node with its Grok-trace delay
+  2. 可测速节点   - every parsed node with its Grok homepage delay
   3. GPT可用地区组 - Nodes whose Grok trace test succeeded AND whose measured
      egress (ipinfo through that node) is Singapore/US
 
@@ -45,6 +45,7 @@ import re
 import secrets
 import shutil
 import socket
+import http.client
 import ssl
 import subprocess
 import sys
@@ -75,10 +76,11 @@ except ImportError:  # pragma: no cover - convert_sub fails closed on its own
 DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
 DEFAULT_STATE_FILE = r"C:\mihomo\feishu-bitable-tables.json"
+DEFAULT_SYNC_STATE_FILE = r"C:\mihomo\state\feishu-bitable-sync-state.json"
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\feishu-bitable-sync.log"
 DEFAULT_SOURCES_ENV = str(SCRIPT_DIR.parent / "config" / "subscription.env")
 DEFAULT_CORE = r"C:\mihomo\mihomo.exe"
-DEFAULT_TARGET = "https://grok.com/cdn-cgi/trace"
+DEFAULT_TARGET = "https://grok.com/"
 CHATGPT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
 OPENAI_TARGET = "https://api.openai.com"
 DEFAULT_GPT_HISTORY_FILE = r"C:\mihomo\feishu-gpt-history.json"
@@ -174,6 +176,8 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("openai延迟ms", FT_NUMBER, NUMBER_PROPERTY),
             ("存活", FT_CHECKBOX, None),
             ("测速目标", FT_TEXT, None),
+            ("测速路径", FT_TEXT, None),
+            ("地区检测时间", FT_DATE_TIME, DATE_PROPERTY),
             ("同步时间", FT_DATE_TIME, DATE_PROPERTY),
         ],
     },
@@ -370,6 +374,9 @@ class Logger:
         self.path = Path(path)
         self.verbose = verbose
         self._ready = False
+        self.write_failures = 0
+        self.last_write_error = ""
+        self._degrade_reported = False
 
     def _open(self) -> None:
         if self._ready:
@@ -384,18 +391,46 @@ class Logger:
                         backup.unlink()
                     self.path.rename(backup)
                 except OSError:
-                    pass
-        except OSError:
+                    self._report_write_failure(OSError("log rotation renamed nothing"),
+                                               "rotation blocked")
+        except OSError as exc:
+            self._report_write_failure(exc, "log dir setup blocked")
+
+    def _report_write_failure(self, exc: OSError, what: str) -> None:
+        """A log write that failed is never allowed to be invisible.
+
+        The scheduled bat used to `>>` its stdout into this same file; cmd keeps
+        that handle open for the whole run, so every open() below raised
+        PermissionError and the run left no trace. Say so on stderr once — the
+        bat's redirect is a different file now — and keep counting for the caller.
+        """
+        self.write_failures += 1
+        self.last_write_error = (f"{type(exc).__name__}(errno={exc.errno}) "
+                                 f"at {self.path} {what}")
+        if self._degrade_reported:
+            return
+        self._degrade_reported = True
+        stream = sys.stderr
+        if stream is None:
+            return
+        try:
+            stream.write(f"{self._timestamp()} ERROR LOG-DEGRADED {self.last_write_error}\n")
+            stream.flush()
+        except (OSError, ValueError):
             pass
 
+    def _timestamp(self) -> str:
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def _write(self, level: str, message: str) -> None:
-        line = f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {level} {message}"
+        line = f"{self._timestamp()} {level} {message}"
         self._open()
         try:
             with self.path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(line + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            self._report_write_failure(exc, "append blocked")
+            return
         if self.verbose:
             print(line, file=sys.stderr)
 
@@ -544,9 +579,10 @@ class SyncLock:
     it never unlinks a lock file that carries another process's token.
     """
 
-    def __init__(self, path: str, log: "Logger") -> None:
+    def __init__(self, path: str, log: "Logger", *, mutex_name: str = SYNC_MUTEX_NAME) -> None:
         self.path = str(path)
         self.log = log
+        self.mutex_name = mutex_name
         self.pid = os.getpid()
         self.token = secrets.token_hex(8)
         self.fd: int | None = None      # POSIX: lock file fd
@@ -590,7 +626,7 @@ class SyncLock:
         import ctypes
 
         k32 = _kernel32()
-        handle = k32.CreateMutexW(None, True, SYNC_MUTEX_NAME)
+        handle = k32.CreateMutexW(None, True, self.mutex_name)
         if not handle:
             err = ctypes.get_last_error()
             self.log.error(f"lock busy path={self.path} reason=mutex_create_failed err={err}")
@@ -1036,6 +1072,86 @@ def save_state(path: str, tables: dict[str, dict[str, str]]) -> None:
         temporary.replace(target)
     except OSError:
         pass
+
+
+RUN_RESULTS = ("ok", "lock_busy", "error")
+
+
+def _stamp(moment: dt.datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def read_run_state(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_run_state(path: str, state: dict) -> None:
+    """Replace the run-state file atomically: temp file in the same dir, then rename."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(target)
+
+
+class RunRecorder:
+    """Start / end / duration / result for one run, logged and mirrored to a state file.
+
+    `mirror` is off for the entrypoints that are not the scheduled sync
+    (--dry-run, --ensure-tables, --ninja-only): a manual probe must not make
+    last_success_time look healthy while the daily task is failing.
+    """
+
+    def __init__(self, state_file: str, log: Logger, *, mirror: bool = True) -> None:
+        self.state_file = state_file
+        self.log = log
+        self.mirror = mirror
+        self.start_dt = dt.datetime.now()
+        self._start_perf = time.monotonic()
+
+    def log_start(self) -> None:
+        self.log.info(f"sync start pid={os.getpid()} state_file={self.state_file}")
+
+    def finish(self, code: int, result: str, reason: str = "") -> int:
+        end_dt = dt.datetime.now()
+        duration_sec = round(time.monotonic() - self._start_perf, 3)
+        tail = f" reason={reason}" if reason else ""
+        degraded = (f" log_write_failures={self.log.write_failures}"
+                    if self.log.write_failures else "")
+        self.log.info(f"sync end result={result} duration_sec={duration_sec}{tail}{degraded}")
+        if self.mirror:
+            self._mirror(result, reason, end_dt, duration_sec)
+        return code
+
+    def _mirror(self, result: str, reason: str, end_dt: dt.datetime,
+                duration_sec: float) -> None:
+        previous = read_run_state(self.state_file)
+        carried = previous.get("consecutive_failures")
+        carried = carried if isinstance(carried, int) and not isinstance(carried, bool) else 0
+        ok = result == "ok"
+        state = {
+            "last_start": _stamp(self.start_dt),
+            "last_end": _stamp(end_dt),
+            "last_result": result,
+            "last_success_time": (_stamp(end_dt) if ok
+                                  else previous.get("last_success_time") or ""),
+            "last_error": "" if ok else (reason or result),
+            "duration_sec": duration_sec,
+            "consecutive_failures": 0 if ok else carried + 1,
+        }
+        try:
+            write_run_state(self.state_file, state)
+        except OSError as exc:
+            self.log.warn(f"sync state write failed path={self.state_file} "
+                          f"{type(exc).__name__}(errno={exc.errno})")
 
 
 def ensure_fields(client: FeishuClient, table_id: str, fields: list[tuple], log: Logger) -> None:
@@ -2415,7 +2531,8 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
                   ipinfo_budget_s: float = IPINFO_TOTAL_BUDGET_S,
                   ipinfo_dead_max: int = 0,
                   include_reachability: bool = False,
-                  total_budget_s: float = SPEEDTEST_TOTAL_BUDGET_S):
+                  total_budget_s: float = SPEEDTEST_TOTAL_BUDGET_S,
+                  on_delays=None):
     if not Path(core).exists():
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
@@ -2474,6 +2591,8 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         delays = target_results["grok"]
         chatgpt_delays = target_results["chatgpt"]
         openai_delays = target_results["openai"]
+        if on_delays is not None:
+            on_delays(delays)
         # Separate pass: egress IP geo via ipinfo through each node (not Grok delay).
         geo_delays = combine_reachable_delays(
             names, delays, chatgpt_delays, openai_delays
@@ -2564,7 +2683,7 @@ def region_of(name: str) -> str | None:
     return None
 
 
-def group_from_actual_area(area: str) -> str | None:
+def group_from_actual_area(area: str, *, include_japan: bool = False) -> str | None:
     """Coarse 地区组 from the measured egress path (国家/地区/城市), not the node name."""
     text = (area or "").strip()
     if not text or text == "未知":
@@ -2574,6 +2693,8 @@ def group_from_actual_area(area: str) -> str | None:
         return "新加坡"
     if US_PATTERN.search(country):
         return "美国"
+    if include_japan and JP_PATTERN.search(country):
+        return "日本"
     return None
 
 
@@ -2759,6 +2880,7 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
                 "openai延迟ms": openai_delays.get(name) or -1,
                 "存活": bool(delay),
                 "测速目标": target,
+                "测速路径": "订阅 Mihomo",
                 "同步时间": sync_ms,
             }
         )
@@ -2770,7 +2892,8 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
                          groups: dict[str, list[str]], sync_ms: int,
                          regions: dict[str, str] | None = None,
                          current_passed: dict[str, bool] | None = None,
-                         streaks: dict[str, int] | None = None) -> list[dict]:
+                         streaks: dict[str, int] | None = None, *,
+                         include_japan: bool = False) -> list[dict]:
     regions = regions or {}
     current_passed = current_passed or {}
     streaks = streaks or {}
@@ -2780,7 +2903,7 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
         delay = delays.get(name)
         # Gate on measured egress only — never on the node name; 未知/non-US-SG is out.
         area = (regions.get(name) or "").strip() or "未知"
-        region = group_from_actual_area(area)
+        region = group_from_actual_area(area, include_japan=include_japan)
         if not region:
             continue
         fields = compact(
@@ -2806,13 +2929,16 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
 # ---------------------------------------------------------------------------
 
 def replace_records(client: FeishuClient, table_id: str, records: list[dict],
-                    log: Logger) -> int:
+                    log: Logger, *, preserve_ninja: bool = False) -> int:
     """Create new rows first, then delete old ones — never leave the table empty.
 
     An empty *records* payload with existing rows is refused so a bad run cannot
     wipe production tables.
     """
     existing = client.list_records(table_id)
+    if preserve_ninja:
+        existing = [row for row in existing
+                    if row.get("fields", {}).get("测速路径") not in ("Ninja Desktop", "源3独立兼容内核", "源1独立Mihomo")]
     ids = [r.get("record_id") for r in existing if r.get("record_id")]
     if not records:
         if ids:
@@ -2826,6 +2952,185 @@ def replace_records(client: FeishuClient, table_id: str, records: list[dict],
         deleted = client.batch_delete(table_id, ids)
         log.info(f"records deleted={deleted}")
     return created
+
+
+def ninja_geo_ports(config_path: Path, log: Logger) -> dict[str, int]:
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+        port = int(config["webui_port"])
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/connector/status",
+            headers={"Authorization": f"Bearer {config['webui_token']}"},
+        )
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5) as response:
+            status = json.load(response)
+        if not status.get("running") or status.get("listen") != "127.0.0.1":
+            log.info("Ninja geo skipped reason=loopback_connector_not_running")
+            return {}
+        endpoints = status["endpoints"]
+        ports = {item["name"]: item["port"] for item in endpoints
+                 if isinstance(item["port"], int) and 0 < item["port"] <= 65535}
+        if len(ports) != len(endpoints) or len(set(ports.values())) != len(ports):
+            raise ValueError("ambiguous connector mapping")
+        return ports
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        log.warn(f"Ninja geo mapping unavailable class={type(exc).__name__}")
+        return {}
+
+
+def fetch_geo_via_ninja_socks(port: int) -> str:
+    curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    for url in GEO_ENDPOINTS:
+        try:
+            result = subprocess.run(
+                [str(curl), "-q", "--fail", "--silent", "--noproxy", "",
+                 "--proxy", f"socks5h://127.0.0.1:{port}", "--max-time", "6", url],
+                capture_output=True, timeout=8, check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            payload = json.loads(result.stdout)
+            if isinstance(payload, dict) and payload.get("ip"):
+                region = format_geo_payload(payload)
+                if region:
+                    return region
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return "未知"
+
+
+def fetch_ninja_routed_geo(api: str, token: str, config_path: Path,
+                          names: list[str]) -> tuple[str, str] | None:
+    """Attribute a geo request only to the leaf observed on its exact TCP tunnel."""
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+        port = int(config["mixed_port"])
+    except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError):
+        return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for url in GEO_ENDPOINTS:
+        target = urllib.parse.urlsplit(url)
+        tunnel = http.client.HTTPSConnection("127.0.0.1", port, timeout=5)
+        try:
+            tunnel.set_tunnel(target.hostname)
+            tunnel.connect()
+            source_port = str(tunnel.sock.getsockname()[1])
+            request = urllib.request.Request(
+                f"{api}/connections", headers={"Authorization": f"Bearer {token}"},
+            )
+            with opener.open(request, timeout=3) as response:
+                connections = json.load(response).get("connections") or []
+            routes = [
+                row.get("chains") or [] for row in connections
+                if str(row.get("metadata", {}).get("sourcePort")) == source_port
+                and row.get("metadata", {}).get("host") == target.hostname
+            ]
+            if len(routes) != 1 or not routes[0] or routes[0][0] not in names:
+                continue
+            tunnel.request("GET", target.path or "/", headers={"Host": target.hostname})
+            response = tunnel.getresponse()
+            if response.status != 200:
+                continue
+            payload = json.loads(response.read(32768))
+            if isinstance(payload, dict) and payload.get("ip"):
+                region = format_geo_payload(payload)
+                if region:
+                    return routes[0][0], region
+        except (OSError, ValueError, http.client.HTTPException):
+            continue
+        finally:
+            tunnel.close()
+    return None
+
+
+def sync_ninja_nodes(client: FeishuClient, table_id: str, log: Logger) -> None:
+    session_path = Path.home() / "AppData/Local/NinjaDesktop/kernel_session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8-sig"))
+    controller = urllib.parse.urlsplit("http://" + session["controller_addr"])
+    if controller.hostname not in {"127.0.0.1", "::1", "localhost"} or not controller.port:
+        raise SyncError("ninja_controller_not_local")
+    api = f"http://{controller.netloc}"
+    token = session["secret"]
+
+    def proxies():
+        request = urllib.request.Request(
+            f"{api}/proxies", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.load(response)["proxies"]
+
+    before = proxies()
+    names = [name for name, node in before.items()
+             if "all" not in node and name not in
+             {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE"}]
+    if not names:
+        raise SyncError("ninja_no_nodes")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+        delays = dict(zip(names, workers.map(
+            lambda name: request_delay(api, name, DEFAULT_TARGET, 8000, token, "200-299"), names
+        )))
+    ports = ninja_geo_ports(session_path.with_name("appconfig.yaml"), log)
+    geo_names = [name for name in names if name in ports]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+        regions = dict(zip(geo_names, workers.map(
+            lambda name: fetch_geo_via_ninja_socks(ports[name]), geo_names
+        )))
+    if ports and ninja_geo_ports(session_path.with_name("appconfig.yaml"), log) != ports:
+        log.warn("Ninja geo discarded reason=connector_mapping_changed")
+        regions = {}
+    if not ports:
+        routed = fetch_ninja_routed_geo(api, token, session_path.with_name("appconfig.yaml"), names)
+        if routed:
+            name, region = routed
+            regions[name] = region
+    log.info(f"Ninja geo measured={sum(region != '未知' for region in regions.values())}/{len(names)}")
+    after = proxies()
+    selected = {name: node.get("now") for name, node in before.items() if "节点选择" in name}
+    after_selected = {name: node.get("now") for name, node in after.items() if "节点选择" in name}
+    log.info(f"Ninja selection unchanged={selected == after_selected} tested={len(names)}")
+    spec = next(spec for spec in TABLE_SPECS if spec["key"] == "nodes")
+    ensure_fields(client, table_id, spec["fields"], log)
+    existing = client.list_records(table_id)
+    updates = [{"record_id": row["record_id"], "fields": {"测速路径": "订阅 Mihomo"}}
+               for row in existing if not row.get("fields", {}).get("测速路径")]
+    prefix = f"/bitable/v1/apps/{client.app_token}/tables/{table_id}/records"
+    for start in range(0, len(updates), 100):
+        client.call("POST", prefix + "/batch_update", body={"records": updates[start:start + 100]})
+    stamp = int(time.time() * 1000)
+    geo_times = {name: stamp for name, region in regions.items() if region != "未知"}
+    for row in existing:
+        fields = row.get("fields", {})
+        name = fields.get("节点名")
+        previous_region = fields.get("实际地区")
+        previous_time = fields.get("地区检测时间")
+        if (fields.get("测速路径") == "Ninja Desktop" and name in names
+                and name not in geo_times and previous_region and previous_region != "未知"
+                and isinstance(previous_time, (int, float)) and 0 < previous_time <= stamp):
+            regions[name] = previous_region
+            geo_times[name] = previous_time
+    records = build_node_records(
+        [({"name": name, "type": before[name]["type"]}, "CoffeeCloud") for name in names],
+        delays, DEFAULT_TARGET, stamp, regions,
+    )
+    for record in records:
+        record["fields"]["测速路径"] = "Ninja Desktop"
+        name = record["fields"]["节点名"]
+        if name in geo_times:
+            record["fields"]["地区检测时间"] = geo_times[name]
+    client.batch_create(table_id, records)
+    old_ids = [row["record_id"] for row in existing
+               if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
+    if old_ids:
+        client.batch_delete(table_id, old_ids)
+    saved = [row["fields"] for row in client.list_records(table_id)
+             if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
+    if ({row.get("节点名") for row in saved} != set(names)
+            or len(saved) != len(names)
+            or any(row.get("同步时间") != stamp or row.get("测速目标") != DEFAULT_TARGET
+                   or row.get("实际地区") != regions.get(row["节点名"], "未知")
+                   or row.get("地区检测时间") != geo_times.get(row["节点名"])
+                   or bool(row.get("存活")) != bool(delays[row["节点名"]]) for row in saved)):
+        raise SyncError("ninja_readback_mismatch")
+    log.info(f"Ninja Feishu readback nodes={len(saved)} alive={sum(bool(row.get('存活')) for row in saved)}")
 
 
 # Tables this script may replace, in write order.
@@ -2860,7 +3165,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE, help="File holding FEISHU_APP_ID/SECRET")
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN)
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    parser.add_argument("--ninja-only", action="store_true", help="Probe Ninja and update only table 2")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
+    parser.add_argument("--sync-state-file", default=DEFAULT_SYNC_STATE_FILE,
+                        help="Run result mirror for monitoring (atomic replace); "
+                             "--dry-run/--ensure-tables/--ninja-only do not write it")
     parser.add_argument("--sources-env", default=DEFAULT_SOURCES_ENV)
     parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument("--timeout-ms", type=int, default=7000)
@@ -2931,12 +3240,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parse_args(argv)
     log = Logger(args.log_file, verbose=args.verbose)
-    log.info("sync start")
+    recorder = RunRecorder(
+        args.sync_state_file, log,
+        mirror=not (args.dry_run or args.ensure_tables or args.ninja_only))
+    recorder.log_start()
 
     if args.limit and not args.dry_run:
         log.error("limit_write_forbidden: --limit cannot write production (use --dry-run)")
         print("ERROR	limit_write_forbidden")
-        return 2
+        return recorder.finish(2, "error", "limit_write_forbidden")
 
     tables = load_state(args.state_file).get("tables") or {}
     results: list[SourceResult] = []
@@ -2944,7 +3256,10 @@ def main(argv: list[str] | None = None) -> int:
     region_rows = 0
     error = ""
     sync_ms = int(time.time() * 1000)
-    lock = SyncLock(args.lock_file, log)
+    if args.ninja_only:
+        lock = SyncLock(args.lock_file, log, mutex_name=SYNC_MUTEX_NAME + ".Ninja")
+    else:
+        lock = SyncLock(args.lock_file, log)
 
     try:
         try:
@@ -2953,13 +3268,15 @@ def main(argv: list[str] | None = None) -> int:
             error = exc.kind
             log.error(f"sync failed class={exc.kind} detail={exc.detail}")
             print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
-            return 1
+            return recorder.finish(1, "lock_busy" if exc.kind == "lock_busy" else "error",
+                                   exc.detail or exc.kind)
 
-        try:
-            procs_killed, dirs_removed = cleanup_temp_corpses(log)
-            log.info(f"cleanup corpses procs={procs_killed} dirs={dirs_removed}")
-        except Exception as exc:  # never fatal: cleanup is best-effort
-            log.warn(f"cleanup corpses failed class={type(exc).__name__}")
+        if not args.ninja_only:
+            try:
+                procs_killed, dirs_removed = cleanup_temp_corpses(log)
+                log.info(f"cleanup corpses procs={procs_killed} dirs={dirs_removed}")
+            except Exception as exc:  # never fatal: cleanup is best-effort
+                log.warn(f"cleanup corpses failed class={type(exc).__name__}")
 
         env = read_env_file(args.env_file)
         app_id = (env.get("FEISHU_APP_ID") or "").strip()
@@ -2967,6 +3284,29 @@ def main(argv: list[str] | None = None) -> int:
         if not app_id or not app_secret:
             raise SyncError("token_error", "credentials_missing")
         client = FeishuClient(app_id, app_secret, args.app_token, log)
+        if args.ninja_only:
+            if args.dry_run:
+                raise SyncError("invalid_args", "--ninja-only requires a write run")
+            table_id = (tables.get("nodes") or {}).get("table_id")
+            if not table_id:
+                raise SyncError("api_error", "missing_table_id:nodes")
+            from source3_compatible import ROOT, sync as sync_source3
+            from source1_independent import ROOT as SOURCE1_ROOT, sync as sync_source1
+            # Separate cores/ports and scoped row ownership; both fit the same 10-minute task.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+                jobs = []
+                if (SOURCE1_ROOT / "all-nodes.private.yaml").exists():
+                    source1_client = FeishuClient(app_id, app_secret, args.app_token, log)
+                    jobs.append(workers.submit(sync_source1, source1_client, table_id,
+                                (tables.get("gpt_regions") or {}).get("table_id"), log, globals()))
+                if (ROOT / "nodes.yaml").exists():
+                    jobs.append(workers.submit(sync_source3, client, table_id, log, globals(),
+                                 (tables.get("gpt_regions") or {}).get("table_id")))
+                else:
+                    jobs.append(workers.submit(sync_ninja_nodes, client, table_id, log))
+                for job in jobs:
+                    job.result()
+            return recorder.finish(0, "ok")
 
         if args.dry_run:
             log.info("dry run: table provisioning skipped")
@@ -2977,7 +3317,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.ensure_tables:
             print_summary(tables, str(Path(__file__).resolve()), [], 0, 0, "")
             log.info("ensure-tables done")
-            return 0
+            return recorder.finish(0, "ok")
 
         # --- sources -----------------------------------------------------
         sources_env = read_env_file(args.sources_env)
@@ -3070,12 +3410,51 @@ def main(argv: list[str] | None = None) -> int:
                     f"缓存文件时间={cache_file_time(cache_paths)}"
                 )
 
+        # Publish fresh subscription metadata before the slow probe phase.
+        # An omitted alive count means this snapshot has not been measured.
+        early_source_records = None
+        if not args.dry_run and not args.speedtest_write and not args.no_speedtest:
+            source_table_id = (tables.get("sources") or {}).get("table_id")
+            if not source_table_id:
+                raise SyncError("api_error", "missing_table_id:sources")
+            early_source_records = build_source_records(results, sync_ms)
+            for record in early_source_records:
+                record["fields"].pop("存活数", None)
+            count = replace_records(client, source_table_id, early_source_records, log)
+            log.info(f"table sources rows={count} phase=subscription_fetched")
+
         # --- pool + speed test ------------------------------------------
         align_source4_names(results, args.config, log)
         pool = build_pool(results, log=log)
         if args.limit and len(pool) > args.limit:
             pool = pool[: args.limit]
         log.info(f"pool nodes={len(pool)}")
+
+        def backfill_source_delays(measured_delays):
+            by_endpoint = {
+                (node.get("type"), node.get("server"), node.get("port")):
+                    measured_delays.get(node["name"])
+                for node, _ in pool
+            }
+            for result in results:
+                for node in result.nodes:
+                    key = (node.get("type"), node.get("server"), node.get("port"))
+                    if key in by_endpoint:
+                        node["_delay"] = by_endpoint[key]
+
+        published_measured_sources = None
+
+        def publish_measured_sources(measured_delays):
+            nonlocal published_measured_sources
+            backfill_source_delays(measured_delays)
+            records = build_source_records(results, sync_ms)
+            try:
+                count = replace_records(client, source_table_id, records, log)
+            except SyncError as exc:
+                log.warn(f"table sources early measured write failed class={exc.kind}")
+                return
+            published_measured_sources = records
+            log.info(f"table sources rows={count} phase=speedtest_measured")
 
         delays: dict[str, int | None] = {}
         chatgpt_delays: dict[str, int | None] = {}
@@ -3101,6 +3480,7 @@ def main(argv: list[str] | None = None) -> int:
                     ipinfo_budget_s=args.ipinfo_budget_s,
                     ipinfo_dead_max=args.ipinfo_dead_max,
                     include_reachability=True,
+                    on_delays=publish_measured_sources if early_source_records is not None else None,
                 )
                 delays, regions = isolated_result[:2]
                 if len(isolated_result) >= 4:
@@ -3135,15 +3515,8 @@ def main(argv: list[str] | None = None) -> int:
             node["_delay"] = delays.get(node["name"])
 
         # Backfill delays onto each source's own node list so 表1「存活数」 matches 表2.
-        delay_by_endpoint: dict[tuple, int | None] = {}
-        for node, _source_name in pool:
-            key = (node.get("type"), node.get("server"), node.get("port"))
-            delay_by_endpoint[key] = delays.get(node["name"])
+        backfill_source_delays(delays)
         for result in results:
-            for node in result.nodes:
-                key = (node.get("type"), node.get("server"), node.get("port"))
-                if key in delay_by_endpoint:
-                    node["_delay"] = delay_by_endpoint[key]
             log.info(
                 f"source#{result.index} measured nodes={len(result.nodes)} "
                 f"alive={result.alive} cache={str(result.result == '缓存').lower()}"
@@ -3268,13 +3641,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             log.info("dry run: no write")
             print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, "")
-            return 0
+            return recorder.finish(0, "ok")
 
         # --- write -------------------------------------------------------
         write_keys = select_write_keys(
             speedtest_ran, args.speedtest_write,
             source_records, node_records, region_records,
         )
+        if (early_source_records is not None and not speedtest_ran
+                or published_measured_sources == source_records):
+            write_keys = [(key, records) for key, records in write_keys if key != "sources"]
         selected = {key for key, _ in write_keys}
         skipped = [key for key in WRITE_TABLE_KEYS if key not in selected]
         log.info(f"table write mode={'speedtest_write' if args.speedtest_write else 'sync'} "
@@ -3294,7 +3670,14 @@ def main(argv: list[str] | None = None) -> int:
             table_id = (tables.get(key) or {}).get("table_id")
             if not table_id:
                 raise SyncError("api_error", f"missing_table_id:{key}")
-            count = replace_records(client, table_id, records, log)
+            if key == "nodes":
+                published_ms = int(time.time() * 1000)
+                for record in records:
+                    record["fields"]["同步时间"] = published_ms
+            if key in ("nodes", "gpt_regions"):
+                count = replace_records(client, table_id, records, log, preserve_ninja=True)
+            else:
+                count = replace_records(client, table_id, records, log)
             log.info(f"table {key} rows={count}")
 
         if next_gpt_history is not None:
@@ -3302,7 +3685,7 @@ def main(argv: list[str] | None = None) -> int:
 
         log.info("sync ok")
         print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, "")
-        return 0
+        return recorder.finish(0, "ok")
 
     except SyncError as exc:
         error = exc.kind
@@ -3314,7 +3697,7 @@ def main(argv: list[str] | None = None) -> int:
         release_sync_lock(lock, log)
 
     print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
-    return 1
+    return recorder.finish(1, "error", error or "unknown")
 
 
 if __name__ == "__main__":
