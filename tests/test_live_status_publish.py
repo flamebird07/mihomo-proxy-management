@@ -4,7 +4,9 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -323,23 +325,29 @@ class BuildRowTests(unittest.TestCase):
     def test_collect_failed_row_is_severe_and_stale(self):
         doc = make_collected(ok=False)
         doc["api"]["reachable"] = False
+        doc["api"]["errors"] = ["api./proxies: ConnectionRefusedError"]
+        doc["errors"] = list(doc["api"]["errors"])
         row = build_row(doc, alert={"level": "严重", "summary": "mihomo API 不通",
                                     "reasons": [{"text": "mihomo API 不通（控制器不可达）"}]},
                         last_ok_collected_at="2026-11-05 17:30:00")
         self.assertEqual(row[mod.F_LEVEL], "严重")
         self.assertEqual(row[mod.F_STALE], "是")
-        self.assertEqual(row[mod.F_SUMMARY], "采集失败/数据陈旧，最后成功采集于 2026-11-05 17:30:00")
+        self.assertEqual(row[mod.F_SUMMARY],
+                         "采集失败（原因:api_unreachable）/数据陈旧，最后成功采集于 2026-11-05 17:30:00")
         self.assertIn("mihomo API 不通", row[mod.F_REASONS])
 
     def test_collect_failed_without_history_says_unknown(self):
         row = build_row(make_collected(ok=False))
-        self.assertEqual(row[mod.F_SUMMARY], "采集失败/数据陈旧，最后成功采集于 未知")
+        self.assertEqual(row[mod.F_SUMMARY],
+                         "采集失败（原因:unknown）/数据陈旧，最后成功采集于 未知")
 
     def test_failed_round_never_names_its_own_stamp_as_last_success(self):
         doc = make_collected(ok=False, base=NOW - timedelta(minutes=2))
         row = build_row(doc, last_ok_collected_at="2026-11-04 08:00:00")
-        self.assertEqual(row[mod.F_SUMMARY], "采集失败/数据陈旧，最后成功采集于 2026-11-04 08:00:00")
-        self.assertEqual(build_row(doc)[mod.F_SUMMARY], "采集失败/数据陈旧，最后成功采集于 未知")
+        self.assertEqual(row[mod.F_SUMMARY],
+                         "采集失败（原因:unknown）/数据陈旧，最后成功采集于 2026-11-04 08:00:00")
+        self.assertEqual(build_row(doc)[mod.F_SUMMARY],
+                         "采集失败（原因:unknown）/数据陈旧，最后成功采集于 未知")
 
     def test_garbage_and_empty_inputs_never_raise(self):
         for bad in ({}, None, [], "x", 42, {"ok": True}):
@@ -361,7 +369,7 @@ class BuildRowTests(unittest.TestCase):
         row = build_row(doc, alert=healthy_alert())
         self.assertEqual(row[mod.F_STALE], "是")
         self.assertEqual(row[mod.F_LEVEL], "严重")
-        self.assertIn("采集失败/数据陈旧", row[mod.F_SUMMARY])
+        self.assertIn("采集失败（原因:collect_document_incomplete）/数据陈旧", row[mod.F_SUMMARY])
 
     def test_bad_alert_result_falls_back_to_severe(self):
         for bad in (None, {}, "x", {"level": "也许"}, {"level": "正常"}):
@@ -447,7 +455,7 @@ class UpsertTests(unittest.TestCase):
                 {"record_id": "r3", "fields": {"key": "  live  "}}]
         self.assertEqual([r["record_id"] for r in mod.find_key_records(junk)], ["r3"])
 
-    def test_create_strips_nulls_but_update_clears_stale_cells(self):
+    def test_create_and_update_both_strip_unknown_numbers(self):
         row = {"key": "live", "GPT当前节点": "", "GPT可用数": None}
         created = FakeClient(records=[])
         mod.upsert_row(created, "tblLive0001", row, self.log)
@@ -455,7 +463,20 @@ class UpsertTests(unittest.TestCase):
 
         updated = FakeClient(records=[live_record("recLive")])
         mod.upsert_row(updated, "tblLive0001", row, self.log)
-        self.assertEqual(updated.updated, [("recLive", row)])  # null clears the old number
+        # an unknown number is omitted, never written as null; known fields —
+        # including "" text that clears a cell — are still sent
+        self.assertEqual(updated.updated,
+                         [("recLive", {"key": "live", "GPT当前节点": ""})])
+
+    def test_update_payload_has_no_nulls_for_a_full_row(self):
+        row = build_row(make_collected())
+        row[mod.F_GPT_USABLE] = None
+        client = FakeClient(records=[live_record("recLive")])
+        mod.upsert_row(client, "tblLive0001", row, self.log)
+        sent = client.updated[0][1]
+        self.assertNotIn(mod.F_GPT_USABLE, sent)
+        self.assertNotIn(None, sent.values())
+        self.assertEqual(len(sent), len(mod.TABLE_FIELDS) - 1)
 
     def test_record_without_id_is_reported_not_crashing(self):
         client = FakeClient(records=[{"fields": {"key": "live"}}])
@@ -590,7 +611,8 @@ class CliTests(TempRunMixin, unittest.TestCase):
             row = json.loads(out)["row"]
             self.assertEqual(row[mod.F_LEVEL], "严重")
             self.assertEqual(row[mod.F_STALE], "是")
-            self.assertIn("采集失败/数据陈旧，最后成功采集于", row[mod.F_SUMMARY])
+            self.assertIn("采集失败（原因:collect_document_missing）/数据陈旧，"
+                          "最后成功采集于", row[mod.F_SUMMARY])
             self.assertEqual(clients, [])
             self.assertIn("fallback row reason=collect_json_unusable", self.log_text())
 
@@ -636,7 +658,8 @@ class CliTests(TempRunMixin, unittest.TestCase):
         code, _, _ = self.run_main(self.base_argv("--apply"), client=client)
         self.assertEqual(code, 0)
         self.assertEqual(client.updated[-1][1][mod.F_SUMMARY],
-                         f"采集失败/数据陈旧，最后成功采集于 {recorded}")
+                         f"采集失败（原因:collect_document_incomplete）/数据陈旧，"
+                         f"最后成功采集于 {recorded}")
 
     def test_apply_uses_the_table_id_override(self):
         self.write_collect(make_collected(base=utcnow()))
@@ -776,6 +799,307 @@ class LockTests(TempRunMixin, unittest.TestCase):
         first.release()
         self.assertTrue(second.acquire())
         second.release()
+
+
+class FeishuClientRetryTests(unittest.TestCase):
+    """HTTP/transport retries of FeishuClient.call against a fake transport."""
+
+    def make_client(self, responses, sleep_mock=None):
+        client = mod.FeishuClient("cli_id", FAKE_SECRET, "app", mod.Logger(os.devnull))
+        client._token = "cached-token"
+        client._expires_at = time.time() + 3600
+        iter_responses = iter(responses)
+
+        def fake_urlopen(request, timeout=None):
+            response = next(iter_responses)
+            if isinstance(response, Exception):
+                raise response
+            handle = mock.MagicMock()
+            handle.read.return_value = json.dumps(response).encode("utf-8")
+            handle.__enter__.return_value = handle
+            return handle
+
+        patcher = mock.patch.object(mod.urllib.request, "urlopen", side_effect=fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if sleep_mock is None:
+            sleep_mock = mock.MagicMock()
+            patcher = mock.patch.object(mod.time, "sleep", sleep_mock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return client, sleep_mock
+
+    def http_error(self, code):
+        return urllib.error.HTTPError(f"{mod.FeishuClient.BASE}/x?secret=leak",
+                                      code, "err", {}, None)
+
+    def test_backoff_http_429_exhausts_after_four_attempts(self):
+        client, sleep = self.make_client([self.http_error(429)] * 4)
+        with self.assertRaises(mod.PublishError) as ctx:
+            client.call("GET", "/bitable/v1/apps/app/tables")
+        self.assertEqual(ctx.exception.kind, "rate_limited")
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(2.0), mock.call(4.0)])
+        self.assertNotIn("leak", ctx.exception.detail)
+        self.assertNotIn(FAKE_SECRET, str(ctx.exception))
+
+    def test_backoff_5xx_then_success(self):
+        ok = {"code": 0, "data": {"items": [1]}}
+        client, sleep = self.make_client([self.http_error(503), self.http_error(500), ok])
+        self.assertEqual(client.call("GET", "/t"), {"items": [1]})
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(2.0)])
+
+    def test_backoff_timeout_and_connection_error(self):
+        ok = {"code": 0, "data": {}}
+        client, sleep = self.make_client(
+            [urllib.error.URLError(OSError(10061, "refused")), ok])
+        self.assertEqual(client.call("GET", "/t"), {})
+        sleep.assert_called_once_with(1.0)
+        client, sleep = self.make_client([mod.socket.timeout("slow"), ok])
+        self.assertEqual(client.call("GET", "/t"), {})
+        sleep.assert_called_once_with(1.0)
+
+    def test_plain_network_error_is_retried(self):
+        ok = {"code": 0, "data": {}}
+        client, sleep = self.make_client(
+            [urllib.error.URLError(ConnectionResetError("reset")), ok])
+        self.assertEqual(client.call("GET", "/t"), {})
+        sleep.assert_called_once_with(1.0)
+
+    def test_every_retryable_kind_backs_off_and_reports_once(self):
+        for kind in ("http_429", "http_5xx", "timeout", "network_error"):
+            error = urllib.error.HTTPError("https://x/y?secret=leak",
+                                           429 if kind == "http_429" else 503,
+                                           "err", {}, None)
+            if kind == "timeout":
+                error = mod.socket.timeout("slow")
+            elif kind == "network_error":
+                error = urllib.error.URLError(OSError(10061, "refused"))
+            client, sleep = self.make_client([error] * 4)
+            with self.assertRaises(mod.PublishError) as ctx:
+                client.call("GET", "/t")
+            self.assertEqual(sleep.call_args_list,
+                             [mock.call(1.0), mock.call(2.0), mock.call(4.0)], kind)
+            self.assertEqual(ctx.exception.kind,
+                             "rate_limited" if kind == "http_429" else "network_failure",
+                             kind)
+            self.assertEqual(ctx.exception.detail, f"kind={kind}")
+
+    def test_http_404_is_not_retried(self):
+        client, sleep = self.make_client([self.http_error(404)])
+        with self.assertRaises(mod.PublishError) as ctx:
+            client.call("GET", "/t")
+        self.assertEqual(ctx.exception.kind, "http_404")
+        self.assertEqual(sleep.call_count, 0)
+
+    def test_bad_json_is_not_retried(self):
+        class BadBody:
+            def read(self_inner):
+                return b"{not json"
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *a):
+                return False
+
+        client, sleep = self.make_client([])
+        with mock.patch.object(mod.urllib.request, "urlopen",
+                               side_effect=lambda request, timeout=None: BadBody()):
+            with self.assertRaises(mod.PublishError) as ctx:
+                client.call("GET", "/t")
+        self.assertEqual(ctx.exception.kind, "bad_response")
+        self.assertEqual(sleep.call_count, 0)
+
+    def test_business_retry_code_still_backs_off(self):
+        busy = {"code": 1254290, "data": {}}
+        ok = {"code": 0, "data": {"v": 1}}
+        client, sleep = self.make_client([busy, busy, ok])
+        self.assertEqual(client.call("GET", "/t"), {"v": 1})
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(2.0)])
+
+    def test_token_refresh_path_unchanged(self):
+        expired = {"code": 99991663}
+        ok = {"code": 0, "data": {}}
+        token_body = {"code": 0, "tenant_access_token": "t2", "expire": 7200}
+        client, sleep = self.make_client([expired, token_body, ok])
+        self.assertEqual(client.call("GET", "/t"), {})
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5)])
+
+    def test_retry_logs_carry_neither_token_nor_url(self):
+        lines = []
+        log = mod.Logger(os.devnull)
+        log.info = log.warn = log.error = lines.append
+        client, _ = self.make_client([self.http_error(500)] * 4)
+        with self.assertRaises(mod.PublishError) as ctx:
+            client.call("GET", "/t", params={"user_email": "zhangsan@example.com"})
+        blob = json.dumps([lines, ctx.exception.kind, ctx.exception.detail],
+                          ensure_ascii=False)
+        for banned in (FAKE_SECRET, "leak", "zhangsan", "Bearer", "http://", "https://"):
+            self.assertNotIn(banned, blob)
+
+
+class ClientPagingTests(unittest.TestCase):
+    """Fake-transport tests for the paginating list_* helpers (>1 page)."""
+
+    def make_client(self, pages):
+        client = mod.FeishuClient("cli_id", FAKE_SECRET, "app", mod.Logger(os.devnull))
+        calls = []
+
+        def fake_call(method, path, body=None, params=None):
+            calls.append(params)
+            return pages[min(len(calls) - 1, len(pages) - 1)]
+
+        client.call = fake_call
+        return client, calls
+
+    def test_list_records_follows_page_token_across_three_pages(self):
+        pages = [
+            {"items": [{"record_id": f"r{i}"} for i in range(500)],
+             "has_more": True, "page_token": "p1"},
+            {"items": [{"record_id": f"r{i}"} for i in range(500, 1000)],
+             "has_more": True, "page_token": "p2"},
+            {"items": [{"record_id": "rLive", "fields": {mod.F_KEY: "live"}}],
+             "has_more": False, "page_token": ""},
+        ]
+        client, calls = self.make_client(pages)
+        records = client.list_records("tblX")
+        self.assertEqual(len(records), 1001)
+        self.assertEqual(calls[0], {"page_size": 500})
+        self.assertEqual(calls[1], {"page_size": 500, "page_token": "p1"})
+        self.assertEqual(calls[2], {"page_size": 500, "page_token": "p2"})
+
+    def test_upsert_updates_key_live_found_only_on_a_later_page(self):
+        def page_items(start, count, live=False):
+            items = []
+            for i in range(start, start + count):
+                if live and i == start:
+                    items.append({"record_id": "recLive", "fields": {mod.F_KEY: "live"},
+                                  "created_time": 1_700_000_000_000})
+                else:
+                    items.append({"record_id": f"r{i}",
+                                  "fields": {mod.F_KEY: f"其它-{i}"}})
+            return items
+
+        pages = [
+            {"items": page_items(0, 500), "has_more": True, "page_token": "p1"},
+            {"items": page_items(500, 500), "has_more": True, "page_token": "p2"},
+            {"items": page_items(1000, 500), "has_more": True, "page_token": "p3"},
+            {"items": page_items(1500, 1, live=True), "has_more": False, "page_token": ""},
+        ]
+        client, _ = self.make_client(pages)
+        updated = []
+        created = []
+        client.update_record = lambda tid, rid, fields: updated.append((tid, rid, dict(fields)))
+        client.create_record = lambda tid, fields: created.append((tid, dict(fields)))
+        row = {mod.F_KEY: "live", mod.F_LEVEL: "正常"}
+        action = mod.upsert_row(client, "tblX", row, mod.Logger(os.devnull))
+        self.assertEqual(action, "updated")
+        self.assertEqual(created, [])  # a row on page 4 must never be re-created
+        self.assertEqual([rid for _, rid, _ in updated], ["recLive"])
+
+    def test_duplicate_key_live_across_pages_updates_only_the_earliest(self):
+        def page(items, has_more, token):
+            return {"items": items, "has_more": has_more, "page_token": token}
+
+        live_old = {"record_id": "recOld", "fields": {mod.F_KEY: "live"},
+                    "created_time": 1_600_000_000_000}
+        live_new = {"record_id": "recNew", "fields": {mod.F_KEY: "live"},
+                    "created_time": 1_900_000_000_000}
+        pages = [
+            page([{"record_id": f"r{i}", "fields": {mod.F_KEY: "x"}} for i in range(500)]
+                 + [live_new], True, "p1"),
+            page([live_old], False, ""),
+        ]
+        client, _ = self.make_client(pages)
+        updated = []
+        client.update_record = lambda tid, rid, fields: updated.append(rid)
+        logs = []
+        log = mod.Logger(os.devnull)
+        log.warn = logs.append
+        action = mod.upsert_row(client, "tblX", {mod.F_KEY: "live"}, log)
+        self.assertEqual(action, "updated")
+        self.assertEqual(updated, ["recOld"])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("count=2", logs[0])
+
+    def test_list_tables_and_fields_paginate(self):
+        client, calls = self.make_client([
+            {"items": [{"name": "other", "table_id": "t1"}], "has_more": True, "page_token": "p1"},
+            {"items": [{"name": mod.TABLE_NAME, "table_id": "tLive"}], "has_more": False},
+        ])
+        tables = client.list_tables()
+        self.assertEqual(len(tables), 2)
+        self.assertEqual(calls[1], {"page_size": 100, "page_token": "p1"})
+        client, calls = self.make_client([
+            {"items": [{"field_name": "a"}], "has_more": True, "page_token": "p1"},
+            {"items": [{"field_name": "key"}], "has_more": False},
+        ])
+        self.assertEqual(len(client.list_fields("t1")), 2)
+        self.assertEqual(calls[1], {"page_size": 100, "page_token": "p1"})
+
+
+class CollectFailureCategoryTests(unittest.TestCase):
+    def doc(self, api_errors=(), errors=(), reachable=False, ok=False):
+        return {"collected_at": {"utc": iso(1)}, "ok": ok,
+                "api": {"base": "http://127.0.0.1:9090", "reachable": reachable,
+                        "errors": list(api_errors)},
+                "errors": list(errors)}
+
+    def test_known_categories(self):
+        cases = [
+            (self.doc(api_errors=["api./proxies: ConnectionRefusedError"]), "api_unreachable"),
+            (self.doc(api_errors=["api./proxies: TimeoutError"]), "timeout"),
+            (self.doc(api_errors=["api./proxies: HTTPError 502"]), "server_error"),
+            (self.doc(api_errors=["api./proxies: HTTPError 429"]), "rate_limited"),
+            (self.doc(api_errors=["api./proxies: OSError"]), "network_error"),
+            (self.doc(errors=["state_files.ippool: JSONDecodeError"]), "invalid_json"),
+            (self.doc(errors=["state_files.ippool: FileNotFoundError"]), "state_file_missing"),
+        ]
+        for doc, expected in cases:
+            self.assertEqual(mod.collect_failure_category(doc), expected, doc)
+
+    def test_api_wins_over_secondary_errors(self):
+        doc = self.doc(api_errors=["api./proxies: TimeoutError"],
+                       errors=["state_files.ippool: FileNotFoundError"], ok=False)
+        self.assertEqual(mod.collect_failure_category(doc), "timeout")
+
+    def test_garbage_and_secrets_never_leak_into_the_category(self):
+        doc = self.doc(api_errors=[f"api./proxies: {FAKE_SECRET}"],
+                       errors=[f"state_files.ippool: {FAKE_SUB_URL}"])
+        self.assertEqual(mod.collect_failure_category(doc), "unknown")
+        summary = build_row(doc)[mod.F_SUMMARY]
+        self.assertNotIn(FAKE_SECRET, summary)
+        self.assertNotIn("sub.example.com", summary)
+        for bad in (None, [], 42, {}, "x"):
+            self.assertIsInstance(mod.collect_failure_category(bad), str)
+
+
+class ParserDocTests(unittest.TestCase):
+    def test_help_names_default_log_lock_and_dry_run_logging(self):
+        text = mod.build_parser().format_help()
+        self.assertIn(mod.DEFAULT_LOG_FILE, text)
+        self.assertIn(mod.DEFAULT_LOCK_FILE, text)
+        self.assertIn("dry-run", text)
+
+    def test_dry_run_writes_the_default_log_and_log_file_redirects_it(self):
+        doc = make_collected(base=utcnow())
+        with tempfile.TemporaryDirectory() as tmp:
+            default_log = Path(tmp) / "default-logs" / "live-status-publish.log"
+            with mock.patch.object(mod, "DEFAULT_LOG_FILE", str(default_log)):
+                collect_file = Path(tmp) / "collected.json"
+                collect_file.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+                argv = ["--collect-json", str(collect_file),
+                        "--lock-file", str(Path(tmp) / "p.lock"),
+                        "--alert-state-file", str(Path(tmp) / "a.json"),
+                        "--publish-state-file", str(Path(tmp) / "s.json")]
+                with mock.patch.object(sys, "stdout", new=io.StringIO()):
+                    mod.main(argv, client_factory=lambda *a: None, lock_factory=FakeLock())
+                self.assertIn("start mode=dry-run", default_log.read_text(encoding="utf-8"))
+
+                elsewhere = Path(tmp) / "custom" / "publish.log"
+                with mock.patch.object(sys, "stdout", new=io.StringIO()):
+                    mod.main(argv + ["--log-file", str(elsewhere)],
+                             client_factory=lambda *a: None, lock_factory=FakeLock())
+                self.assertIn("start mode=dry-run", elsewhere.read_text(encoding="utf-8"))
+                self.assertEqual(default_log.read_text(encoding="utf-8").count("start mode"), 1)
 
 
 class HelperTests(unittest.TestCase):

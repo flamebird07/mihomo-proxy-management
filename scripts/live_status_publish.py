@@ -5,12 +5,18 @@ Reads a live_status_collect.py JSON document plus a live_status_alert.py
 evaluation (imported, or read from its --out JSON) and upserts exactly ONE row
 keyed ``key=live``: update when the row exists, create when it does not. An
 update never adds a row; if several ``key=live`` rows are found, only the
-earliest is updated and the duplication is logged as a warning.
+earliest is updated and the duplication is logged as a warning. Unknown
+numbers are omitted from both payloads (null is never sent); unknown text is
+``""``, which clears the cell on update.
 
 Modes: ``--dry-run`` (default) only prints the row it would write; ``--apply``
 writes it; ``--init`` provisions the table idempotently (create when missing,
 otherwise only add missing fields). Development and tests must stay on
 dry-run/fake clients — never point ``--init`` or ``--apply`` at real Feishu.
+
+Defaults: log ``C:\mihomo\logs\live-status-publish.log``, lock
+``C:\mihomo\live-status-publish.lock`` (``--log-file``/``--lock-file`` override).
+A dry-run writes the log — use ``--log-file`` to send it elsewhere.
 
 Only text and number fields are used. Every displayed time is Beijing-time
 text: aware UTC stamps (ippool ``updated_at``) are converted, naive stamps are
@@ -18,7 +24,13 @@ read as Beijing time. Tokens, secrets and subscription URLs are never printed,
 logged or written.
 
 The exit code is always 0. A failed collection or evaluation still writes a
-best-effort 数据陈旧 row (状态等级=严重) rather than raising.
+best-effort 数据陈旧 row (状态等级=严重) rather than raising. A failed
+collection row names the failure category in its summary (api_unreachable,
+timeout, invalid_json, ...) — never a URL, token or raw error text.
+
+Bitable calls retry not only the Feishu business codes but also HTTP 429/5xx,
+timeouts and connection errors: at most 4 attempts, 1/2/4s backoff. Retry logs
+carry only the fixed error kind.
 
 Nothing here starts a temporary mihomo, calls /configs, or probes any delay
 endpoint: collection is delegated to live_status_collect (GET /proxies plus
@@ -111,6 +123,9 @@ TABLE_FIELDS: list[tuple[str, int, dict | None]] = [
 # token-expiry codes: same sets the main sync retries on.
 RETRY_CODES = {1254290, 1254291, 1254607, 99991400, 1310213}
 TOKEN_CODES = {99991661, 99991663, 99991664, 99991668}
+
+# HTTP/transport failures retried by call() with the same backoff as RETRY_CODES.
+RETRYABLE_HTTP_KINDS = {"http_429", "http_5xx", "timeout", "network_error"}
 
 # Windows named-mutex constants (a dedicated name, not the main sync's).
 PUBLISH_MUTEX_NAME = r"Local\mihomo-live-status-publish"
@@ -436,6 +451,11 @@ class FeishuClient:
                 raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             # The HTTP body may echo request details; only the status is kept.
+            # 429/5xx are retryable and classified as such; other codes are not.
+            if exc.code == 429:
+                raise PublishError("http_429") from None
+            if 500 <= exc.code < 600:
+                raise PublishError("http_5xx") from None
             raise PublishError(f"http_{exc.code}") from None
         except (socket.timeout, TimeoutError):
             raise PublishError("timeout") from None
@@ -476,27 +496,52 @@ class FeishuClient:
             url = f"{url}?{urllib.parse.urlencode(params)}"
         delay = 1.0
         for attempt in range(4):
-            headers = {
-                "Content-Type": "application/json; charset=utf-8",
-                "Authorization": f"Bearer {self.token()}",
-            }
-            payload = self._raw(method, url, body, headers)
-            code = payload.get("code", 0)
-            if code == 0:
-                return payload.get("data") or {}
-            if code in TOKEN_CODES:
-                self._token = None
-                if attempt < 3:
-                    time.sleep(0.5)
-                    continue
-                raise PublishError("token_error", f"code={code}")
-            if code in RETRY_CODES:
-                if attempt < 3:
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
+            auth_error = None
+            net_error = None
+            payload = None
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {self.token()}",
+                }
+                payload = self._raw(method, url, body, headers)
+            except PublishError as exc:
+                # An auth failure inside token acquisition refreshes and retries
+                # like before; HTTP 429/5xx, timeouts and connection errors get
+                # the same bounded backoff as the retry codes. The kind is a
+                # fixed classification: no URL, token or secret ever escapes.
+                if exc.kind == "token_error":
+                    auth_error = exc
+                    self._token = None
+                elif exc.kind in RETRYABLE_HTTP_KINDS:
+                    net_error = exc
+                else:
+                    raise
+            if auth_error is None and payload is not None:
+                code = payload.get("code", 0)
+                if code == 0:
+                    return payload.get("data") or {}
+                if code not in TOKEN_CODES and code not in RETRY_CODES:
+                    raise PublishError("api_error", f"code={code}")
+                if code in TOKEN_CODES:
+                    self._token = None
+            if attempt >= 3:
+                if auth_error is not None:
+                    raise auth_error
+                if net_error is not None:
+                    raise (PublishError("rate_limited", "kind=http_429")
+                           if net_error.kind == "http_429" else
+                           PublishError("network_failure", f"kind={net_error.kind}"))
+                if code in TOKEN_CODES:
+                    raise PublishError("token_error", f"code={code}")
                 raise PublishError("rate_limited", f"code={code}")
-            raise PublishError("api_error", f"code={code}")
+            if auth_error is not None:
+                time.sleep(0.5)
+            elif net_error is None and code in TOKEN_CODES:
+                time.sleep(0.5)
+            else:
+                time.sleep(delay)
+                delay *= 2
         raise PublishError("api_error", "retry_exhausted")
 
     # -- tables / fields ---------------------------------------------------
@@ -680,6 +725,84 @@ def is_stale(collected, collected_moment, now, stale_minutes) -> bool:
     return (now - collected_moment).total_seconds() > stale_minutes * 60.0
 
 
+# Collector error strings are "<site>: <sanitized exception name or HTTPError
+# <code>>"; the mapping keeps only fixed categories. Anything unmappable stays
+# "unknown" — error text from a document supplied via --collect-json is never
+# echoed into the row.
+_FAILURE_CATEGORIES = {
+    "connectionrefusederror": "api_unreachable",
+    "connectionreseterror": "api_unreachable",
+    "connectionabortederror": "api_unreachable",
+    "remoteendpointnotfounderror": "connection_refused",
+    "unknownhosterror": "dns_failure",
+    "gaierror": "dns_failure",
+    "timeouterror": "timeout",
+    "readtimeout": "timeout",
+    "sockettimeout": "timeout",
+    "sslerror": "tls_failure",
+    "oserror": "network_error",
+    "filenotfounderror": "state_file_missing",
+    "permissionerror": "state_file_unreadable",
+    "isadirectoryerror": "state_file_unreadable",
+    "jsondecodeerror": "invalid_json",
+    "unicodeerror": "invalid_json",
+    "valueerror": "invalid_json",
+    "httperror": "server_error",
+}
+
+
+def _failure_category(token: str) -> str | None:
+    token = token.strip().lower()
+    if token.startswith("httperror"):
+        parts = token.split()
+        try:
+            code = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            code = 0
+        if code == 429:
+            return "rate_limited"
+        if 500 <= code < 600:
+            return "server_error"
+        return "client_error"
+    if not token or " " in token:
+        # Never a known classification token: refuse to echo anything else.
+        return None
+    return _FAILURE_CATEGORIES.get(token)
+
+
+def _error_category(error) -> str | None:
+    """Category from a collector error '<site>: <sanitized message>'."""
+    if not isinstance(error, str) or ":" not in error:
+        return None
+    return _failure_category(error.split(":", 1)[1])
+
+
+def collect_failure_category(collected) -> str:
+    """One safe category for why this round failed (never raw text or URLs)."""
+    if not isinstance(collected, dict) or not collected:
+        return "collect_document_missing"
+    if collected.get("collected_at") is None:
+        return "collect_document_incomplete"
+    categories = []
+    api = collected.get("api")
+    if isinstance(api, dict) and api.get("reachable") is False:
+        categories.extend(_error_category(e) for e in api.get("errors") or [])
+    if not categories:
+        errors = collected.get("errors")
+        if isinstance(errors, list):
+            categories.extend(
+                _error_category(e)
+                for e in errors
+                if isinstance(e, str)
+                and (e.startswith("api.") or e.startswith("state_files.")))
+    for category in categories:
+        if category is not None and category != "client_error":
+            return category
+    if any(category is not None for category in categories):
+        return "client_error"
+    return "unknown"
+
+
 def build_row(collected, alert_result, *, now=None, stale_minutes=DEFAULT_STALE_MINUTES,
               last_ok_collected_at=None) -> dict:
     """The 实时状态 field dict for one round. Never raises on bad input.
@@ -706,7 +829,9 @@ def build_row(collected, alert_result, *, now=None, stale_minutes=DEFAULT_STALE_
         last_ok = (last_ok_collected_at.strip()
                    if isinstance(last_ok_collected_at, str) and last_ok_collected_at.strip()
                    else None)
-        summary = f"采集失败/数据陈旧，最后成功采集于 {last_ok or '未知'}"
+        category = collect_failure_category(collected)
+        summary = (f"采集失败（原因:{category}）/数据陈旧，"
+                   f"最后成功采集于 {last_ok or '未知'}")
     else:
         summary = alert_result.get("summary") if isinstance(alert_result, dict) else None
         summary = summary if isinstance(summary, str) and summary.strip() else "无摘要"
@@ -747,7 +872,7 @@ def build_row(collected, alert_result, *, now=None, stale_minutes=DEFAULT_STALE_
 def _finalize_row(row: dict) -> dict:
     """Every declared field, in table order: unknown text becomes "" so an update
     clears a cell instead of leaving the previous round's value on screen. Unknown
-    numbers stay None — omitted on create, written as null on update."""
+    numbers stay None — upsert_row omits them from both create and update."""
     final: dict[str, Any] = {}
     for name, ftype, _ in TABLE_FIELDS:
         value = row.get(name)
@@ -921,10 +1046,9 @@ def ensure_table(client, args, log: Logger) -> tuple[str, list[str]]:
 def upsert_row(client, table_id: str, row: dict, log: Logger) -> str:
     """Update the single key=live row, or create it. Returns the action taken."""
     matches = find_key_records(client.list_records(table_id))
+    payload = {name: value for name, value in row.items() if value is not None}
     if not matches:
-        # A new row needs no nulls: an absent field is already an empty cell.
-        record_id = client.create_record(
-            table_id, {name: value for name, value in row.items() if value is not None})
+        record_id = client.create_record(table_id, payload)
         log.info(f"row created key={KEY_VALUE} table_id={table_id} record_id={record_id}")
         return "created"
     if len(matches) > 1:
@@ -934,7 +1058,9 @@ def upsert_row(client, table_id: str, row: dict, log: Logger) -> str:
     record_id = str(target.get("record_id") or "")
     if not record_id:
         raise PublishError("api_error", "record_without_id")
-    client.update_record(table_id, record_id, row)
+    # Unknown numbers are omitted here too (an explicit null could wipe a cell
+    # the fetch could not explain); unknown text is "" and still clears.
+    client.update_record(table_id, record_id, payload)
     log.info(f"row updated key={KEY_VALUE} table_id={table_id} record_id={record_id} "
              f"matches={len(matches)}")
     return "updated"
@@ -969,7 +1095,11 @@ def _add_collector_defaults(parser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Upsert the single 实时状态 row in Feishu Bitable (exit code always 0).")
+        description="Upsert the single 实时状态 row in Feishu Bitable (exit code always 0).",
+        epilog=(f"default --log-file {DEFAULT_LOG_FILE} and --lock-file {DEFAULT_LOCK_FILE}; "
+                "a --dry-run run still writes the log (redirect it with --log-file); "
+                "Feishu calls retry HTTP 429/5xx, timeouts and connection errors "
+                "with a 1/2/4s backoff (4 attempts max)."))
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--init", action="store_true",
                       help="idempotent provisioning: create the table if missing, else only add "
@@ -993,8 +1123,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="file holding FEISHU_APP_ID/FEISHU_APP_SECRET")
     parser.add_argument("--table-id", default=None,
                         help=f"skip the {TABLE_NAME} table lookup and use this table_id")
-    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="log file path")
-    parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE, help="lock file path")
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE,
+                        help=f"log file path, also written by dry-run (default {DEFAULT_LOG_FILE})")
+    parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
+                        help=f"lock file path (default {DEFAULT_LOCK_FILE})")
     parser.add_argument("--verbose", action="store_true", help="mirror log lines to stderr")
     _add_collector_defaults(parser)
     return parser
