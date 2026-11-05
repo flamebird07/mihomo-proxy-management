@@ -87,6 +87,13 @@ def codes(result):
     return [r["code"] for r in result["reasons"]]
 
 
+def zero_gpt_doc(base, members=("美国1｜AI通用", "美国2｜AI通用")):
+    """A doc collected at ``base`` whose GPT group has no usable member."""
+    doc = make_collected(base=base)
+    doc["groups"]["GPT"] = group([member(name, usable=False) for name in members])
+    return doc
+
+
 def evaluate(doc, prev_state=None, thresholds=None, now=NOW):
     return mod.evaluate(doc, prev_state=prev_state, thresholds=thresholds, now=now)
 
@@ -122,34 +129,30 @@ class RuleTests(unittest.TestCase):
 
     # c) GPT zero usable, consecutive rounds
     def test_gpt_zero_first_round_is_degraded_then_severe(self):
-        doc = make_collected()
-        doc["groups"]["GPT"] = group([member("美国1｜AI通用", usable=False),
-                                       member("美国2｜AI通用", usable=False)])
-        r1 = evaluate(doc)  # no prev_state -> first round
+        # one round per distinct collected_at
+        r1 = evaluate(zero_gpt_doc(NOW - timedelta(minutes=20)))  # no prev_state -> first round
         self.assertIn("gpt_zero_usable_first_round", codes(r1))
         self.assertEqual(r1["level_code"], 1)
         self.assertIn("待确认", r1["summary"])
         self.assertEqual(r1["next_state"]["gpt_zero_usable_rounds"], 1)
 
-        r2 = evaluate(doc, prev_state=r1["next_state"])
+        r2 = evaluate(zero_gpt_doc(NOW - timedelta(minutes=10)), prev_state=r1["next_state"])
         self.assertIn("gpt_zero_usable_persistent", codes(r2))
         self.assertEqual(r2["level_code"], 2)
         self.assertEqual(r2["next_state"]["gpt_zero_usable_rounds"], 2)
 
-        r3 = evaluate(doc, prev_state=r2["next_state"])
+        r3 = evaluate(zero_gpt_doc(NOW), prev_state=r2["next_state"])
         self.assertIn("gpt_zero_usable_persistent", codes(r3))
         self.assertEqual(r3["next_state"]["gpt_zero_usable_rounds"], 3)
 
     def test_gpt_zero_counter_resets_on_recovery(self):
-        zero_doc = make_collected()
-        zero_doc["groups"]["GPT"] = group([member("美国1｜AI通用", usable=False)])
-        r1 = evaluate(zero_doc)
+        r1 = evaluate(zero_gpt_doc(NOW - timedelta(minutes=20), members=("美国1｜AI通用",)))
         self.assertEqual(r1["next_state"]["gpt_zero_usable_rounds"], 1)
-        r2 = evaluate(make_collected(), prev_state=r1["next_state"])
+        r2 = evaluate(make_collected(base=NOW - timedelta(minutes=10)), prev_state=r1["next_state"])
         self.assertEqual(r2["next_state"]["gpt_zero_usable_rounds"], 0)
         self.assertEqual(r2["level_code"], 0)
         # after recovery, a fresh zero round is degraded again, not severe
-        r3 = evaluate(zero_doc, prev_state=r2["next_state"])
+        r3 = evaluate(zero_gpt_doc(NOW, members=("美国1｜AI通用",)), prev_state=r2["next_state"])
         self.assertIn("gpt_zero_usable_first_round", codes(r3))
         self.assertEqual(r3["level_code"], 1)
 
@@ -414,6 +417,78 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(result["next_state"]["last_level"], "正常")
 
 
+class CollectedAtDedupTests(unittest.TestCase):
+    """The GPT zero-usable counter advances once per distinct collected_at."""
+
+    def test_same_collected_at_repeat_does_not_increment(self):
+        doc = zero_gpt_doc(NOW)
+        r1 = evaluate(doc)
+        self.assertEqual(r1["next_state"]["gpt_zero_usable_rounds"], 1)
+        state = r1["next_state"]
+        for _ in range(5):
+            repeat = evaluate(doc, prev_state=state)
+            self.assertEqual(repeat["next_state"]["gpt_zero_usable_rounds"], 1)
+            self.assertIn("gpt_zero_usable_first_round", codes(repeat))
+            self.assertNotIn("gpt_zero_usable_persistent", codes(repeat))
+            self.assertEqual(repeat["level_code"], 1)
+            state = repeat["next_state"]
+
+    def test_new_collected_at_increments(self):
+        state = None
+        for minutes in (30, 20, 10, 0):
+            result = evaluate(zero_gpt_doc(NOW - timedelta(minutes=minutes)), prev_state=state)
+            state = result["next_state"]
+        self.assertEqual(state["gpt_zero_usable_rounds"], 4)
+
+    def test_utc_and_beijing_forms_of_one_instant_are_the_same_round(self):
+        doc = zero_gpt_doc(NOW)
+        r1 = evaluate(doc)
+        # same instant expressed only through the beijing member
+        clone = zero_gpt_doc(NOW)
+        clone["collected_at"] = {"beijing": NOW.astimezone(BEIJING_TZ).isoformat()}
+        r2 = evaluate(clone, prev_state=r1["next_state"])
+        self.assertEqual(r2["next_state"]["gpt_zero_usable_rounds"], 1)
+        self.assertNotIn("gpt_zero_usable_persistent", codes(r2))
+
+    def test_recovery_still_clears_on_a_repeated_round(self):
+        r1 = evaluate(zero_gpt_doc(NOW))
+        healthy = make_collected(base=NOW)  # identical collected_at, usable again
+        r2 = evaluate(healthy, prev_state=r1["next_state"])
+        self.assertEqual(r2["next_state"]["gpt_zero_usable_rounds"], 0)
+        self.assertEqual(r2["level_code"], 0)
+
+    def test_missing_or_unparsable_collected_at_counts_every_round(self):
+        for bad in (None, {}, "not-a-time", {"utc": None, "beijing": ""}, 42):
+            doc = zero_gpt_doc(NOW)
+            doc["collected_at"] = bad
+            r1 = evaluate(doc)
+            r2 = evaluate(doc, prev_state=r1["next_state"])
+            r3 = evaluate(doc, prev_state=r2["next_state"])
+            self.assertEqual([r["next_state"]["gpt_zero_usable_rounds"] for r in (r1, r2, r3)],
+                             [1, 2, 3], repr(bad))
+            self.assertIn("gpt_zero_usable_persistent", codes(r2), repr(bad))
+            self.assertIsNone(r3["next_state"]["last_collected_at"], repr(bad))
+
+    def test_state_records_last_collected_at_in_beijing(self):
+        result = evaluate(zero_gpt_doc(NOW))
+        self.assertEqual(result["next_state"]["last_collected_at"],
+                         NOW.astimezone(BEIJING_TZ).isoformat())
+        # a state written by the older version has no key: still a fresh round
+        legacy = {"gpt_zero_usable_rounds": 1}
+        self.assertEqual(evaluate(zero_gpt_doc(NOW), prev_state=legacy)
+                         ["next_state"]["gpt_zero_usable_rounds"], 2)
+
+    def test_data_age_still_uses_wall_clock_on_a_repeated_round(self):
+        # a repeated round must not freeze the age-based rules either
+        doc = zero_gpt_doc(NOW)
+        doc["state_files"]["feishu_bitable_sync_state"]["summary"][
+            "last_success_time"] = ago_iso(181)
+        r1 = evaluate(doc)
+        r2 = evaluate(doc, prev_state=r1["next_state"])
+        for result in (r1, r2):
+            self.assertIn("sync_success_too_old", codes(result))
+
+
 class StateFileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -513,18 +588,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(out2)["level_code"], 2)
 
     def test_cli_state_persists_across_runs(self):
-        zero_doc = self.fresh_doc()
-        zero_doc["groups"]["GPT"] = group([member("美国1｜AI通用", usable=False)])
-        path = self.write_input(zero_doc)
-        argv = ["--input", path, "--state-file", str(self.state_file), "--json"]
+        # each run evaluates a NEW collection (distinct collected_at); re-running
+        # the same document must not advance the counter (see dedup tests below)
+        argv = ["--input", str(self.input_file), "--state-file", str(self.state_file), "--json"]
+        self.write_input(zero_gpt_doc(utcnow(), members=("美国1｜AI通用",)))
         _, out1 = self.run_main(argv)
         self.assertEqual(json.loads(out1)["level_code"], 1)  # first round: 待确认
+        self.write_input(zero_gpt_doc(utcnow() + timedelta(seconds=60),
+                                      members=("美国1｜AI通用",)))
         _, out2 = self.run_main(argv)
         result2 = json.loads(out2)
         self.assertEqual(result2["level_code"], 2)  # second round: severe
         self.assertIn("gpt_zero_usable_persistent", [r["code"] for r in result2["reasons"]])
         # recovery resets the counter on disk
-        self.write_input(self.fresh_doc())
+        self.write_input(make_collected(base=utcnow() + timedelta(seconds=120)))
         _, out3 = self.run_main(argv)
         self.assertEqual(json.loads(out3)["level_code"], 0)
         self.assertEqual(mod.load_state(self.state_file)["gpt_zero_usable_rounds"], 0)

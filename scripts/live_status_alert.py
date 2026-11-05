@@ -20,6 +20,13 @@ State file: JSON, default C:\\mihomo\\state\\live-status-alert-state.json
 (configurable via --state-file). Written atomically (temp file + os.replace).
 A missing or corrupt state file is treated as a first round — never fatal.
 
+Round identity: the GPT zero-usable counter advances once per distinct
+``collected_at``. Re-evaluating a document whose ``collected_at`` matches the
+state's ``last_collected_at`` leaves the counter where it is, so a repeated run
+over the same collection cannot escalate 待确认 into 严重. A missing or
+unparsable ``collected_at`` has no identity and falls back to counting every
+evaluation as its own round. Data-age rules keep using the wall clock.
+
 Timestamps: aware ISO strings are used as-is; naive ones are assumed to be
 Beijing local time (sync-feishu-bitable writes ``datetime.now().isoformat()``
 on a +08:00 machine). All displayed times are rendered in Beijing time.
@@ -88,6 +95,28 @@ def _parse_iso(text):
     return parsed
 
 
+def _collected_at_key(collected):
+    """Canonical dedup key for one collection round; None when absent/unparsable.
+
+    ``collected_at`` may be the collector's {"utc","beijing"} pair or a bare
+    string. Both members of the pair denote the same instant, so rendering the
+    parsed value in Beijing time makes them collapse to one key. Naive stamps
+    are read as Beijing time (see _parse_iso).
+    """
+    raw = collected.get("collected_at")
+    if isinstance(raw, dict):
+        candidates = (raw.get("utc"), raw.get("beijing"))
+    elif isinstance(raw, str):
+        candidates = (raw,)
+    else:
+        candidates = ()
+    for text in candidates:
+        parsed = _parse_iso(text)
+        if parsed is not None:
+            return parsed.astimezone(BEIJING_TZ).isoformat()
+    return None
+
+
 def _beijing_text(moment):
     """Render an aware datetime as Beijing-time text."""
     return moment.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -140,8 +169,10 @@ def _rule_process(collected, reasons):
         reasons.append(_reason("mihomo_process_missing", 2, "mihomo 进程不存在（未找到 mihomo_pid）"))
 
 
-def _rule_gpt(collected, prev_state, thresholds, reasons, next_state):
-    # c) / f) GPT usable-count rules with a consecutive-round counter
+def _rule_gpt(collected, prev_state, thresholds, reasons, next_state, same_round=False):
+    # c) / f) GPT usable-count rules with a consecutive-round counter.
+    # same_round: this collected_at was already evaluated, so the counter must
+    # not advance again for it.
     groups = collected.get("groups")
     gpt = groups.get(GPT_GROUP) if isinstance(groups, dict) else None
     prev_rounds = prev_state.get("gpt_zero_usable_rounds")
@@ -157,7 +188,7 @@ def _rule_gpt(collected, prev_state, thresholds, reasons, next_state):
         next_state["gpt_zero_usable_rounds"] = prev_rounds
         return
     if usable == 0:
-        rounds = prev_rounds + 1
+        rounds = prev_rounds if same_round else prev_rounds + 1
         next_state["gpt_zero_usable_rounds"] = rounds
         severe_after = thresholds["gpt_zero_severe_rounds"]
         if rounds >= severe_after:
@@ -337,9 +368,13 @@ def evaluate(collected, prev_state=None, thresholds=None, now=None):
 
     reasons = []
     next_state = {}
+    collected_key = _collected_at_key(collected)
+    prev_key = prev_state.get("last_collected_at")
+    same_round = (collected_key is not None and isinstance(prev_key, str)
+                  and prev_key == collected_key)
     _rule_collect_and_api(collected, reasons)
     _rule_process(collected, reasons)
-    _rule_gpt(collected, prev_state, merged, reasons, next_state)
+    _rule_gpt(collected, prev_state, merged, reasons, next_state, same_round=same_round)
     _rule_sync(collected, merged, now, reasons)
     _rule_group_now(collected, reasons)
     _rule_ippool(collected, merged, now, reasons)
@@ -359,6 +394,7 @@ def evaluate(collected, prev_state=None, thresholds=None, now=None):
         "last_summary": summary,
         "last_reason_count": len(reasons),
         "evaluated_at_beijing": _beijing_text(now),
+        "last_collected_at": collected_key,
     })
     return {
         "level": LEVEL_NAMES[level_code],
