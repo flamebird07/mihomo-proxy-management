@@ -2,7 +2,7 @@
 
 Covered contracts:
   * the daily default (no flags) is the full path: speed test on, 表1/表2/表3
-  * the default speed-test target is https://grok.com/cdn-cgi/trace
+  * the default speed-test target is the Grok homepage
   * run-feishu-bitable-sync.bat (daily task) never passes --no-speedtest or
     --speedtest-write; run-feishu-speedtest.bat is an optional manual entry
   * --speedtest-write parses, defaults off, and is mutually exclusive with
@@ -40,7 +40,7 @@ sys.modules[spec.name] = sync
 spec.loader.exec_module(sync)
 
 SOURCES = [{"源": "A"}]
-NODES = [{"节点": "a1"}]
+NODES = [{"fields": {"节点名": "a1"}}]
 REGIONS = [{"地区": "新加坡"}]
 
 
@@ -115,6 +115,7 @@ class LimitGuardTests(unittest.TestCase):
                 "--log-file", os.path.join(tmp, "sync.log"),
                 "--env-file", os.path.join(tmp, "missing.env"),
                 "--state-file", os.path.join(tmp, "missing-state.json"),
+                "--sync-state-file", os.path.join(tmp, "sync-state.json"),
                 "--lock-file", os.path.join(tmp, "sync.lock"),
             ]
             stdout = io.StringIO()
@@ -164,11 +165,13 @@ class MainFlowMockClientTests(unittest.TestCase):
             "--sources-env", os.path.join(tmp, "missing-sources.env"),
             "--live-env", os.path.join(tmp, "missing-live.env"),
             "--state-file", os.path.join(tmp, "missing-state.json"),
+            "--sync-state-file", os.path.join(tmp, "sync-state.json"),
             "--gpt-history-file", os.path.join(tmp, "gpt-history.json"),
             "--lock-file", os.path.join(tmp, "sync.lock"),
         ] + extra_argv
 
         replaced: list[tuple[str, list]] = []
+        events = []
         isolated = MagicMock(
             return_value=(dict(DELAYS), dict(REGION_BY_NODE)),
             side_effect=isolated_side_effect,
@@ -192,14 +195,25 @@ class MainFlowMockClientTests(unittest.TestCase):
             p("collect_source", fake_collect)
             p("write_source_cache", lambda *a, **k: None)
             p("build_pool", lambda results, log=None: [(dict(POOL[0][0]), POOL[0][1])])
-            p("test_isolated", isolated)
+            def run_isolated(*args, **kwargs):
+                events.append("speedtest")
+                result = isolated(*args, **kwargs)
+                if kwargs.get("on_delays") is not None:
+                    kwargs["on_delays"](result[0])
+                events.append("geo")
+                return result
+
+            p("test_isolated", run_isolated)
             p("test_live", live)
             p("load_group_members", lambda config, log: {})
-            p("build_source_records", lambda results, sync_ms: list(SOURCES))
-            p("build_node_records", lambda *a, **k: list(NODES))
+            p("build_node_records", lambda *a, **k: [{"fields": dict(row["fields"])} for row in NODES])
             p("build_region_records", lambda *a, **k: list(REGIONS))
-            p("replace_records",
-              lambda client, table_id, records, log: replaced.append((table_id, records)) or len(records))
+            def record_write(client, table_id, records, log, **kwargs):
+                events.append(table_id)
+                replaced.append((table_id, records))
+                return len(records)
+
+            p("replace_records", record_write)
             p("print_summary", lambda *a, **k: None)
             p("SyncLock", _StubLock)
             stdout = io.StringIO()
@@ -207,11 +221,26 @@ class MainFlowMockClientTests(unittest.TestCase):
                 code = sync.main(argv)
         return code, {
             "replaced_ids": [table_id for table_id, _ in replaced],
+            "replaced": replaced,
+            "events": events,
             "isolated": isolated,
             "live": live,
             "client": client_cls,
             "locks": list(_StubLock.instances),
         }
+
+    def test_full_sync_publishes_sources_before_speedtest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, state = self.run_main(tmp, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(state["events"], ["tblS", "speedtest", "tblS", "geo", "tblN", "tblG"])
+        early, final = state["replaced"][:2]
+        self.assertNotIn("存活数", early[1][0]["fields"])
+        self.assertIn("存活数", final[1][0]["fields"])
+        self.assertGreaterEqual(
+            state["replaced"][2][1][0]["fields"]["同步时间"],
+            final[1][0]["fields"]["同步时间"],
+        )
 
     def test_no_speedtest_writes_sources_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -249,9 +278,9 @@ class DailyEntrypointTests(unittest.TestCase):
 
     SCRIPT_DIR = os.path.join(HERE, os.pardir, "scripts")
 
-    def test_default_target_is_grok_trace(self):
-        self.assertEqual(sync.DEFAULT_TARGET, "https://grok.com/cdn-cgi/trace")
-        self.assertEqual(sync.parse_args([]).target, "https://grok.com/cdn-cgi/trace")
+    def test_default_target_is_grok_homepage(self):
+        self.assertEqual(sync.DEFAULT_TARGET, "https://grok.com/")
+        self.assertEqual(sync.parse_args([]).target, "https://grok.com/")
 
     def test_daily_bat_runs_full_sync(self):
         path = os.path.join(self.SCRIPT_DIR, "run-feishu-bitable-sync.bat")
