@@ -1,0 +1,5 @@
+#!/bin/sh
+# Thin entry point - all logic lives in the mpm_macos package.
+# The installer replaces __PACKAGE_DIR__ with the installed package location.
+: "${MPM_PYTHON:=/usr/bin/python3}"
+exec "$MPM_PYTHON" -c 'import sys; sys.path.insert(0, "__PACKAGE_DIR__"); from mpm_macos.cli import main; raise SystemExit(main())' "$@"

@@ -30,6 +30,8 @@ import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, os.pardir, "scripts", "sync-feishu-bitable.py")
 BAT = os.path.join(HERE, os.pardir, "scripts", "run-feishu-bitable-sync.bat")
@@ -77,6 +79,7 @@ def run_bat(bat):
         encoding="utf-8", errors="replace", timeout=180)
 
 
+@pytest.mark.windows_only
 @unittest.skipUnless(sys.platform.startswith("win"), "cmd.exe redirection is Windows-only")
 class SameFileConflictTests(unittest.TestCase):
     """The bug, reproduced through a real cmd `>>`, and then shown to be fixed."""

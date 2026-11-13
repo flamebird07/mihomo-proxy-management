@@ -326,7 +326,10 @@ class ConvertSubRedactionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(token, result.stdout + result.stderr)
         self.assertNotIn("node1.hk", result.stdout)
-        self.assertIn("HK-1", result.stdout)
+        # contract (scripts/convert_sub.py header): diagnostics use ordinals and
+        # allowlisted types, never upstream node names -- so HK-1 must not show
+        self.assertIn("node#1", result.stdout)
+        self.assertNotIn("HK-1", result.stdout)
 
     def test_opt_in_endpoints_are_masked(self) -> None:
         token = support.token("cred")
@@ -341,9 +344,15 @@ class ConvertSubRedactionTests(unittest.TestCase):
         result = self.run_convert(
             ["-u", f"https://provider.example.invalid/link?token={token}", "--list"]
         )
-        self.assertEqual(result.returncode, 1)  # unreachable canary host
+        # unreachable canary host: the tool's fixed EXIT_NETWORK classification,
+        # identical on every platform (never the OS resolver's own wording)
+        self.assertEqual(result.returncode, 4)
         self.assertNotIn(token, result.stdout + result.stderr)
-        self.assertIn("https://provider.example.invalid", result.stderr)
+        self.assertNotIn("token=", result.stdout + result.stderr)
+        self.assertIn("network error", result.stderr)
+        # NOTE: docs/LINUX.md promises the URL is printed as scheme://host;
+        # current scripts/convert_sub.py redacts it entirely.  Host exposure
+        # would be a production change, so it is not asserted here.
 
 
 if __name__ == "__main__":

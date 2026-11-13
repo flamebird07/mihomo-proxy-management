@@ -41,7 +41,8 @@ from mpm.preflight import HostFacts  # noqa: E402
 from mpm.sanitize import HOST  # noqa: E402
 
 UNIT = UNIT_NAME
-RUN_AS_ROOT = os.geteuid() == 0
+# os.geteuid is absent on Windows; -1 keeps RUN_AS_ROOT False there.
+RUN_AS_ROOT = getattr(os, "geteuid", lambda: -1)() == 0
 
 FOREIGN = "subscription-foreign"
 CN = "subscription-cn"
@@ -257,7 +258,10 @@ def make_facts(
     facts.has_tun_device = tun
     facts.tun_writable = tun
     facts.avx2 = avx2
-    facts.is_root = RUN_AS_ROOT if root is None else root
+    # The sandbox simulates a supported root Linux host on every platform;
+    # preflight must see the injected facts, not the runner's privileges.
+    # Negative tests pass root=False explicitly.
+    facts.is_root = True if root is None else root
     facts.has_systemd = systemd
     facts.inside_container = container
     return facts

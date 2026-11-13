@@ -75,6 +75,8 @@ wrapper 逐阶段保存退出码，并按“池失败优先、其次飞书、最
 
 每轮 wrapper 结束前会调用 `scripts/sync-xigua-ippool-feishu.py`，维护独立子表 `西瓜IP池`。它不写现有“订阅源状态 / 可测速节点 / GPT可用地区组”三张表。Production 在 stage2 之后同步，因此“最终可用”对应本轮最终 provider；collector 尚未成熟或 stage2 失败时仍会尝试同步安全可读的 state。退出码按“池失败优先、其次飞书、最后日志”聚合：池成功但飞书失败时最终仍为非 0。stdout 会分别打印 `POOL_RESULT`、`FEISHU_RESULT` 与 `ROUND_RESULT`。
 
+飞书凭据从 `--env-file`（默认 `C:\Users\Administrator\.hermes\.env`）读取：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_BITABLE_APP_TOKEN`（多维表 app token）。token 解析优先级为命令行 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` > env 文件同名键；缺失时只报键名与来源并以非 0 退出，任何日志都不打印 token 值。真实值只填在本机 env 文件，不进仓库。
+
 表中每个 `(原入口域名, IP)` 一行，包含稳定唯一键、发现/健康/防抖计数、延迟、时间和最终节点名。状态缺失、非 schema v2、结构损坏或 0 行时拒绝替换，绝不清空旧表。同步 cursor 位于 RuntimeRoot 的 `feishu-sync-state.json`，变化键覆盖 state SHA-256、最终 provider SHA-256 和 table id；无变化时跳过整表替换。写入后必须回读记录总数和至少一个稳定唯一键才更新 cursor。
 
 同步使用独立锁文件 `feishu-sync.lock`（仅保存 pid/token 元数据）和独立命名 mutex `Local\mihomo-xigua-ippool-feishu-sync`；主同步使用 `Local\mihomo-feishu-bitable-sync`，两者不同，因此西瓜表同步不会与主同步的 writer mutex 串行。wrapper 另写全链日志 `xigua-ippool.log`（默认在 RuntimeRoot，1 MiB 轮转、保留 3 份、键值与 URL 脱敏）；飞书阶段日志仍为 `C:\mihomo\logs\xigua-ippool-feishu.log`。日志、cursor 和表记录都不包含密码、token、SNI 或订阅 URL。日志不可写时 stderr 输出 `XIGUA_LOG_FAILED`，且若池与飞书均成功则最终退出码为 `8`。现有计划任务 launcher 调用仓库 wrapper，因此不需要增加 launcher 参数或重注册任务；部署新脚本和 wrapper 后，下一轮自然生效。
