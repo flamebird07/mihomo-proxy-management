@@ -543,15 +543,22 @@ class CorpseCleanupTests(unittest.TestCase):
             for d in (old_dir, fresh_dir, prod):
                 d.mkdir()
                 (d / "config.yaml").write_text("x", encoding="utf-8")
+            # Stale + proven-dead owner (nonexistent pid) may be deleted.
+            # Process count is always 0; the kill helper no longer exists.
+            (old_dir / "owner.json").write_text(
+                json.dumps({"pid": 1_999_999_999, "create_time": 1.0}),
+                encoding="utf-8",
+            )
             past = time.time() - 7200
             os.utime(old_dir, (past, past))
             log = RecordingLog()
-            with patch.object(sync, "_kill_corpse_processes", lambda _log: 2):
-                procs, dirs = sync.cleanup_temp_corpses(log, temp_roots=[root])
-            self.assertEqual((procs, dirs), (2, 1))
+            procs, dirs = sync.cleanup_temp_corpses(log, temp_roots=[root])
+            self.assertEqual(procs, 0)
+            self.assertEqual(dirs, 1)
             self.assertFalse(old_dir.exists())
             self.assertTrue(fresh_dir.exists())
             self.assertTrue(prod.exists())
+            self.assertFalse(hasattr(sync, "_kill_corpse_processes"))
 
 
 class Stage2BFlagTests(unittest.TestCase):

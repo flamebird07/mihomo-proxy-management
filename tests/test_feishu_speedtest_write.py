@@ -140,13 +140,15 @@ class _StubLock:
 
     instances: list = []
 
-    def __init__(self, path, log):
+    def __init__(self, path, log, *, mutex_name=None):
         self.path = path
+        self.mutex_name = mutex_name
         self.acquired = False
         _StubLock.instances.append(self)
 
-    def acquire(self):
+    def acquire(self, timeout_ms=0):
         self.acquired = True
+        self.timeout_ms = timeout_ms
         return self
 
     def release(self):
@@ -249,9 +251,9 @@ class MainFlowMockClientTests(unittest.TestCase):
         self.assertEqual(state["replaced_ids"], ["tblS"])
         state["isolated"].assert_not_called()
         state["live"].assert_not_called()
-        # Lock reused: the stub was constructed with --lock-file and acquired.
-        self.assertEqual(len(state["locks"]), 1)
-        self.assertFalse(state["locks"][0].acquired)  # released in finally
+        # Write-section locks (ensure_tables + table replace) are released.
+        self.assertGreaterEqual(len(state["locks"]), 1)
+        self.assertTrue(all(not lock.acquired for lock in state["locks"]))
 
     def test_speedtest_write_writes_nodes_and_regions_only(self):
         with tempfile.TemporaryDirectory() as tmp:

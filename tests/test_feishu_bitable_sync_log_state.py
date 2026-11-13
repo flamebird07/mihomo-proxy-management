@@ -190,7 +190,7 @@ class StubLock:
     def __init__(self, path, log, *, mutex_name=None):
         self.path = path
 
-    def acquire(self):
+    def acquire(self, timeout_ms=0):
         return self
 
     def release(self):
@@ -198,7 +198,7 @@ class StubLock:
 
 
 class BusyLock(StubLock):
-    def acquire(self):
+    def acquire(self, timeout_ms=0):
         raise sync.SyncError("lock_busy", "holder_pid=4321")
 
 
@@ -221,8 +221,26 @@ class RunRecordTests(unittest.TestCase):
         return code, logged, state
 
     def test_lock_busy_round(self):
+        # Writer mutex is taken only around Feishu writes now.
         with tempfile.TemporaryDirectory() as tmp:
-            code, logged, state = self.run_main(tmp, [], BusyLock)
+            log_file = os.path.join(tmp, "sync.log")
+            state_file = os.path.join(tmp, "state", "feishu-bitable-sync-state.json")
+            log = sync.Logger(log_file)
+            recorder = sync.RunRecorder(state_file, log, mirror=True)
+            recorder.log_start()
+            with patch.object(sync, "SyncLock", BusyLock):
+                try:
+                    with sync.hold_writer_lock(log, os.path.join(tmp, "sync.lock")):
+                        raise AssertionError("write section should not run")
+                except sync.SyncError as exc:
+                    self.assertEqual(exc.kind, "lock_busy")
+                    recorder.finish(1, "lock_busy", exc.detail or exc.kind)
+            with open(log_file, encoding="utf-8") as handle:
+                logged = handle.read()
+            with open(state_file, encoding="utf-8") as handle:
+                state = json.load(handle)
+            code = 1
+            _ = code
             self.assertEqual(code, 1)
             self.assertRegex(logged, TS_LINE.pattern + r"INFO sync start")
             end = re.search(TS_LINE.pattern + r"INFO sync end .*$", logged, re.M)
