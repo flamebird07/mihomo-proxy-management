@@ -33,6 +33,11 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 
 * 业务模块不散落 `sys.platform` / `os.geteuid()`；平台事实由
   `mpm_common.platforms.PlatformFacts` 注入，测试可在 Windows/Linux 上覆盖 Darwin 分支。
+* 所有会改状态的命令（`install`/`configure`/`start`/`stop`/`restart`/`uninstall`）
+  在 CLI 统一入口以非阻塞 `fcntl.flock` 获取
+  `/var/run/mihomo-proxy-management/lifecycle.lock`；拿不到锁立即以退出码 2 失败，
+  不会交错修改配置、launchd 与代理快照。锁只在入口获取一次，`install`→`start`→回退、
+  `restart`→`stop`+`start` 内部不再加锁，因此不存在重入死锁。
 * 所有外部命令（`launchctl`、`networksetup`、`mihomo`、`ifconfig`、`route`）都经
   `Executor` 以 argv 列表执行，**从不拼 shell**；服务名含空格也只是一个 argv 元素。
 * 任何输出都经过 `mpm_common.sanitize`，不会出现订阅 URL、controller secret、
@@ -193,11 +198,14 @@ TUN 判定链（缺一不可）：
 2. `mihomo -t` 通过；
 3. LaunchDaemon running；
 4. `127.0.0.1:9090/version` 可用（带 secret 认证）；
-5. 注入式探针观察到**新增的 `utun*`** 或默认路由切到 `utun*`（仅“存在 utun”不算成功，
-   其他 VPN 也会创建 utun）；
-6. provider healthcheck 通过且至少一个节点存活。
+5. provider healthcheck 通过且至少一个节点存活（共享健康检查
+   `common/python/mpm_common/controller_health.py`）；
+6. 注入式探针观察到**新增的 `utun*`** 或默认路由切到 `utun*`（仅“存在 utun”不算成功，
+   其他 VPN 也会创建 utun）。
 
-TUN 失败按事务回退：
+TUN 失败按事务回退。以下任一环节失败都进入**同一个**回退事务（不存在“直接抛错、
+不回退”的路径）：LaunchDaemon bootstrap/kickstart 失败、`wait_running` 超时、
+controller readiness 失败、共享健康检查失败、utun 验证失败。
 
 1. 停止 core；
 2. 枚举所有 network service，快照 Web/Secure Web/SOCKS 的 enabled/server/port、
@@ -205,8 +213,11 @@ TUN 失败按事务回退：
 3. 原子写入 `0600` 的 `network-proxy-backup.json`（stage=prepared）；
 4. 渲染 mixed 配置：`tun.enable=false`、`mixed-port=7890`、DNS 从 `fake-ip` 改为
    `redir-host`（无 TUN 时 fake-ip 无人接管），其余生产规则不变；
-5. 启动 core 并完成 controller readiness；
-6. **仅在 core 健康后**才用 `networksetup` 把 HTTP/HTTPS/SOCKS 指向 `127.0.0.1:7890`；
+5. 启动 core，完成 controller readiness，并通过**共享健康检查**
+   （`common/python/mpm_common/controller_health.py`：provider healthcheck 成功且至少
+   一个节点存活）；healthcheck 或节点存活失败都按 TUN 失败处理；
+6. **仅在 core 健康后**才用 `networksetup` 把 HTTP/HTTPS/SOCKS 指向 `127.0.0.1:7890`
+   （mixed 健康检查失败则 fail-closed：回滚快照、不设置系统代理）；
 7. 读回校验，stage 改为 applied，状态记为 `DEGRADED`；
 8. `stop`/`uninstall`/下次启动前按快照逐项恢复并读回校验，成功后才删除快照。
 
@@ -243,6 +254,19 @@ TUN 失败按事务回退：
 合并本分支后**不更新 2209 生产工作区**：`C:\mihomo\config.yaml`、`subscription.env` 与
 计划任务都保持原样，等网管单独安排上线窗口。
 
+### Windows 2209 生产将来更新到本版本前
+
+本 PR 不改动 2209；真正在 2209 上线本版本时，必须先做下面这一步，否则飞书写入路径
+会以 `app_token_missing` 非 0 退出：
+
+1. 在 `C:\Users\Administrator\.hermes\.env` 中**增加一个键**（只写键名，不写值）：
+   `FEISHU_BITABLE_APP_TOKEN`；
+2. 值的来源由网管单独交付，仓库、README 与提交历史中都不出现该值；
+3. 建议同时在飞书侧**轮换该 app token**：旧值仍留在公开仓库的 git 历史中，
+   仅从当前工作树移除并不等于作废。
+
+飞书脚本的取值顺序是 `--app-token` > 进程环境变量 > env 文件，错误信息不会打印值。
+
 ## 7. 测试
 
 ```sh
@@ -253,7 +277,13 @@ TUN 失败按事务回退：
 ```
 
 * `macos/tests` 全部 host-free：subprocess/launchctl/networksetup/fcntl/controller 均为注入，
-  可在 Windows、Linux、macOS 上运行；
+  可在 Windows、Linux、macOS 上运行（含 Windows 2209 / Python 3.11.9）；
+* plist 审计按**目标平台**判定绝对路径（`posixpath`），测试用 sandbox root 在渲染
+  plist 前映射为 POSIX 目标路径（`Layout.to_target_path`），因此 Windows 宿主不会
+  把 `C:\...` 写进 LaunchDaemon；
+* `linux/tests` 在 Windows 上整体 skip（`linux/tests/conftest.py` 的
+  `pytest_collection_modifyitems`，reason 写明 Linux/POSIX-only）：这些是 Linux 宿主
+  测试，在 Windows 上运行没有意义，属于平台不适用而非真实缺陷；Linux/macOS 上的行为不变；
 * 测试模块统一带 `test_macos_` 前缀（`test_macos_config.py`、`test_macos_lifecycle.py`…），
   共享 fake 在 `macos_test_support.py`；这样 pytest 默认的 prepend 导入模式不会把
   `tests/`、`linux/tests/`、`macos/tests/` 的同名模块混在一起；

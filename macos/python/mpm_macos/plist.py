@@ -17,6 +17,7 @@ KeepAlive semantics (launchd.plist(5)):
 from __future__ import annotations
 
 import plistlib
+import posixpath
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -120,6 +121,16 @@ def _require(condition: bool, message: str) -> None:
         raise FailClosed(f"plist audit failed: {message}")
 
 
+def _is_target_absolute(value: Any) -> bool:
+    """Absolute *as a macOS path*, independent of the host that runs the audit.
+
+    The rendered document is always a Darwin plist, so the judgement must use
+    POSIX semantics: on Windows ``os.path.isabs("C:\\...")`` would be true for
+    a path macOS cannot use, and false for nothing else.
+    """
+    return isinstance(value, str) and bool(value) and posixpath.isabs(value)
+
+
 def audit(document: Any, *, label: str = LABEL, state_dir: str | None = None) -> dict[str, Any]:
     """Static audit of a parsed LaunchDaemon document."""
     _require(isinstance(document, dict), "root is not a dictionary")
@@ -156,13 +167,13 @@ def audit(document: Any, *, label: str = LABEL, state_dir: str | None = None) ->
     _require("mpm_macos.runner" in arguments, "ProgramArguments must point at mpm_macos.runner")
 
     working = document.get("WorkingDirectory")
-    _require(isinstance(working, str) and working.startswith("/"), "WorkingDirectory must be absolute")
+    _require(_is_target_absolute(working), "WorkingDirectory must be absolute")
     if state_dir is not None:
         _require(working == state_dir, "WorkingDirectory must be the state directory")
 
     for key in ("StandardOutPath", "StandardErrorPath"):
         value = document.get(key)
-        _require(isinstance(value, str) and value.startswith("/"), f"{key} must be an absolute path")
+        _require(_is_target_absolute(value), f"{key} must be an absolute path")
 
     environment = document.get("EnvironmentVariables", {})
     _require(isinstance(environment, dict), "EnvironmentVariables must be a dictionary")

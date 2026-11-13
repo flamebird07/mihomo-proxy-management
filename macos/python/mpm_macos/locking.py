@@ -61,11 +61,23 @@ class FileLock:
         if self._fd is not None:
             return self
         directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise FailClosed(
+                f"cannot open the {self.label} lock file {self.path}: "
+                f"{exc.strerror or type(exc).__name__}"
+            ) from exc
         try:
             (self.flock or _default_flock)(fd, LOCK_EX | LOCK_NB)
+        except ImportError as exc:
+            # Windows has no fcntl: refuse rather than run unserialised.
+            os.close(fd)
+            raise FailClosed(
+                f"the {self.label} lock requires POSIX flock, which this host does not provide"
+            ) from exc
         except OSError as exc:
             os.close(fd)
             raise LockBusy(
@@ -97,7 +109,7 @@ class FileLock:
         # on purpose - deleting it would reintroduce the stale-file race.
         try:
             (self.flock or _default_flock)(fd, LOCK_UN)
-        except OSError:  # pragma: no cover - descriptor already invalid
+        except (ImportError, OSError):  # pragma: no cover - descriptor already invalid
             pass
         os.close(fd)
 

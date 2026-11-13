@@ -39,14 +39,16 @@ from mpm_common.atomicio import (
 )
 from mpm_common.controller_health import (
     ControllerClient,
+    ControllerError,
     HEALTH_DEGRADED,
     HEALTH_FAILED,
     HEALTH_INACTIVE,
     HEALTH_OK,
+    HealthReport,
     evaluate,
     readiness,
 )
-from mpm_common.errors import ExitCode, FailClosed, NotReady
+from mpm_common.errors import ExitCode, FailClosed, MpmError, NotReady
 from mpm_common.executor import Executor
 from mpm_common.platforms import PlatformFacts
 from mpm_common.sanitize import HOST, sanitize
@@ -55,7 +57,7 @@ from . import config as config_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
 from .launchdctl import Launchd
-from .locking import is_held, read_metadata
+from .locking import FileLock, is_held, read_metadata
 from .network_proxy import (
     NetworkProxy,
     NetworkProxyError,
@@ -313,6 +315,8 @@ class Context:
     dry_run: bool = False
     python: str = sys.executable
     quiet: bool = False
+    # injected in tests so the lifecycle lock needs no real ``fcntl``
+    flock: Callable[[int, int], None] | None = None
 
     # ---- helpers -------------------------------------------------------
     def say(self, message: str) -> None:
@@ -320,6 +324,15 @@ class Context:
 
     def shout(self, message: str) -> None:
         self.out.write("\n" + "!" * 72 + "\n" + sanitize(message).rstrip("\n") + "\n" + "!" * 72 + "\n")
+
+    def lifecycle_guard(self) -> FileLock:
+        """The single lock serialising every state-changing command.
+
+        Only the CLI entry point acquires it; the lifecycle functions it calls
+        (``install`` -> ``start`` -> ``_fallback_to_mixed``) never re-acquire,
+        so there is no re-entrant flock and therefore no self-deadlock.
+        """
+        return FileLock(self.layout.lifecycle_lock, label="lifecycle", flock=self.flock)
 
     def launchd(self) -> Launchd:
         return Launchd(self.executor, plist=self.layout.plist, sleeper=self.sleeper)
@@ -594,19 +607,22 @@ def configure(
 
 def _install_plist(ctx: Context) -> bool:
     layout = ctx.layout
+    # The plist describes the macOS target, not the rendering host: with a
+    # sandbox root (tests) the paths are mapped back onto the POSIX target.
+    target = layout.to_target_path
     rendered = plist_mod.render_from_file(
         layout.plist_template,
         label=LABEL,
-        python=ctx.python,
-        package_dir=layout.share_python,
-        state_dir=layout.support,
-        config=layout.config,
-        binary=layout.binary,
-        run_dir=layout.run_dir,
-        log_out=layout.log_out,
-        log_err=layout.log_err,
+        python=target(ctx.python),
+        package_dir=target(layout.share_python),
+        state_dir=target(layout.support),
+        config=target(layout.config),
+        binary=target(layout.binary),
+        run_dir=target(layout.run_dir),
+        log_out=target(layout.log_out),
+        log_err=target(layout.log_err),
     )
-    plist_mod.audit_text(rendered, label=LABEL, state_dir=layout.support)
+    plist_mod.audit_text(rendered, label=LABEL, state_dir=target(layout.support))
     if is_noop(layout.plist, rendered, mode=0o644):
         return False
     write_atomic(layout.plist, rendered, mode=0o644)
@@ -720,6 +736,30 @@ def _readiness(ctx: Context, secrets: Secrets) -> str:
     return readiness(ctx.controller(secrets.controller_secret), sleeper=ctx.sleeper)
 
 
+def _health_check(ctx: Context, secrets: Secrets, *, mode: str) -> HealthReport:
+    """The shared verdict: provider healthcheck plus at least one live node.
+
+    Same code path as ``status``/``health``, so a mode is never declared usable
+    on a weaker check than the one the operator sees later.
+    """
+    return evaluate(
+        ctx.controller(secrets.controller_secret),
+        provider=config_mod.PROVIDER_NAME,
+        mode=mode,
+        running=True,
+    )
+
+
+def _health_failure(verdict: HealthReport, *, mode: str) -> str:
+    reasons = "; ".join(verdict.reasons) or "health check failed"
+    return HOST.text(f"{mode} core is not healthy: {reasons}")[:200]
+
+
+def _failure_reason(exc: BaseException) -> str:
+    detail = exc.message if isinstance(exc, MpmError) else (str(exc) or type(exc).__name__)
+    return HOST.text(detail)[:200]
+
+
 def _restore_proxy_if_any(ctx: Context) -> list[str]:
     """Restore an unfinished proxy transaction; delete the snapshot only on success."""
     layout = ctx.layout
@@ -756,6 +796,11 @@ def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Rep
             raise NotReady("mixed-mode core did not reach running state")
         secrets = ctx.secrets()
         report.data["version"] = _readiness(ctx, secrets)
+        verdict = _health_check(ctx, secrets, mode="mixed")
+        report.data["health"] = verdict.to_dict()
+        if not verdict.ok:
+            # fail closed: never point the system proxy at an unhealthy core
+            raise NotReady(_health_failure(verdict, mode="mixed"))
         modified = proxy.apply(snapshot)
         snapshot.stage = STAGE_APPLIED
         save_snapshot(layout.network_backup, snapshot, overwrite=True)
@@ -830,24 +875,38 @@ def start(ctx: Context, *, quiet: bool = False) -> Report:
         configure(ctx, quiet=True, mode="tun")
 
     before = ctx.tun()
-    if current.loaded:
-        launchd.kickstart()
-    else:
-        launchd.bootstrap()
-    if not launchd.wait_running():
-        raise NotReady("LaunchDaemon did not reach running state")
+    after = before
+    version = ""
+    failure = ""
+    try:
+        if current.loaded:
+            launchd.kickstart()
+        else:
+            launchd.bootstrap()
+        if not launchd.wait_running():
+            raise NotReady("LaunchDaemon did not reach running state")
 
-    secrets = ctx.secrets()
-    version = _readiness(ctx, secrets)
-    report.data["version"] = version
+        secrets = ctx.secrets()
+        version = _readiness(ctx, secrets)
+        report.data["version"] = version
 
-    after = ctx.tun()
-    if not tun_established(before, after):
-        return _fallback_to_mixed(
-            ctx,
-            "mihomo did not establish a utun interface or take over the default route",
-            quiet=quiet,
-        )
+        verdict = _health_check(ctx, secrets, mode="tun")
+        report.data["health"] = verdict.to_dict()
+        if not verdict.ok:
+            raise NotReady(_health_failure(verdict, mode="tun"))
+
+        after = ctx.tun()
+        if not tun_established(before, after):
+            raise NotReady(
+                "mihomo did not establish a utun interface or take over the default route"
+            )
+    except (MpmError, ControllerError, NetworkProxyError, OSError) as exc:
+        # launch, readiness, health and utun verification are one transaction:
+        # every one of them failing leads to the same mixed-port fallback.
+        failure = _failure_reason(exc)
+
+    if failure:
+        return _fallback_to_mixed(ctx, failure, quiet=quiet)
 
     state.mode = "tun"
     state.degraded = False

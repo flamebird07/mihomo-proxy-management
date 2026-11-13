@@ -54,7 +54,7 @@ def _binary(tmp_path):
     return binary
 
 
-def _run(tmp_path, returncode, **kwargs):
+def _run(tmp_path, returncode, *, flock=None, **kwargs):
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     return runner.run(
@@ -63,6 +63,8 @@ def _run(tmp_path, returncode, **kwargs):
         core_lock=str(tmp_path / "run" / "core.lock"),
         popen=lambda *args, **kw: FakePopen(returncode),
         install_signal_handlers=False,
+        # injected: the real flock is POSIX-only and the tests run on Windows too
+        flock=flock if flock is not None else FakeFlock(),
         **kwargs,
     )
 
@@ -99,5 +101,6 @@ def test_missing_binary_is_a_config_error(tmp_path):
         core_lock=str(tmp_path / "core.lock"),
         popen=lambda *args, **kw: FakePopen(0),
         install_signal_handlers=False,
+        flock=FakeFlock(),
     )
     assert code == runner.EXIT_CONFIG

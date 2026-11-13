@@ -174,6 +174,28 @@ class Layout:
             self.plist,
         ]
 
+    def to_target_path(self, path: str) -> str:
+        """Render a host path as the macOS path recorded in a plist.
+
+        A plist always describes the *target* host, never the machine that
+        rendered it.  On the real host the root is ``/`` and this is the
+        identity; the host-free tests run with a throwaway sandbox root (a
+        Windows drive path included), so the sandbox prefix is replaced with
+        ``/`` and separators become POSIX ones.
+        """
+        text = str(path)
+        if os.sep == "/":
+            return text
+        root = os.path.normpath(os.path.abspath(self.root))
+        candidate = os.path.normpath(os.path.abspath(text))
+        prefix = root.rstrip(os.sep) + os.sep
+        if candidate == root:
+            return "/"
+        if candidate.startswith(prefix):
+            relative = candidate[len(prefix):]
+            return "/" + relative.replace(os.sep, "/")
+        return text.replace(os.sep, "/")
+
     def is_project_path(self, path: str) -> bool:
         abspath = os.path.normpath(os.path.abspath(path))
         for prefix in self.deletable_prefixes():

@@ -109,6 +109,14 @@ def test_audit_text_rejects_a_leaked_url():
         plist.audit_text(text)
 
 
+def test_audit_rejects_a_host_specific_working_directory():
+    """The plist is a macOS document: a Windows path is never acceptable."""
+    document = plistlib.loads(_rendered().encode("utf-8"))
+    document["WorkingDirectory"] = r"C:\Library\Application Support\mihomo-proxy-management"
+    with pytest.raises(FailClosed):
+        plist.audit(document)
+
+
 def test_foreign_label_is_refused():
     with pytest.raises(FailClosed):
         plist.render_from_file(

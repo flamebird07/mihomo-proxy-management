@@ -26,6 +26,13 @@ PROGRAM = "mihomo-proxy-management"
 ENV_ROOT = "MPM_ROOT"
 ENV_PYTHON = "MPM_PYTHON"
 
+# Every command that can change config, launchd, the proxy snapshot or files.
+# They are serialised by the lifecycle lock; the lifecycle functions they call
+# (install -> start -> fallback, restart -> stop + start) never take it again.
+MUTATING_COMMANDS = frozenset(
+    {"install", "configure", "start", "stop", "restart", "uninstall"}
+)
+
 
 class _SanitisingWriter:
     """Fallback guard: nothing reaches a stream unsanitised."""
@@ -114,6 +121,19 @@ def make_context(args: argparse.Namespace, *, stdout: TextIO, stderr: TextIO) ->
 
 
 def dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Report:
+    """Single entry point; state-changing commands run under the lifecycle lock.
+
+    The lock is non-blocking: a concurrent operation is refused with a clear
+    error and a non-zero exit instead of interleaving config, launchd and
+    proxy-snapshot changes.
+    """
+    if args.command in MUTATING_COMMANDS:
+        with ctx.lifecycle_guard():
+            return _dispatch(ctx, args)
+    return _dispatch(ctx, args)
+
+
+def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Report:
     command = args.command
     if command == "preflight":
         return lifecycle.run_preflight(ctx)

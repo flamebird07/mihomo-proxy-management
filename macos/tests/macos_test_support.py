@@ -140,6 +140,9 @@ class LaunchdHarness:
         self.loaded = False
         self.running = False
         self.pid: int | None = None
+        #: bootstrap/kickstart calls that load the job but leave it stopped,
+        #: so ``wait_running`` times out (a start failure without a crash).
+        self.start_failures = 0
         executor.set("launchctl print", self._print)
         executor.set("launchctl bootstrap", self._bootstrap)
         executor.set("launchctl bootout", self._bootout)
@@ -152,10 +155,18 @@ class LaunchdHarness:
             return (0, f"state = running\n\tpid = {self.pid or 4242}\n", "")
         return (0, "state = not running\n\tlast exit code = 0\n", "")
 
-    def _bootstrap(self, argv):
+    def _start(self) -> None:
         self.loaded = True
+        if self.start_failures > 0:
+            self.start_failures -= 1
+            self.running = False
+            self.pid = None
+            return
         self.running = True
         self.pid = 4242
+
+    def _bootstrap(self, argv):
+        self._start()
         return (0, "", "")
 
     def _bootout(self, argv):
@@ -165,8 +176,8 @@ class LaunchdHarness:
         return (0, "", "")
 
     def _kickstart(self, argv):
-        self.running = True
-        self.pid = 4243
+        self._start()
+        self.pid = 4243 if self.running else None
         return (0, "", "")
 
 

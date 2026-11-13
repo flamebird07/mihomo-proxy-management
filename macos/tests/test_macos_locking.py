@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from mpm_common.errors import FailClosed
+from mpm_macos import locking
 from mpm_macos.locking import FileLock, LockBusy, is_held, read_metadata
 
 from macos_test_support import FakeFlock
@@ -93,3 +95,33 @@ def test_is_held_reflects_the_current_owner(tmp_path):
 
 def test_is_held_on_a_missing_file(tmp_path):
     assert is_held(str(tmp_path / "missing.lock"), flock=FakeFlock()) is False
+
+
+def test_acquire_without_fcntl_fails_closed(tmp_path, monkeypatch):
+    """Windows has no fcntl: refuse to run unserialised, never "pretend"."""
+
+    def missing(_fd, _flags):
+        raise ImportError("No module named 'fcntl'")
+
+    monkeypatch.setattr(locking, "_default_flock", missing)
+    with pytest.raises(FailClosed) as caught:
+        FileLock(str(tmp_path / "core.lock"), label="core").acquire()
+    assert "POSIX flock" in caught.value.message
+
+
+def test_unopenable_lock_path_fails_closed(tmp_path):
+    directory = tmp_path / "not-a-directory"
+    directory.write_text("x", encoding="utf-8")
+    with pytest.raises(FailClosed) as caught:
+        FileLock(str(directory / "core.lock"), label="core").acquire()
+    assert "cannot open the core lock file" in caught.value.message
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fcntl.flock is POSIX-only")
+def test_default_flock_works_on_posix(tmp_path):
+    lock = FileLock(str(tmp_path / "core.lock"), label="core")
+    lock.acquire()
+    try:
+        assert lock.held is True
+    finally:
+        lock.release()

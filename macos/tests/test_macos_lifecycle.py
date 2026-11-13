@@ -173,6 +173,95 @@ def test_mixed_start_failure_never_sets_the_system_proxy(tmp_path):
     assert not snapshot_exists(ctx.layout.network_backup)
 
 
+def test_wait_running_failure_falls_back_to_mixed(tmp_path):
+    """The job loads but never runs: same transaction as a utun failure."""
+    ctx, harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    harness.start_failures = 1
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "DEGRADED"
+    assert report.data["mode"] == "mixed"
+    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
+    assert network.state["Wi-Fi"]["web"]["port"] == 7890
+    assert snapshot_exists(ctx.layout.network_backup)
+    state = lifecycle.load_state(ctx.layout)
+    assert state.mode == "mixed"
+    assert state.degraded is True
+
+
+def test_readiness_failure_falls_back_to_mixed(tmp_path):
+    """An unreachable controller during the TUN attempt is a TUN failure."""
+
+    class _ReadinessFailsFirst(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.remaining_failures = 25
+
+        def version(self):
+            if self.remaining_failures > 0:
+                self.remaining_failures -= 1
+                raise ControllerError("controller not ready")
+            return super().version()
+
+    ctx, _harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    controller = _ReadinessFailsFirst()
+    ctx.controller_factory = lambda _secret: controller
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "DEGRADED"
+    assert report.data["mode"] == "mixed"
+    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
+    assert lifecycle.load_state(ctx.layout).mode == "mixed"
+
+
+def test_unhealthy_tun_core_falls_back_to_mixed(tmp_path):
+    """provider healthcheck failing means TUN never counts as established."""
+
+    class _HealthcheckFailsOnce(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def healthcheck(self, name: str) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ControllerError("provider healthcheck failed")
+            super().healthcheck(name)
+
+    ctx, _harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    controller = _HealthcheckFailsOnce()
+    ctx.controller_factory = lambda _secret: controller
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "DEGRADED"
+    assert controller.attempts == 2, "the mixed core must be health-checked too"
+    assert report.data["health"]["state"] == "OK"
+    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
+    assert lifecycle.load_state(ctx.layout).mode == "mixed"
+
+
+def test_unhealthy_mixed_core_never_sets_the_system_proxy(tmp_path):
+    """mixed is fail-closed: no live node -> roll back, proxy untouched."""
+    ctx, _harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    ctx.controller_factory = lambda _secret: FakeController(node_count=3, alive=0)
+    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
+
+    with pytest.raises(NotReady):
+        lifecycle.start(ctx, quiet=True)
+
+    assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
+    assert network.state["Wi-Fi"]["web"]["enabled"] is True
+    assert ctx.executor.count("networksetup", "-setwebproxy", "Wi-Fi", "127.0.0.1") == 0
+    assert not snapshot_exists(ctx.layout.network_backup)
+
+
 # ---- stop / crash recovery ------------------------------------------------
 
 
