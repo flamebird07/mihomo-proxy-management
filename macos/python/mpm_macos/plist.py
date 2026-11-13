@@ -5,6 +5,11 @@ skeleton), so the emitted document is always a valid property list.  The audit
 is the security boundary: it refuses a plist that could leak a secret, run a
 shell, add ``caffeinate`` or lose the crash-restart semantics.
 
+``WorkingDirectory`` and the runner's ``-d`` argument are mihomo's **home**
+(``Layout.support``), not this project's ``state/`` directory: the provider
+file and the geo databases live below the home, and mihomo rejects a provider
+path outside it.
+
 KeepAlive semantics (launchd.plist(5)):
 
 * ``KeepAlive = {SuccessfulExit: false}`` restarts the job when it exits with a
@@ -29,7 +34,7 @@ PLACEHOLDERS = (
     "__LABEL__",
     "__PYTHON__",
     "__PACKAGE_DIR__",
-    "__STATE_DIR__",
+    "__MIHOMO_HOME__",
     "__CONFIG__",
     "__BINARY__",
     "__RUN_DIR__",
@@ -47,7 +52,7 @@ def _values(
     label: str,
     python: str,
     package_dir: str,
-    state_dir: str,
+    home_dir: str,
     config: str,
     binary: str,
     run_dir: str,
@@ -58,7 +63,7 @@ def _values(
         "__LABEL__": label,
         "__PYTHON__": python,
         "__PACKAGE_DIR__": package_dir,
-        "__STATE_DIR__": state_dir,
+        "__MIHOMO_HOME__": home_dir,
         "__CONFIG__": config,
         "__BINARY__": binary,
         "__RUN_DIR__": run_dir,
@@ -73,7 +78,7 @@ def render(
     label: str = LABEL,
     python: str,
     package_dir: str,
-    state_dir: str,
+    home_dir: str,
     config: str,
     binary: str,
     run_dir: str,
@@ -87,7 +92,7 @@ def render(
         label=label,
         python=python,
         package_dir=package_dir,
-        state_dir=state_dir,
+        home_dir=home_dir,
         config=config,
         binary=binary,
         run_dir=run_dir,
@@ -106,7 +111,7 @@ def render(
         raise FailClosed(f"rendered plist is not valid: {type(exc).__name__}") from exc
     if not isinstance(document, dict):
         raise FailClosed("rendered plist root is not a dictionary")
-    audit(document, label=label, state_dir=state_dir)
+    audit(document, label=label, home_dir=home_dir)
     _scan_values(document)
     return plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False).decode("utf-8")
 
@@ -131,7 +136,7 @@ def _is_target_absolute(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and posixpath.isabs(value)
 
 
-def audit(document: Any, *, label: str = LABEL, state_dir: str | None = None) -> dict[str, Any]:
+def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> dict[str, Any]:
     """Static audit of a parsed LaunchDaemon document."""
     _require(isinstance(document, dict), "root is not a dictionary")
     _require(document.get("Label") == label, "Label must be the project label")
@@ -168,8 +173,8 @@ def audit(document: Any, *, label: str = LABEL, state_dir: str | None = None) ->
 
     working = document.get("WorkingDirectory")
     _require(_is_target_absolute(working), "WorkingDirectory must be absolute")
-    if state_dir is not None:
-        _require(working == state_dir, "WorkingDirectory must be the state directory")
+    if home_dir is not None:
+        _require(working == home_dir, "WorkingDirectory must be the mihomo home directory")
 
     for key in ("StandardOutPath", "StandardErrorPath"):
         value = document.get(key)
@@ -207,13 +212,13 @@ def _scan_values(value: Any, *, path: str = "") -> None:
             _require(token not in lowered, f"{path or 'value'} must not contain '{token}'")
 
 
-def audit_text(text: str, *, label: str = LABEL, state_dir: str | None = None) -> dict[str, Any]:
+def audit_text(text: str, *, label: str = LABEL, home_dir: str | None = None) -> dict[str, Any]:
     """Audit the serialised plist (values are scanned, the XML DTD is not)."""
     try:
         document = plistlib.loads(text.encode("utf-8"))
     except Exception as exc:
         raise FailClosed(f"plist is not valid: {type(exc).__name__}") from exc
-    result = audit(document, label=label, state_dir=state_dir)
+    result = audit(document, label=label, home_dir=home_dir)
     _scan_values(document)
     return result
 

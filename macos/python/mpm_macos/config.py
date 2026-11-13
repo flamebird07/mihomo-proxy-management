@@ -318,9 +318,9 @@ def required_geodata(text: str) -> tuple[str, ...]:
     """Geo database files mihomo loads from its ``-d`` directory.
 
     ``geodata-mode: true`` (the production template) makes mihomo read
-    ``GeoIP.dat`` and ``GeoSite.dat`` from the config directory.  When either is
-    missing mihomo downloads it, which is exactly what a static validation must
-    not do on a host with no outbound access.
+    ``GeoIP.dat`` and ``GeoSite.dat`` from its home directory (``-d``).  When
+    either is missing mihomo downloads it, which is exactly what a static
+    validation must not do on a host with no outbound access.
     """
     yaml = _yaml()
     document = yaml.safe_load(text)
@@ -329,26 +329,26 @@ def required_geodata(text: str) -> tuple[str, ...]:
     return ()
 
 
-def ensure_geodata(text: str, state_dir: str) -> None:
+def ensure_geodata(text: str, home_dir: str) -> None:
     """Fail closed before ``mihomo -t`` instead of letting mihomo download."""
     missing = [
         name
         for name in required_geodata(text)
-        if not os.path.isfile(os.path.join(state_dir, name))
+        if not os.path.isfile(os.path.join(home_dir, name))
     ]
     if not missing:
         return
     raise RenderError(
-        "geo database missing from the mihomo state directory "
-        f"({state_dir}): {', '.join(missing)}; put GeoIP.dat and GeoSite.dat next to "
+        "geo database missing from the mihomo home directory "
+        f"({home_dir}): {', '.join(missing)}; put GeoIP.dat and GeoSite.dat next to "
         "the binary given to MPM_MIHOMO_BINARY (the installer copies them into the "
-        "state directory) - mihomo -t must not download them"
+        "mihomo home, i.e. the -d directory) - mihomo -t must not download them"
     )
 
 
-def validate(binary: str, config_path: str, state_dir: str, executor: Executor) -> None:
+def validate(binary: str, config_path: str, home_dir: str, executor: Executor) -> None:
     """Static ``mihomo -t`` validation; a failure never replaces the live config."""
-    result = executor.run([binary, "-t", "-f", config_path, "-d", state_dir])
+    result = executor.run([binary, "-t", "-f", config_path, "-d", home_dir])
     if not result.ok:
         raise RenderError(
             f"mihomo -t rejected the rendered config (exit={result.returncode})"

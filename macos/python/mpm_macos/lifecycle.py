@@ -6,6 +6,10 @@ Invariants:
   re-verifies, and never starts a second instance;
 * a config only replaces the live one after the static audit *and*
   ``mihomo -t`` passed;
+* there is exactly one mihomo home (``-d``): ``layout.support``.  The plist's
+  ``--state-dir``/``WorkingDirectory``, ``mihomo -t -d``, the geo databases and
+  the rendered provider path (``support/providers/subscription.yaml``) all use
+  it; ``state/`` only holds this project's secret/deployment/backup files;
 * TUN is only claimed when the process, the controller and an injected
   interface/route probe agree;
 * a TUN failure is a transaction: snapshot the system proxy, render mixed,
@@ -584,11 +588,13 @@ def _default_validator(ctx: Context) -> Callable[[str], None]:
             return  # nothing to validate against; install will require the binary
         # Fail closed *before* mihomo runs: a missing geo database makes mihomo
         # fetch it from GitHub, which hangs an offline install.
-        config_mod.ensure_geodata(text, ctx.layout.state_dir)
+        config_mod.ensure_geodata(text, ctx.layout.mihomo_home)
         with secure_tempdir(ctx.layout.staging_dir, "validate") as staging:
             candidate = os.path.join(staging, "config.yaml")
             write_atomic(candidate, text, mode=0o600, mkdir=False)
-            config_mod.validate(ctx.layout.binary, candidate, ctx.layout.state_dir, ctx.executor)
+            config_mod.validate(
+                ctx.layout.binary, candidate, ctx.layout.mihomo_home, ctx.executor
+            )
 
     return validate
 
@@ -682,16 +688,17 @@ def _install_plist(ctx: Context) -> bool:
         label=LABEL,
         python=target(ctx.python),
         package_dir=target(layout.share_python),
-        # the runner passes ``mihomo -d <state>``: the same directory
-        # ``mihomo -t`` validates against and where geo data is installed
-        state_dir=target(layout.state_dir),
+        # the runner passes ``mihomo -d <home>``: the same directory
+        # ``mihomo -t`` validates against, where geo data is installed and
+        # where the rendered provider path (providers/subscription.yaml) lives
+        home_dir=target(layout.mihomo_home),
         config=target(layout.config),
         binary=target(layout.binary),
         run_dir=target(layout.run_dir),
         log_out=target(layout.log_out),
         log_err=target(layout.log_err),
     )
-    plist_mod.audit_text(rendered, label=LABEL, state_dir=target(layout.state_dir))
+    plist_mod.audit_text(rendered, label=LABEL, home_dir=target(layout.mihomo_home))
     if is_noop(layout.plist, rendered, mode=0o644):
         return False
     write_atomic(layout.plist, rendered, mode=0o644)
@@ -706,9 +713,9 @@ def _install_binary(ctx: Context) -> bool:
 
     ``MPM_MIHOMO_BINARY`` selects the source explicitly; otherwise ``mihomo``
     on ``PATH`` is used.  Geo databases found next to the source are copied into
-    the **state** directory, because that is the ``-d`` directory used by both
-    ``mihomo -t`` (``config.validate``) and the resident runner (``mihomo -d``).
-    Files left in the old location (``support`` root) are ignored, not deleted.
+    the **mihomo home** (``layout.support``), because that is the ``-d``
+    directory used by both ``mihomo -t`` (``config.validate``) and the resident
+    runner (``mihomo -d``), and the rendered provider path is below it too.
     """
     layout = ctx.layout
     source = ctx.environ.get("MPM_MIHOMO_BINARY") or shutil.which("mihomo")
@@ -737,7 +744,7 @@ def _install_binary(ctx: Context) -> bool:
     source_dir = os.path.dirname(os.path.abspath(source))
     for name in _GEO_DATA_FILES:
         candidate = os.path.join(source_dir, name)
-        target = os.path.join(layout.state_dir, name)
+        target = os.path.join(layout.mihomo_home, name)
         if not os.path.isfile(candidate):
             continue
         if os.path.abspath(candidate) == os.path.abspath(target):

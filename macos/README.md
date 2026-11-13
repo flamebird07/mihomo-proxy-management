@@ -56,16 +56,25 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 /usr/local/share/mihomo-proxy-management/templates/
 /Library/Application Support/mihomo-proxy-management/config.yaml          (0600)
 /Library/Application Support/mihomo-proxy-management/providers/subscription.yaml
+/Library/Application Support/mihomo-proxy-management/{GeoIP.dat,GeoSite.dat,Country.mmdb} (0644)
 /Library/Application Support/mihomo-proxy-management/state/subscription.env (0600)
 /Library/Application Support/mihomo-proxy-management/state/deployment.json  (0600)
 /Library/Application Support/mihomo-proxy-management/state/network-proxy-backup.json (0600)
-/Library/Application Support/mihomo-proxy-management/state/{GeoIP.dat,GeoSite.dat,Country.mmdb} (0644)
 /Library/Application Support/mihomo-proxy-management/logs/{core.out.log,core.err.log}
 /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
 ```
 
-`state/` 就是 mihomo 的 `-d` 目录：`mihomo -t`（安装校验）和常驻 runner 的
-`mihomo -d` 都用它，LaunchDaemon 的 `--state-dir` 与 `WorkingDirectory` 也是它。
+**mihomo 的 home（`-d`）是 `support` 根目录**，即
+`/Library/Application Support/mihomo-proxy-management`：`mihomo -t`（安装校验）与常驻
+runner 的 `mihomo -d` 都用它，LaunchDaemon 的 `--state-dir` 与 `WorkingDirectory` 也是它
+（`--state-dir` 只是 runner 的参数名，值就是 mihomo home，不是项目自己的 `state/`）。
+`providers/`、geo 数据、mihomo 自己的 cache 都在这个目录下，因此渲染出的 provider 绝对路径
+（`support/providers/subscription.yaml`）位于 `-d` 之内——mihomo 会拒绝不在 home 或
+`SAFE_PATHS` 内的 provider 路径。
+
+`state/` 只放本项目管理用的状态文件（`subscription.env`、`deployment.json`、
+`network-proxy-backup.json`、`config.tun.yaml`、`staging/`），**不是** mihomo 的 `-d`
+目录。
 
 统一调用 `/usr/local/bin/mihomo-proxy-management <command>`；脚本只是兼容入口：
 
@@ -94,15 +103,18 @@ sudo --preserve-env=MPM_SUBSCRIPTION_URL,MPM_SECRET,MPM_MIHOMO_BINARY \
 
 安装器**不联网下载**：mihomo 由 `MPM_MIHOMO_BINARY`（或 PATH 上的 `mihomo`）提供。
 `GeoIP.dat`、`GeoSite.dat`、`Country.mmdb` 若与源二进制同目录，会以 `0644` 原子复制到
-**`state/`**（mihomo 的 `-d` 目录，与 `mihomo -t`、runner 的 `-d` 一致）；旧位置
-（`Application Support/mihomo-proxy-management/` 根下）的残留文件不会被读取或删除，
-可以手动清理。模板里 `geodata-mode: true`，因此 `GeoIP.dat` 与 `GeoSite.dat` 是必需的：
+**mihomo home**（`support` 根，即 `-d` 目录，与 `mihomo -t`、runner 的 `-d` 一致）。
+模板里 `geodata-mode: true`，因此 `GeoIP.dat` 与 `GeoSite.dat` 是必需的：
 
 * 渲染出的配置固定 `geo-auto-update: false`，`mihomo -t` 不会尝试从 GitHub 下载
   geo 数据（真实 Mac 上曾因此超时、安装失败）；
-* 安装会在调用 `mihomo -t` **之前**检查 `state/` 中的这两个文件；缺失时直接以
+* 安装会在调用 `mihomo -t` **之前**检查 mihomo home 中的这两个文件；缺失时直接以
   `FailClosed`/`RenderError` 失败，并提示把 `GeoIP.dat`/`GeoSite.dat` 放到
   `MPM_MIHOMO_BINARY` 同目录后重试。
+
+单测 `test_macos_lifecycle.py::test_provider_path_plist_and_geodata_share_the_mihomo_home`
+锁定这条不变量：渲染出的 provider 路径必须位于传给 `mihomo -t` 的 `-d` 目录之下，
+plist 的 `--state-dir`/`WorkingDirectory` 与 geodata 目标目录都等于同一个目录。
 
 root（`system profile`）安装时，安装器会对 `support`、`state`、`providers`、`logs`
 四个目录以及 `subscription.env`、`deployment.json`、`network-proxy-backup.json`、

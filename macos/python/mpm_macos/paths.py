@@ -10,6 +10,10 @@ layout:
     /usr/local/share/mihomo-proxy-management/{python,templates,scripts}
     /Library/Application Support/mihomo-proxy-management/{config.yaml,providers,state,logs}
     /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
+
+``support`` is mihomo's home (``-d``): the provider file, the geo databases and
+the cache mihomo writes all live there.  ``state`` only holds this project's own
+state files (secret, deployment record, proxy snapshot, staging).
 """
 
 from __future__ import annotations
@@ -96,7 +100,7 @@ class Layout:
     def convert_sub(self) -> str:
         return os.path.join(self.scripts_dir, "convert_sub.py")
 
-    # ---- support (configuration + state) ------------------------------
+    # ---- support (mihomo home + project state) ------------------------
     @property
     def support(self) -> str:
         return os.path.join(self.root, "Library", "Application Support", SUPPORT_DIR_NAME)
@@ -111,6 +115,17 @@ class Layout:
         return os.path.join(self.state_dir, "config.tun.yaml")
 
     @property
+    def mihomo_home(self) -> str:
+        """mihomo's ``-d`` directory (also the LaunchDaemon WorkingDirectory).
+
+        mihomo resolves a relative provider ``path`` against this directory and
+        rejects any absolute provider path that is not inside it (or in
+        ``SAFE_PATHS``).  ``providers/`` therefore must stay below ``support``:
+        the rendered provider path is ``support/providers/subscription.yaml``.
+        """
+        return self.support
+
+    @property
     def providers(self) -> str:
         return os.path.join(self.support, "providers")
 
@@ -120,6 +135,7 @@ class Layout:
 
     @property
     def state_dir(self) -> str:
+        """Project state only (secret, deployment record, snapshots); not ``-d``."""
         return os.path.join(self.support, "state")
 
     @property

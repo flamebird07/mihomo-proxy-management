@@ -10,7 +10,7 @@
 		<string>-m</string>
 		<string>mpm_macos.runner</string>
 		<string>--state-dir</string>
-		<string>__STATE_DIR__</string>
+		<string>__MIHOMO_HOME__</string>
 		<string>--config</string>
 		<string>__CONFIG__</string>
 		<string>--binary</string>
@@ -37,7 +37,7 @@
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 	<key>WorkingDirectory</key>
-	<string>__STATE_DIR__</string>
+	<string>__MIHOMO_HOME__</string>
 	<key>StandardOutPath</key>
 	<string>__LOG_OUT__</string>
 	<key>StandardErrorPath</key>

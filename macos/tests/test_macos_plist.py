@@ -13,16 +13,16 @@ from macos_test_support import PLIST_TEMPLATE
 
 pytestmark = pytest.mark.macos
 
-STATE_DIR = "/Library/Application Support/mihomo-proxy-management"
+MIHOMO_HOME = "/Library/Application Support/mihomo-proxy-management"
 RENDER_ARGS = {
     "python": "/usr/bin/python3",
     "package_dir": "/usr/local/share/mihomo-proxy-management/python",
-    "state_dir": STATE_DIR,
-    "config": STATE_DIR + "/config.yaml",
+    "home_dir": MIHOMO_HOME,
+    "config": MIHOMO_HOME + "/config.yaml",
     "binary": "/usr/local/libexec/mihomo-proxy-management/current/mihomo",
     "run_dir": "/var/run/mihomo-proxy-management",
-    "log_out": STATE_DIR + "/logs/core.out.log",
-    "log_err": STATE_DIR + "/logs/core.err.log",
+    "log_out": MIHOMO_HOME + "/logs/core.out.log",
+    "log_err": MIHOMO_HOME + "/logs/core.err.log",
 }
 
 
@@ -37,7 +37,9 @@ def test_plist_is_parseable_and_complete():
     assert document["KeepAlive"] == {"SuccessfulExit": False}
     assert document["ThrottleInterval"] == 5
     assert document["ProcessType"] == "Interactive"
-    assert document["WorkingDirectory"] == STATE_DIR
+    assert document["WorkingDirectory"] == MIHOMO_HOME
+    arguments = document["ProgramArguments"]
+    assert arguments[arguments.index("--state-dir") + 1] == MIHOMO_HOME
     assert document["StandardOutPath"].endswith("core.out.log")
     assert document["StandardErrorPath"].endswith("core.err.log")
 

@@ -7,6 +7,7 @@ import plistlib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from mpm_common.controller_health import ControllerError
 from mpm_common.errors import FailClosed, NotReady
@@ -115,8 +116,8 @@ def test_install_fails_closed_when_cursor_has_no_region_node(tmp_path):
 # ---- install: geo data / ownership / interpreter --------------------------
 
 
-def test_install_puts_geodata_in_the_mihomo_state_directory(tmp_path):
-    """``mihomo -t`` and the runner both use ``-d state``; support root is wrong."""
+def test_install_puts_geodata_in_the_mihomo_home_directory(tmp_path):
+    """``mihomo -t`` and the runner both use ``-d support``; ``state/`` is wrong."""
     ctx = make_context(tmp_path, validator=None)
     prepare_install(ctx)
     _add_geodata(ctx)
@@ -124,16 +125,16 @@ def test_install_puts_geodata_in_the_mihomo_state_directory(tmp_path):
     assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
 
     for name in ("GeoIP.dat", "GeoSite.dat"):
-        installed = os.path.join(ctx.layout.state_dir, name)
+        installed = os.path.join(ctx.layout.mihomo_home, name)
         assert os.path.isfile(installed), name
         assert open(installed, "rb").read() == b"geo-" + name.encode()
-        assert not os.path.exists(os.path.join(ctx.layout.support, name))
+        assert not os.path.exists(os.path.join(ctx.layout.state_dir, name))
     if os.name != "nt":
-        assert_posix_mode(os.path.join(ctx.layout.state_dir, "GeoIP.dat"), 0o644)
+        assert_posix_mode(os.path.join(ctx.layout.mihomo_home, "GeoIP.dat"), 0o644)
 
     call = ctx.executor.find(ctx.layout.binary, "-t")
     assert call is not None, "install must validate the rendered config"
-    assert call.argv[call.argv.index("-d") + 1] == ctx.layout.state_dir
+    assert call.argv[call.argv.index("-d") + 1] == ctx.layout.mihomo_home
 
 
 def test_install_fails_closed_before_mihomo_when_geodata_is_missing(tmp_path):
@@ -150,13 +151,49 @@ def test_install_fails_closed_before_mihomo_when_geodata_is_missing(tmp_path):
     assert not os.path.exists(ctx.layout.config)
 
 
-def test_plist_and_validation_share_the_mihomo_state_directory(tmp_path):
-    ctx, _harness, _network = _installed(tmp_path)
-    document = plistlib.loads(open(ctx.layout.plist, "rb").read())
-    arguments = document["ProgramArguments"]
-    state = arguments[arguments.index("--state-dir") + 1]
-    assert state == ctx.layout.to_target_path(ctx.layout.state_dir)
-    assert document["WorkingDirectory"] == state
+def _is_subpath(child: str, parent: str) -> bool:
+    child_n = os.path.normcase(os.path.normpath(child))
+    parent_n = os.path.normcase(os.path.normpath(parent))
+    return child_n != parent_n and child_n.startswith(parent_n + os.sep)
+
+
+def test_provider_path_plist_and_geodata_share_the_mihomo_home(tmp_path):
+    """Invariant: one ``-d`` directory for the plist, ``mihomo -t`` and the provider.
+
+    mihomo rejects a provider path that is not below its home (or in
+    ``SAFE_PATHS``), so the rendered provider path, the geo databases and the
+    plist's ``--state-dir``/``WorkingDirectory`` must all resolve to
+    ``layout.support`` - never to ``layout.state_dir``.
+    """
+    ctx = make_context(tmp_path, validator=None)
+    prepare_install(ctx)
+    _add_geodata(ctx)
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    plist_document = plistlib.loads(open(ctx.layout.plist, "rb").read())
+    arguments = plist_document["ProgramArguments"]
+    plist_home = arguments[arguments.index("--state-dir") + 1]
+    assert plist_home == plist_document["WorkingDirectory"]
+    assert plist_home == ctx.layout.to_target_path(ctx.layout.mihomo_home)
+    assert plist_home != ctx.layout.to_target_path(ctx.layout.state_dir)
+
+    call = ctx.executor.find(ctx.layout.binary, "-t")
+    assert call is not None, "install must validate the rendered config"
+    validate_home = call.argv[call.argv.index("-d") + 1]
+    assert validate_home == ctx.layout.mihomo_home
+    assert ctx.layout.to_target_path(validate_home) == plist_home
+
+    with open(ctx.layout.config, "r", encoding="utf-8") as handle:
+        config_document = yaml.safe_load(handle.read())
+    provider_path = config_document["proxy-providers"]["subscription"]["path"]
+    assert _is_subpath(provider_path, validate_home), provider_path
+    assert os.path.dirname(os.path.normpath(provider_path)) == os.path.normpath(
+        os.path.join(validate_home, "providers")
+    )
+
+    # geo data is installed where ``-d`` points, so mihomo -t never downloads it
+    for name in ("GeoIP.dat", "GeoSite.dat"):
+        assert os.path.isfile(os.path.join(validate_home, name)), name
 
 
 def test_root_system_install_chowns_state_and_secrets_to_root_wheel(tmp_path):
