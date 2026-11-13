@@ -82,6 +82,11 @@ SUBCOMMANDS = (
 
 STATE_SCHEMA = 1
 
+#: Geo databases copied next to the binary into the mihomo ``-d`` directory.
+#: ``GeoIP.dat``/``GeoSite.dat`` are what ``geodata-mode: true`` loads;
+#: ``Country.mmdb`` is kept for a future ``geodata-mode: false`` config.
+_GEO_DATA_FILES = ("GeoIP.dat", "GeoSite.dat", "Country.mmdb")
+
 
 @dataclass
 class Report:
@@ -117,6 +122,25 @@ def _safe(value: Any) -> Any:
     if isinstance(value, str):
         return HOST.text(value)
     return value
+
+
+# ---- ownership ------------------------------------------------------------
+
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+def _default_geteuid() -> int:
+    """``-1`` where the platform has no ``geteuid`` (Windows) - never root."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter is not None else -1
+
+
+def _default_chown(path: str, uid: int, gid: int) -> None:
+    """Real ``chown`` on POSIX; a no-op where the platform has none (Windows)."""
+    chown = getattr(os, "chown", None)
+    if chown is not None:
+        chown(path, uid, gid)
 
 
 # ---- state ----------------------------------------------------------------
@@ -317,6 +341,10 @@ class Context:
     quiet: bool = False
     # injected in tests so the lifecycle lock needs no real ``fcntl``
     flock: Callable[[int, int], None] | None = None
+    # injected in tests so ownership can be asserted without root (and on
+    # Windows, where neither ``geteuid`` nor ``chown`` exists)
+    geteuid: Callable[[], int] = _default_geteuid
+    chown: Callable[[str, int, int], None] = _default_chown
 
     # ---- helpers -------------------------------------------------------
     def say(self, message: str) -> None:
@@ -356,6 +384,29 @@ class Context:
         )
 
 
+def _own(ctx: Context, *paths: str) -> None:
+    """Force ``root:wheel`` on installer artifacts of a root system install.
+
+    BSD ``chown`` semantics: a new file inherits its *parent directory's* group,
+    and ``/Library/Application Support`` belongs to ``admin``.  Without an
+    explicit ``chown`` the installer's own ``state/subscription.env`` is
+    ``root:admin`` and :func:`check_secret_input` (root:wheel) rejects it on the
+    next read.  Sandbox/test runs (non-root) never chown, and a symlink is never
+    followed - only the managed artifact itself is chowned.
+    """
+    if not ctx.system_profile or ctx.geteuid() != ROOT_UID:
+        return
+    for path in paths:
+        if os.path.islink(path) or not os.path.exists(path):
+            continue
+        ctx.chown(path, ROOT_UID, ROOT_GID)
+
+
+def _save_state(ctx: Context, state: DeploymentState) -> None:
+    save_state(ctx.layout, state)
+    _own(ctx, ctx.layout.deployment_state)
+
+
 # ---- shared preparation ---------------------------------------------------
 
 
@@ -366,6 +417,8 @@ def _prepare_dirs(ctx: Context) -> list[str]:
         ensure_dir(path, mode)
         if not existed:
             created.append(path)
+    layout = ctx.layout
+    _own(ctx, layout.support, layout.providers, layout.state_dir, layout.logs)
     return created
 
 
@@ -471,7 +524,9 @@ def _install_cli(ctx: Context) -> None:
             return  # installed copy is already in place
         raise FailClosed(f"CLI wrapper source is missing: {source}")
     payload = read_text_strict(source)
-    payload = payload.replace("__PACKAGE_DIR__", layout.share_python)
+    payload = payload.replace("__PACKAGE_DIR__", layout.share_python).replace(
+        "__PYTHON__", ctx.python
+    )
     if is_noop(layout.cli_entry, payload, mode=0o755):
         return
     write_atomic(layout.cli_entry, payload, mode=0o755)
@@ -527,6 +582,9 @@ def _default_validator(ctx: Context) -> Callable[[str], None]:
     def validate(text: str) -> None:
         if not os.path.isfile(ctx.layout.binary):
             return  # nothing to validate against; install will require the binary
+        # Fail closed *before* mihomo runs: a missing geo database makes mihomo
+        # fetch it from GitHub, which hangs an offline install.
+        config_mod.ensure_geodata(text, ctx.layout.state_dir)
         with secure_tempdir(ctx.layout.staging_dir, "validate") as staging:
             candidate = os.path.join(staging, "config.yaml")
             write_atomic(candidate, text, mode=0o600, mkdir=False)
@@ -541,11 +599,18 @@ def configure(
     quiet: bool = False,
     mode: str | None = None,
     provider_nodes: list[str] | None = None,
+    secrets: Secrets | None = None,
 ) -> Report:
-    """Render, audit and atomically install ``config.yaml``.  Repeatable."""
+    """Render, audit and atomically install ``config.yaml``.  Repeatable.
+
+    ``secrets`` lets ``install`` reuse the values it just wrote: re-reading the
+    0600 file immediately after writing it would re-run the root-ownership check
+    against a file whose group is only fixed a moment later.
+    """
     report = Report(command="configure")
     layout = ctx.layout
-    secrets = ctx.secrets()
+    if secrets is None:
+        secrets = ctx.secrets()
     state = load_state(layout) or DeploymentState()
     target_mode = mode or state.mode or "tun"
 
@@ -581,9 +646,11 @@ def configure(
     else:
         write_atomic(layout.config, rendered, mode=0o600)
         report.status = "CHANGED"
+    _own(ctx, layout.config)
     if target_mode == "tun":
         if not is_noop(layout.config_tun_backup, rendered, mode=0o600):
             write_atomic(layout.config_tun_backup, rendered, mode=0o600)
+        _own(ctx, layout.config_tun_backup)
 
     state.mode = target_mode
     state.degraded = target_mode == "mixed"
@@ -591,7 +658,7 @@ def configure(
     if target_mode == "tun":
         state.reasons = []
         state.services = []
-    save_state(layout, state)
+    _save_state(ctx, state)
 
     report.data["mode"] = target_mode
     # keep the "sha256:" prefix: the sanitizer preserves digests, but redacts
@@ -615,14 +682,16 @@ def _install_plist(ctx: Context) -> bool:
         label=LABEL,
         python=target(ctx.python),
         package_dir=target(layout.share_python),
-        state_dir=target(layout.support),
+        # the runner passes ``mihomo -d <state>``: the same directory
+        # ``mihomo -t`` validates against and where geo data is installed
+        state_dir=target(layout.state_dir),
         config=target(layout.config),
         binary=target(layout.binary),
         run_dir=target(layout.run_dir),
         log_out=target(layout.log_out),
         log_err=target(layout.log_err),
     )
-    plist_mod.audit_text(rendered, label=LABEL, state_dir=target(layout.support))
+    plist_mod.audit_text(rendered, label=LABEL, state_dir=target(layout.state_dir))
     if is_noop(layout.plist, rendered, mode=0o644):
         return False
     write_atomic(layout.plist, rendered, mode=0o644)
@@ -636,8 +705,10 @@ def _install_binary(ctx: Context) -> bool:
     """Copy a user-supplied mihomo into ``libexec`` (this installer never downloads).
 
     ``MPM_MIHOMO_BINARY`` selects the source explicitly; otherwise ``mihomo``
-    on ``PATH`` is used.  Geo databases found next to the source are copied to
-    the state directory (``mihomo -d``).
+    on ``PATH`` is used.  Geo databases found next to the source are copied into
+    the **state** directory, because that is the ``-d`` directory used by both
+    ``mihomo -t`` (``config.validate``) and the resident runner (``mihomo -d``).
+    Files left in the old location (``support`` root) are ignored, not deleted.
     """
     layout = ctx.layout
     source = ctx.environ.get("MPM_MIHOMO_BINARY") or shutil.which("mihomo")
@@ -664,9 +735,9 @@ def _install_binary(ctx: Context) -> bool:
             changed = True
 
     source_dir = os.path.dirname(os.path.abspath(source))
-    for name in ("GeoIP.dat", "GeoSite.dat", "Country.mmdb"):
+    for name in _GEO_DATA_FILES:
         candidate = os.path.join(source_dir, name)
-        target = os.path.join(layout.support, name)
+        target = os.path.join(layout.state_dir, name)
         if not os.path.isfile(candidate):
             continue
         if os.path.abspath(candidate) == os.path.abspath(target):
@@ -683,10 +754,21 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
     check = preflight_mod.preflight(ctx.facts)
     for warning in check.warnings:
         report.warn(warning)
-    secrets = ctx.secrets()
     _prepare_dirs(ctx)
+    # A previous root install may have left root:admin artifacts behind (BSD
+    # group inheritance); repair them before the ownership check reads them.
+    _own(
+        ctx,
+        layout.secret_file,
+        layout.deployment_state,
+        layout.network_backup,
+        layout.config,
+        layout.config_tun_backup,
+    )
+    secrets = ctx.secrets()
     if not os.path.isfile(layout.secret_file):
         save_secrets(layout, secrets)
+        _own(ctx, layout.secret_file)
 
     changed = _install_static(ctx)
     report.data["installed_files"] = len(changed)
@@ -695,8 +777,9 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
 
     nodes = _ensure_provider(ctx, secrets)
     report.data["provider_nodes"] = len(nodes)
+    _own(ctx, layout.provider_file)
 
-    config_report = configure(ctx, quiet=quiet, provider_nodes=nodes)
+    config_report = configure(ctx, quiet=quiet, provider_nodes=nodes, secrets=secrets)
     report.data["configure"] = config_report.status
     report.warnings.extend(config_report.warnings)
 
@@ -787,6 +870,7 @@ def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Rep
     proxy = ctx.proxy_client()
     snapshot = proxy.snapshot()
     save_snapshot(layout.network_backup, snapshot)
+    _own(ctx, layout.network_backup)
 
     try:
         configure(ctx, quiet=True, mode="mixed")
@@ -804,6 +888,7 @@ def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Rep
         modified = proxy.apply(snapshot)
         snapshot.stage = STAGE_APPLIED
         save_snapshot(layout.network_backup, snapshot, overwrite=True)
+        _own(ctx, layout.network_backup)
     except Exception:
         # roll back; a failure here keeps the snapshot for the next run
         try:
@@ -824,7 +909,7 @@ def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Rep
     state.tun_ok = False
     state.reasons = [HOST.text(reason)]
     state.services = list(modified)
-    save_state(layout, state)
+    _save_state(ctx, state)
 
     report.data["mode"] = "mixed"
     report.data["services"] = list(modified)
@@ -913,7 +998,7 @@ def start(ctx: Context, *, quiet: bool = False) -> Report:
     state.tun_ok = True
     state.reasons = []
     state.services = []
-    save_state(layout, state)
+    _save_state(ctx, state)
     report.data["mode"] = "tun"
     report.data["tun"] = after.to_dict()
     if not quiet:
@@ -935,7 +1020,7 @@ def stop(ctx: Context, *, quiet: bool = False) -> Report:
         deployment.degraded = False
         deployment.reasons = []
         deployment.services = []
-        save_state(ctx.layout, deployment)
+        _save_state(ctx, deployment)
     report.status = "OK" if state.loaded else "UNCHANGED"
     if not quiet:
         report.add("core stopped" if state.loaded else "core already stopped")

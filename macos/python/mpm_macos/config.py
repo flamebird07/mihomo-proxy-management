@@ -15,6 +15,7 @@ macOS on one policy.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 from typing import Any
 
@@ -30,6 +31,9 @@ DNS_PORT = 1053
 PROVIDER_NAME = "subscription"
 
 MODES = ("tun", "mixed")
+
+#: Files mihomo loads from its ``-d`` directory when ``geodata-mode`` is true.
+GEODATA_FILES = ("GeoIP.dat", "GeoSite.dat")
 
 ARK_RULE = "DOMAIN,ark.cn-beijing.volces.com,DIRECT"
 SUPERBOSS_RULE = "DOMAIN-SUFFIX,superboss.cc,DIRECT"
@@ -92,6 +96,11 @@ def render(
     document["mixed-port"] = MIXED_PORT
     document["external-controller"] = f"127.0.0.1:{CONTROLLER_PORT}"
     document["secret"] = secret
+    # ``mihomo -t`` runs during install and must never reach the network: with
+    # auto-update on, a missing geo database is fetched from GitHub and the
+    # install stalls until it times out.  Geo data is installed locally instead
+    # (see :func:`ensure_geodata`).
+    document["geo-auto-update"] = False
 
     providers = document.get("proxy-providers")
     if not isinstance(providers, dict) or not isinstance(providers.get(PROVIDER_NAME), dict):
@@ -176,6 +185,10 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     if secret is not None:
         require(document.get("secret") == secret, "rendered secret does not match the input")
     require(not document.get("proxies"), "the rendered config must not inline proxy nodes")
+    require(
+        document.get("geo-auto-update") is False,
+        "geo-auto-update must be false (mihomo -t must never download geo data)",
+    )
 
     tun = document.get("tun")
     require(isinstance(tun, dict), "tun section is missing")
@@ -301,6 +314,38 @@ def convert_provider(
     return [str(proxy["name"]) for proxy in merged if proxy.get("name")]
 
 
+def required_geodata(text: str) -> tuple[str, ...]:
+    """Geo database files mihomo loads from its ``-d`` directory.
+
+    ``geodata-mode: true`` (the production template) makes mihomo read
+    ``GeoIP.dat`` and ``GeoSite.dat`` from the config directory.  When either is
+    missing mihomo downloads it, which is exactly what a static validation must
+    not do on a host with no outbound access.
+    """
+    yaml = _yaml()
+    document = yaml.safe_load(text)
+    if isinstance(document, dict) and document.get("geodata-mode"):
+        return GEODATA_FILES
+    return ()
+
+
+def ensure_geodata(text: str, state_dir: str) -> None:
+    """Fail closed before ``mihomo -t`` instead of letting mihomo download."""
+    missing = [
+        name
+        for name in required_geodata(text)
+        if not os.path.isfile(os.path.join(state_dir, name))
+    ]
+    if not missing:
+        return
+    raise RenderError(
+        "geo database missing from the mihomo state directory "
+        f"({state_dir}): {', '.join(missing)}; put GeoIP.dat and GeoSite.dat next to "
+        "the binary given to MPM_MIHOMO_BINARY (the installer copies them into the "
+        "state directory) - mihomo -t must not download them"
+    )
+
+
 def validate(binary: str, config_path: str, state_dir: str, executor: Executor) -> None:
     """Static ``mihomo -t`` validation; a failure never replaces the live config."""
     result = executor.run([binary, "-t", "-f", config_path, "-d", state_dir])
@@ -316,6 +361,7 @@ __all__ = [
     "CONTROLLER_PORT",
     "CURSOR_RULES",
     "DNS_PORT",
+    "GEODATA_FILES",
     "JINRITEMAI_RULE",
     "MIXED_PORT",
     "MODES",
@@ -325,9 +371,11 @@ __all__ = [
     "TIKTOK_RULE",
     "audit",
     "convert_provider",
+    "ensure_geodata",
     "load_convert_module",
     "load_template",
     "provider_node_names",
     "render",
+    "required_geodata",
     "validate",
 ]

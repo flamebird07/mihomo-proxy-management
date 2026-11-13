@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import plistlib
+from pathlib import Path
 
 import pytest
 
 from mpm_common.controller_health import ControllerError
 from mpm_common.errors import FailClosed, NotReady
-from mpm_macos import lifecycle
+from mpm_macos import config, lifecycle
 from mpm_macos.network_proxy import snapshot_exists
 
 from macos_test_support import (
@@ -33,6 +35,30 @@ def _installed(tmp_path, **ctx_kwargs):
     network = FakeNetworkSetup()
     ctx.executor.set("networksetup", network)
     return ctx, harness, network
+
+
+def _add_geodata(ctx, names=("GeoIP.dat", "GeoSite.dat")) -> None:
+    """Put geo databases next to the source binary, as MPM_MIHOMO_BINARY expects."""
+    source = Path(ctx.environ["MPM_MIHOMO_BINARY"])
+    for name in names:
+        (source.parent / name).write_bytes(b"geo-" + name.encode())
+
+
+class _Ownership:
+    """Records ``chown`` calls with an injectable effective uid."""
+
+    def __init__(self, euid: int) -> None:
+        self.euid = euid
+        self.calls: list[tuple[str, int, int]] = []
+
+    def geteuid(self) -> int:
+        return self.euid
+
+    def chown(self, path: str, uid: int, gid: int) -> None:
+        self.calls.append((path, uid, gid))
+
+    def paths(self) -> set[str]:
+        return {os.path.normpath(path) for path, _uid, _gid in self.calls}
 
 
 def _tun_sequence(*observations):
@@ -84,6 +110,105 @@ def test_install_fails_closed_when_cursor_has_no_region_node(tmp_path):
     prepare_install(ctx, converter=converter)
     with pytest.raises(FailClosed):
         lifecycle.install(ctx, quiet=True, skip_start=True)
+
+
+# ---- install: geo data / ownership / interpreter --------------------------
+
+
+def test_install_puts_geodata_in_the_mihomo_state_directory(tmp_path):
+    """``mihomo -t`` and the runner both use ``-d state``; support root is wrong."""
+    ctx = make_context(tmp_path, validator=None)
+    prepare_install(ctx)
+    _add_geodata(ctx)
+
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    for name in ("GeoIP.dat", "GeoSite.dat"):
+        installed = os.path.join(ctx.layout.state_dir, name)
+        assert os.path.isfile(installed), name
+        assert open(installed, "rb").read() == b"geo-" + name.encode()
+        assert not os.path.exists(os.path.join(ctx.layout.support, name))
+    if os.name != "nt":
+        assert_posix_mode(os.path.join(ctx.layout.state_dir, "GeoIP.dat"), 0o644)
+
+    call = ctx.executor.find(ctx.layout.binary, "-t")
+    assert call is not None, "install must validate the rendered config"
+    assert call.argv[call.argv.index("-d") + 1] == ctx.layout.state_dir
+
+
+def test_install_fails_closed_before_mihomo_when_geodata_is_missing(tmp_path):
+    ctx = make_context(tmp_path, validator=None)
+    prepare_install(ctx)  # no GeoIP.dat / GeoSite.dat next to the binary
+
+    with pytest.raises(config.RenderError) as excinfo:
+        lifecycle.install(ctx, quiet=True, skip_start=True)
+
+    message = str(excinfo.value)
+    assert "GeoIP.dat" in message and "GeoSite.dat" in message
+    assert "MPM_MIHOMO_BINARY" in message
+    assert ctx.executor.count(ctx.layout.binary, "-t") == 0
+    assert not os.path.exists(ctx.layout.config)
+
+
+def test_plist_and_validation_share_the_mihomo_state_directory(tmp_path):
+    ctx, _harness, _network = _installed(tmp_path)
+    document = plistlib.loads(open(ctx.layout.plist, "rb").read())
+    arguments = document["ProgramArguments"]
+    state = arguments[arguments.index("--state-dir") + 1]
+    assert state == ctx.layout.to_target_path(ctx.layout.state_dir)
+    assert document["WorkingDirectory"] == state
+
+
+def test_root_system_install_chowns_state_and_secrets_to_root_wheel(tmp_path):
+    owner = _Ownership(0)
+    ctx = make_context(
+        tmp_path,
+        system_profile=True,
+        geteuid=owner.geteuid,
+        chown=owner.chown,
+    )
+    prepare_install(ctx)
+
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    owned = owner.paths()
+    for path in (
+        ctx.layout.support,
+        ctx.layout.providers,
+        ctx.layout.state_dir,
+        ctx.layout.logs,
+        ctx.layout.secret_file,
+        ctx.layout.deployment_state,
+        ctx.layout.provider_file,
+    ):
+        assert os.path.normpath(path) in owned, path
+    assert all((uid, gid) == (0, 0) for _path, uid, gid in owner.calls)
+
+
+def test_non_root_install_never_chowns(tmp_path):
+    owner = _Ownership(501)
+    ctx = make_context(
+        tmp_path,
+        system_profile=True,
+        geteuid=owner.geteuid,
+        chown=owner.chown,
+    )
+    prepare_install(ctx)
+
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+    assert owner.calls == []
+
+
+def test_installed_cli_defaults_to_the_installing_interpreter(tmp_path):
+    interpreter = "/opt/homebrew/bin/python3.13"
+    ctx = make_context(tmp_path, python=interpreter)
+    prepare_install(ctx)
+
+    lifecycle.install(ctx, quiet=True, skip_start=True)
+
+    text = open(ctx.layout.cli_entry, encoding="utf-8").read()
+    assert f"MPM_PYTHON:={interpreter}" in text
+    assert "/usr/bin/python3" not in text, "stock python3 is 3.9 and has no PyYAML"
 
 
 # ---- start: TUN -----------------------------------------------------------

@@ -84,6 +84,42 @@ def test_render_never_inlines_nodes_and_has_no_placeholders():
     assert "__SUBSCRIPTION_INTERVAL__" not in text
 
 
+@pytest.mark.parametrize("mode", ["tun", "mixed"])
+def test_render_disables_geo_auto_update(mode):
+    """``mihomo -t`` must never fetch geo data from GitHub during install."""
+    assert yaml.safe_load(_render(mode))["geo-auto-update"] is False
+
+
+def test_audit_rejects_geo_auto_update():
+    document = yaml.safe_load(_render("tun"))
+    document["geo-auto-update"] = True
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+
+def test_ensure_geodata_fails_closed_before_mihomo_runs(tmp_path):
+    with pytest.raises(config.RenderError) as excinfo:
+        config.ensure_geodata(_render("tun"), str(tmp_path))
+    message = str(excinfo.value)
+    assert "GeoIP.dat" in message and "GeoSite.dat" in message
+    assert "MPM_MIHOMO_BINARY" in message
+
+
+def test_ensure_geodata_passes_when_both_files_are_present(tmp_path):
+    text = _render("tun")
+    (tmp_path / "GeoIP.dat").write_bytes(b"geo")
+    (tmp_path / "GeoSite.dat").write_bytes(b"site")
+    config.ensure_geodata(text, str(tmp_path))
+
+
+def test_required_geodata_is_empty_without_geodata_mode():
+    document = yaml.safe_load(_render("tun"))
+    document["geodata-mode"] = False
+    assert config.required_geodata(yaml.safe_dump(document, sort_keys=False)) == ()
+    assert config.required_geodata(_render("tun")) == ("GeoIP.dat", "GeoSite.dat")
+
+
 def test_render_requires_a_secret_and_a_url():
     with pytest.raises(config.RenderError):
         config.render(_template(), secret="", subscription_url=URL)

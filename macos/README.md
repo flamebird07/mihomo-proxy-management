@@ -59,9 +59,13 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 /Library/Application Support/mihomo-proxy-management/state/subscription.env (0600)
 /Library/Application Support/mihomo-proxy-management/state/deployment.json  (0600)
 /Library/Application Support/mihomo-proxy-management/state/network-proxy-backup.json (0600)
+/Library/Application Support/mihomo-proxy-management/state/{GeoIP.dat,GeoSite.dat,Country.mmdb} (0644)
 /Library/Application Support/mihomo-proxy-management/logs/{core.out.log,core.err.log}
 /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
 ```
+
+`state/` 就是 mihomo 的 `-d` 目录：`mihomo -t`（安装校验）和常驻 runner 的
+`mihomo -d` 都用它，LaunchDaemon 的 `--state-dir` 与 `WorkingDirectory` 也是它。
 
 统一调用 `/usr/local/bin/mihomo-proxy-management <command>`；脚本只是兼容入口：
 
@@ -88,8 +92,28 @@ sudo --preserve-env=MPM_SUBSCRIPTION_URL,MPM_SECRET,MPM_MIHOMO_BINARY \
 `export`，或在 root shell 里 `read -s` 读入；不要写进脚本或命令行参数
 （会落进 shell 历史）。
 
-安装器**不联网下载**：mihomo 由 `MPM_MIHOMO_BINARY`（或 PATH 上的 `mihomo`）提供，
-GeoIP/GeoSite 若与源二进制同目录会一并复制到 state 目录。
+安装器**不联网下载**：mihomo 由 `MPM_MIHOMO_BINARY`（或 PATH 上的 `mihomo`）提供。
+`GeoIP.dat`、`GeoSite.dat`、`Country.mmdb` 若与源二进制同目录，会以 `0644` 原子复制到
+**`state/`**（mihomo 的 `-d` 目录，与 `mihomo -t`、runner 的 `-d` 一致）；旧位置
+（`Application Support/mihomo-proxy-management/` 根下）的残留文件不会被读取或删除，
+可以手动清理。模板里 `geodata-mode: true`，因此 `GeoIP.dat` 与 `GeoSite.dat` 是必需的：
+
+* 渲染出的配置固定 `geo-auto-update: false`，`mihomo -t` 不会尝试从 GitHub 下载
+  geo 数据（真实 Mac 上曾因此超时、安装失败）；
+* 安装会在调用 `mihomo -t` **之前**检查 `state/` 中的这两个文件；缺失时直接以
+  `FailClosed`/`RenderError` 失败，并提示把 `GeoIP.dat`/`GeoSite.dat` 放到
+  `MPM_MIHOMO_BINARY` 同目录后重试。
+
+root（`system profile`）安装时，安装器会对 `support`、`state`、`providers`、`logs`
+四个目录以及 `subscription.env`、`deployment.json`、`network-proxy-backup.json`、
+`config.yaml` 等写入后显式 `chown(0, 0)`。原因是 BSD 语义下新文件继承父目录属组，而
+`/Library/Application Support` 属组为 `admin`，不修正就会写出 `root:admin` 的
+`subscription.env`，与 `check_secret_input` 要求的 `root:wheel` 冲突。非 root（沙箱/测试）
+运行时不执行 `chown`。
+
+`/usr/local/bin/mihomo-proxy-management` 的默认解释器在安装时被渲染为**安装所用的
+解释器**（`MPM_PYTHON` 或 `sys.executable`），不再默认 `/usr/bin/python3`（stock macOS
+为 3.9 且无 PyYAML）。运行时仍可用 `MPM_PYTHON=/path/to/python3` 覆盖。
 
 ## 3. KeepAlive 与崩溃拉起语义
 
