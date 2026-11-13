@@ -210,6 +210,22 @@ INSTALL_DIR=C:\mihomo          # 默认值，可不改
 > `subscription.env` 一律忽略）。仓库里只有 `.example` 模板。
 > This file holds real credentials; the recursive `.gitignore` covers it anywhere.
 
+### 飞书同步凭据 / Feishu credentials
+
+`scripts/sync-feishu-bitable.py`、`scripts/live_status_publish.py`、
+`scripts/sync-xigua-ippool-feishu.py`、`scripts/source1_independent.py` 从
+`--env-file`（默认 `C:\Users\Administrator\.hermes\.env`）读取飞书凭据：
+
+```ini
+FEISHU_APP_ID=...               # 飞书应用 ID
+FEISHU_APP_SECRET=...           # 飞书应用密钥
+FEISHU_BITABLE_APP_TOKEN=...    # 多维表 app token（多维表 URL 中的 app_token 段）
+```
+
+app token 解析优先级：命令行 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` >
+env 文件同名键。缺失时只报键名与来源并以非 0 退出（dry-run 等不访问飞书的路径不受影响）；
+日志与错误信息不打印任何 token 值。真实值只填在本机 env 文件，不要提交进仓库。
+
 ### 修改代理组 / Editing proxy groups
 
 `config\config.yaml.template` 是模板，下面这些正则可按需调整：

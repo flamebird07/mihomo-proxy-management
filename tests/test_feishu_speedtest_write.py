@@ -25,6 +25,7 @@ No network: every I/O boundary in main() is patched.
 import importlib.util
 import io
 import os
+import secrets
 import sys
 import tempfile
 import unittest
@@ -42,6 +43,8 @@ spec.loader.exec_module(sync)
 SOURCES = [{"源": "A"}]
 NODES = [{"fields": {"节点名": "a1"}}]
 REGIONS = [{"地区": "新加坡"}]
+# Runtime-generated fake credential; never a real token.
+FAKE_APP_TOKEN = "fake-app-token-" + secrets.token_hex(8)
 
 
 def keys_of(pairs):
@@ -158,7 +161,8 @@ class MainFlowMockClientTests(unittest.TestCase):
         """Run sync.main() with every I/O boundary patched; return (rc, state)."""
         env_file = os.path.join(tmp, "feishu.env")
         with open(env_file, "w", encoding="utf-8") as handle:
-            handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret\n")
+            handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret\n"
+                         f"FEISHU_BITABLE_APP_TOKEN={FAKE_APP_TOKEN}\n")
         argv = [
             "--log-file", os.path.join(tmp, "sync.log"),
             "--env-file", env_file,

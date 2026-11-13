@@ -1,0 +1,20 @@
+usage: health-check-provider.py [-h] --candidate CANDIDATE --output OUTPUT
+                                [--core CORE] --target TARGET
+                                [--required-name-regex REQUIRED_NAME_REGEX]
+                                [--minimum-matching MINIMUM_MATCHING]
+                                [--mixed-port MIXED_PORT]
+                                [--controller-port CONTROLLER_PORT]
+                                [--timeout-ms TIMEOUT_MS] [--workers WORKERS]
+
+options:
+  -h, --help            show this help message and exit
+  --candidate CANDIDATE
+  --output OUTPUT
+  --core CORE
+  --target TARGET
+  --required-name-regex REQUIRED_NAME_REGEX
+  --minimum-matching MINIMUM_MATCHING
+  --mixed-port MIXED_PORT
+  --controller-port CONTROLLER_PORT
+  --timeout-ms TIMEOUT_MS
+  --workers WORKERS

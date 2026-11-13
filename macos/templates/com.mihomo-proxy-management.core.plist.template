@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-m</string>
+		<string>mpm_macos.runner</string>
+		<string>--state-dir</string>
+		<string>__STATE_DIR__</string>
+		<string>--config</string>
+		<string>__CONFIG__</string>
+		<string>--binary</string>
+		<string>__BINARY__</string>
+		<string>--run-dir</string>
+		<string>__RUN_DIR__</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>__PACKAGE_DIR__</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>__STATE_DIR__</string>
+	<key>StandardOutPath</key>
+	<string>__LOG_OUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_ERR__</string>
+</dict>
+</plist>

@@ -221,6 +221,13 @@ if __name__ == '__main__':
     # Shared writer mutex is hold_writer_lock inside sync(), which uses
     # writer_mutex_name() / SYNC_MUTEX_NAME. Probes run unlocked.
     env = h['read_env_file'](args.env_file)
-    client = h['FeishuClient'](env['FEISHU_APP_ID'], env['FEISHU_APP_SECRET'], args.app_token, log)
+    app_id = (env.get('FEISHU_APP_ID') or '').strip()
+    app_secret = (env.get('FEISHU_APP_SECRET') or '').strip()
+    if not app_id or not app_secret:
+        raise SystemExit('credentials_missing: FEISHU_APP_ID/FEISHU_APP_SECRET not set in --env-file')
+    app_token = h['resolve_app_token'](args.app_token, env)
+    if not app_token:
+        raise SystemExit('app_token_missing: FEISHU_BITABLE_APP_TOKEN (--app-token > env > --env-file)')
+    client = h['FeishuClient'](app_id, app_secret, app_token, log)
     tables = h['load_state'](args.state_file)['tables']
     sync(client, tables['nodes']['table_id'], tables['gpt_regions']['table_id'], log, h)

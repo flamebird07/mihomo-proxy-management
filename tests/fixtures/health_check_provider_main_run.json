@@ -1,0 +1,10 @@
+{
+  "tested": 2,
+  "healthy_all_targets": 1,
+  "matching_pool": 1,
+  "targets": {
+    "probe.example.invalid": 1
+  },
+  "output_sha256": "<sha256>",
+  "isolated_mihomo_stopped": true
+}

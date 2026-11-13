@@ -713,14 +713,14 @@ class CliTests(TempRunMixin, unittest.TestCase):
         self.write_collect(make_collected(base=utcnow()))
 
         def boom(args, log):
-            raise mod.PublishError("credentials_missing", "FEISHU_APP_ID/FEISHU_APP_SECRET not set")
+            raise mod.PublishError("token_error", "code=99991663")
 
         out = io.StringIO()
         with mock.patch.object(sys, "stdout", new=out):
             code = mod.main(self.base_argv("--apply"), client_factory=boom,
                             lock_factory=FakeLock())
         self.assertEqual(code, 0)
-        self.assertIn("credentials_missing", self.log_text())
+        self.assertIn("token_error", self.log_text())
         self.assertNotIn(FAKE_SECRET, self.log_text())
 
     def test_unexpected_exception_is_logged_with_traceback_and_exit_zero(self):
