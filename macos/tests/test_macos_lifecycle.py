@@ -11,6 +11,7 @@ import yaml
 
 from mpm_common.controller_health import ControllerError
 from mpm_common.errors import FailClosed, NotReady
+from mpm_common.executor import Result
 from mpm_macos import config, lifecycle
 from mpm_macos.network_proxy import snapshot_exists
 
@@ -29,10 +30,10 @@ pytestmark = pytest.mark.macos
 
 def _installed(tmp_path, **ctx_kwargs):
     ctx = make_context(tmp_path, **ctx_kwargs)
+    harness = LaunchdHarness(ctx.executor)
     prepare_install(ctx)
     report = lifecycle.install(ctx, quiet=True, skip_start=True)
     assert report.status == "OK", report.messages
-    harness = LaunchdHarness(ctx.executor)
     network = FakeNetworkSetup()
     ctx.executor.set("networksetup", network)
     return ctx, harness, network
@@ -83,6 +84,7 @@ def test_install_writes_config_plist_and_provider(tmp_path):
     assert os.path.isfile(layout.plist)
     assert os.path.isfile(layout.provider_file)
     assert os.path.isfile(layout.cli_entry)
+    assert os.path.isfile(layout.switch_entry)
     assert os.path.isfile(layout.binary)
     state = lifecycle.load_state(layout)
     assert state.mode == "tun"
@@ -111,6 +113,103 @@ def test_install_fails_closed_when_cursor_has_no_region_node(tmp_path):
     prepare_install(ctx, converter=converter)
     with pytest.raises(FailClosed):
         lifecycle.install(ctx, quiet=True, skip_start=True)
+
+
+def test_install_no_start_leaves_service_disabled(tmp_path):
+    """KeepAlive implies RunAtLoad, so only ``disable`` keeps boot clean."""
+    ctx, harness, _network = _installed(tmp_path)
+    assert harness.disabled is True
+    assert harness.loaded is False
+    assert any(
+        call.argv[:2] == ["launchctl", "disable"] for call in ctx.executor.calls
+    )
+
+
+def test_start_enables_bootstraps_then_disables(tmp_path):
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "OK"
+    assert harness.running is True
+    assert harness.disabled is True, "the loaded job keeps running but must not auto-start"
+    commands = [call.argv[:2] for call in ctx.executor.calls]
+    enable_at = commands.index(["launchctl", "enable"])
+    bootstrap_at = commands.index(["launchctl", "bootstrap"])
+    disable_at = len(commands) - 1 - commands[::-1].index(["launchctl", "disable"])
+    assert enable_at < bootstrap_at < disable_at
+
+
+def test_stop_bootout_and_disable(tmp_path):
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+    lifecycle.start(ctx, quiet=True)
+    ctx.executor.calls.clear()
+
+    report = lifecycle.stop(ctx, quiet=True)
+
+    assert report.status == "OK"
+    assert harness.loaded is False
+    assert harness.disabled is True
+    commands = [call.argv[:2] for call in ctx.executor.calls]
+    assert commands.index(["launchctl", "bootout"]) < commands.index(["launchctl", "disable"])
+
+
+def _fail_on(ctx, *prefix):
+    """Make one launchctl subcommand fail, keeping the rest of the fake working."""
+    original = ctx.executor.run
+
+    def run(argv, **kwargs):
+        if tuple(argv[: len(prefix)]) == tuple(prefix):
+            return Result(tuple(argv), 1, "", "refused")
+        return original(argv, **kwargs)
+
+    ctx.executor.run = run
+
+
+def test_stop_core_disable_runs_even_if_bootout_fails(tmp_path):
+    """``disable`` must run in ``finally``: never leave a boot-enabled job."""
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+    lifecycle.start(ctx, quiet=True)
+    ctx.executor.calls.clear()
+    _fail_on(ctx, "launchctl", "bootout")
+
+    with pytest.raises(NotReady):
+        lifecycle._stop_core(ctx)
+
+    assert ctx.executor.count("launchctl", "disable") >= 1
+    assert harness.disabled is True
+    assert harness.running is True, "a still-running core is not a safe rollback"
+
+
+def test_post_start_disable_failure_rolls_back(tmp_path):
+    """A failed persistent disable is a failed start, not a warning."""
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+    _fail_on(ctx, "launchctl", "disable")
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert report.exit_code not in (0, None)
+    assert harness.loaded is False, "the core must be booted out again"
+    assert ctx.executor.count("launchctl", "bootout") >= 1
+    state = lifecycle.load_state(ctx.layout)
+    assert state.tun_ok is False
+
+
+def test_post_start_disable_readback_failure_rolls_back(tmp_path):
+    """An unreadable override is not a confirmation of "disabled"."""
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+    _fail_on(ctx, "launchctl", "print-disabled")
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert harness.loaded is False
 
 
 # ---- install: geo data / ownership / interpreter --------------------------
@@ -282,146 +381,169 @@ def test_start_is_idempotent_when_already_running(tmp_path):
     assert after == before, "an already-running core must not be started twice"
 
 
-# ---- start: fallback ------------------------------------------------------
+def test_start_already_running_disable_readback_failure_fails_safe(tmp_path):
+    """An unconfirmed override on an already-running core is a failed start.
+
+    Like the fresh paths, the already-running branch must read the disable
+    override back; a failure runs the safety stop transaction (bootout +
+    disable) instead of reporting a false UNCHANGED or raising past the CLI.
+    """
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.tun_observer = _tun_sequence(NO_TUN, WITH_TUN)
+    lifecycle.start(ctx, quiet=True)
+    assert harness.running is True
+    _fail_on(ctx, "launchctl", "print-disabled")
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert report.exit_code not in (0, None)
+    assert harness.loaded is False, "the running core is stopped by the safety transaction"
+    assert ctx.executor.count("launchctl", "bootout") >= 1
+    assert any("disable" in warning or "override" in warning for warning in report.warnings)
 
 
-def test_tun_failure_falls_back_and_sets_the_system_proxy(tmp_path):
-    ctx, _harness, network = _installed(tmp_path)
+# ---- start: failure is FAILED, never a mixed takeover ---------------------
+
+
+def test_start_health_failure_stops_and_restores_no_mixed_takeover(tmp_path):
+    """A TUN failure must stop the core and leave the system proxy alone."""
+    ctx, harness, network = _installed(tmp_path)
     network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
     network.seed_bypass("Wi-Fi", ["*.corp.example"])
     ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
 
     report = lifecycle.start(ctx, quiet=True)
 
-    assert report.status == "DEGRADED"
-    config_text = open(ctx.layout.config, encoding="utf-8").read()
-    assert "redir-host" in config_text
-    assert "fake-ip-range" not in config_text
-    assert snapshot_exists(ctx.layout.network_backup)
-    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
-    assert network.state["Wi-Fi"]["web"]["port"] == 7890
-    assert network.state["Wi-Fi"]["web"]["enabled"] is True
-    state = lifecycle.load_state(ctx.layout)
-    assert state.mode == "mixed"
-    assert state.degraded is True
-    assert "Wi-Fi" in state.services
-
-
-def test_mixed_start_failure_never_sets_the_system_proxy(tmp_path):
-    ctx, _harness, network = _installed(tmp_path)
-    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
-
-    class _FirstOkThenDown(FakeController):
-        def __init__(self) -> None:
-            super().__init__()
-            self.version_calls = 0
-
-        def version(self):
-            self.version_calls += 1
-            if self.version_calls > 1:
-                raise ControllerError("controller went away")
-            return super().version()
-
-    controller = _FirstOkThenDown()
-    ctx.controller_factory = lambda _secret: controller
-    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
-
-    with pytest.raises(NotReady):
-        lifecycle.start(ctx, quiet=True)
-
+    assert report.status == "FAILED"
+    assert report.exit_code not in (0, None)
+    assert harness.loaded is False
+    assert harness.disabled is True
     assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
-    assert network.state["Wi-Fi"]["web"]["enabled"] is True
+    assert network.state["Wi-Fi"]["web"]["port"] == 8080
     assert ctx.executor.count("networksetup", "-setwebproxy", "Wi-Fi", "127.0.0.1") == 0
     assert not snapshot_exists(ctx.layout.network_backup)
+    text = open(ctx.layout.config, encoding="utf-8").read()
+    assert "enhanced-mode: fake-ip" in text, "the TUN config must not be replaced by mixed"
+    assert "redir-host" not in text
+    state = lifecycle.load_state(ctx.layout)
+    assert state.mode == "tun"
+    assert state.degraded is False
 
 
-def test_wait_running_failure_falls_back_to_mixed(tmp_path):
-    """The job loads but never runs: same transaction as a utun failure."""
+def test_start_wait_running_failure_stops_without_mixed(tmp_path):
     ctx, harness, network = _installed(tmp_path)
     network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
     harness.start_failures = 1
 
     report = lifecycle.start(ctx, quiet=True)
 
+    assert report.status == "FAILED"
+    assert harness.loaded is False
+    assert harness.disabled is True
+    assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
+    assert not snapshot_exists(ctx.layout.network_backup)
+
+
+def test_start_readiness_failure_stops_without_mixed(tmp_path):
+    class _ReadinessFails(FakeController):
+        def version(self):
+            raise ControllerError("controller not ready")
+
+    ctx, harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    ctx.controller_factory = lambda _secret: _ReadinessFails()
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert harness.loaded is False
+    assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
+
+
+def test_start_unhealthy_core_stops_without_mixed(tmp_path):
+    ctx, harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    ctx.controller_factory = lambda _secret: FakeController(node_count=3, alive=0)
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert harness.loaded is False
+    assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
+
+
+def test_start_requires_autoforeign_and_gpt_group_liveness(tmp_path):
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.controller_factory = lambda _secret: FakeController(
+        group_alive={"AUTO-FOREIGN": True, "GPT": False}
+    )
+
+    report = lifecycle.start(ctx, quiet=True)
+
+    assert report.status == "FAILED"
+    assert any("GPT" in warning for warning in report.warnings)
+    assert harness.loaded is False
+
+
+def test_start_conflict_refuses_before_any_launchd_action(tmp_path):
+    from mpm_macos.conflict import ConflictReport
+
+    ctx, harness, _network = _installed(tmp_path)
+    ctx.conflict_detector = lambda: ConflictReport(
+        ok=False, reasons=["外部 VPN 已连接：Nextin"]
+    )
+
+    with pytest.raises(FailClosed) as excinfo:
+        lifecycle.start(ctx, quiet=True)
+
+    assert "Nextin" in str(excinfo.value)
+    assert harness.loaded is False
+    assert ctx.executor.count("launchctl", "bootstrap") == 0
+
+
+# ---- start: explicit mixed mode only --------------------------------------
+
+
+def test_explicit_mixed_start_sets_the_proxy(tmp_path):
+    ctx, harness, network = _installed(tmp_path)
+    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
+    network.seed_bypass("Wi-Fi", ["*.corp.example"])
+
+    report = lifecycle.start(ctx, quiet=True, mode="mixed")
+
     assert report.status == "DEGRADED"
     assert report.data["mode"] == "mixed"
+    assert harness.running is True
+    assert harness.disabled is True
+    assert snapshot_exists(ctx.layout.network_backup)
     assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
     assert network.state["Wi-Fi"]["web"]["port"] == 7890
-    assert snapshot_exists(ctx.layout.network_backup)
+    assert network.state["Wi-Fi"]["bypass"] == ["*.corp.example"]
     state = lifecycle.load_state(ctx.layout)
     assert state.mode == "mixed"
     assert state.degraded is True
+    assert "Wi-Fi" in state.services
+    assert "redir-host" in open(ctx.layout.config, encoding="utf-8").read()
 
 
-def test_readiness_failure_falls_back_to_mixed(tmp_path):
-    """An unreachable controller during the TUN attempt is a TUN failure."""
-
-    class _ReadinessFailsFirst(FakeController):
-        def __init__(self) -> None:
-            super().__init__()
-            self.remaining_failures = 25
-
-        def version(self):
-            if self.remaining_failures > 0:
-                self.remaining_failures -= 1
-                raise ControllerError("controller not ready")
-            return super().version()
-
-    ctx, _harness, network = _installed(tmp_path)
-    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
-    controller = _ReadinessFailsFirst()
-    ctx.controller_factory = lambda _secret: controller
-
-    report = lifecycle.start(ctx, quiet=True)
-
-    assert report.status == "DEGRADED"
-    assert report.data["mode"] == "mixed"
-    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
-    assert lifecycle.load_state(ctx.layout).mode == "mixed"
-
-
-def test_unhealthy_tun_core_falls_back_to_mixed(tmp_path):
-    """provider healthcheck failing means TUN never counts as established."""
-
-    class _HealthcheckFailsOnce(FakeController):
-        def __init__(self) -> None:
-            super().__init__()
-            self.attempts = 0
-
-        def healthcheck(self, name: str) -> None:
-            self.attempts += 1
-            if self.attempts == 1:
-                raise ControllerError("provider healthcheck failed")
-            super().healthcheck(name)
-
-    ctx, _harness, network = _installed(tmp_path)
-    network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
-    controller = _HealthcheckFailsOnce()
-    ctx.controller_factory = lambda _secret: controller
-
-    report = lifecycle.start(ctx, quiet=True)
-
-    assert report.status == "DEGRADED"
-    assert controller.attempts == 2, "the mixed core must be health-checked too"
-    assert report.data["health"]["state"] == "OK"
-    assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
-    assert lifecycle.load_state(ctx.layout).mode == "mixed"
-
-
-def test_unhealthy_mixed_core_never_sets_the_system_proxy(tmp_path):
-    """mixed is fail-closed: no live node -> roll back, proxy untouched."""
-    ctx, _harness, network = _installed(tmp_path)
+def test_explicit_mixed_start_failure_never_sets_the_system_proxy(tmp_path):
+    ctx, harness, network = _installed(tmp_path)
     network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
     ctx.controller_factory = lambda _secret: FakeController(node_count=3, alive=0)
-    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
 
-    with pytest.raises(NotReady):
-        lifecycle.start(ctx, quiet=True)
+    report = lifecycle.start(ctx, quiet=True, mode="mixed")
 
+    assert report.status == "FAILED"
+    assert harness.loaded is False
+    assert harness.disabled is True
     assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
     assert network.state["Wi-Fi"]["web"]["enabled"] is True
     assert ctx.executor.count("networksetup", "-setwebproxy", "Wi-Fi", "127.0.0.1") == 0
     assert not snapshot_exists(ctx.layout.network_backup)
+    # the failed mixed attempt must not leave a mixed config for the next start
+    assert "enhanced-mode: fake-ip" in open(ctx.layout.config, encoding="utf-8").read()
+    assert lifecycle.load_state(ctx.layout).mode == "tun"
 
 
 # ---- stop / crash recovery ------------------------------------------------
@@ -431,33 +553,34 @@ def test_stop_restores_the_proxy_and_removes_the_snapshot(tmp_path):
     ctx, harness, network = _installed(tmp_path)
     network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
     network.seed_bypass("Wi-Fi", ["*.corp.example"])
-    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
-    lifecycle.start(ctx, quiet=True)
+    lifecycle.start(ctx, quiet=True, mode="mixed")
     assert network.state["Wi-Fi"]["web"]["server"] == "127.0.0.1"
 
     report = lifecycle.stop(ctx, quiet=True)
 
     assert report.status == "OK"
     assert harness.loaded is False
+    assert harness.disabled is True
     assert network.state["Wi-Fi"]["web"]["server"] == "10.0.0.5"
     assert network.state["Wi-Fi"]["web"]["port"] == 8080
     assert network.state["Wi-Fi"]["web"]["enabled"] is True
     assert network.state["Wi-Fi"]["bypass"] == ["*.corp.example"]
     assert not snapshot_exists(ctx.layout.network_backup)
     assert ctx.executor.count("launchctl", "bootout") >= 1
+    assert ctx.executor.count("launchctl", "disable") >= 1
 
 
 def test_stop_is_idempotent_when_never_started(tmp_path):
     ctx, _harness, _network = _installed(tmp_path)
     report = lifecycle.stop(ctx, quiet=True)
     assert report.status == "UNCHANGED"
+    assert _harness.disabled is True
 
 
 def test_start_restores_an_unfinished_transaction_first(tmp_path):
     ctx, harness, network = _installed(tmp_path)
     network.seed("Wi-Fi", "web", enabled=True, server="10.0.0.5", port=8080)
-    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
-    lifecycle.start(ctx, quiet=True)
+    lifecycle.start(ctx, quiet=True, mode="mixed")
     assert snapshot_exists(ctx.layout.network_backup)
 
     # simulate a crash: the job is gone but the proxy and snapshot remain
@@ -477,10 +600,9 @@ def test_start_restores_an_unfinished_transaction_first(tmp_path):
 # ---- status / preflight ---------------------------------------------------
 
 
-def test_status_reports_degraded_after_fallback(tmp_path):
+def test_status_reports_degraded_for_explicit_mixed(tmp_path):
     ctx, _harness, _network = _installed(tmp_path)
-    ctx.tun_observer = _tun_sequence(NO_TUN, NO_TUN)
-    lifecycle.start(ctx, quiet=True)
+    lifecycle.start(ctx, quiet=True, mode="mixed")
 
     report = lifecycle.status(ctx)
 

@@ -19,7 +19,8 @@ from mpm_common.errors import ExitCode, FailClosed, MpmError
 from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST, sanitize
 
-from . import __version__, lifecycle, preflight as preflight_mod
+from . import __version__, lifecycle, preflight as preflight_mod, probe as probe_mod
+from . import switch as switch_mod
 from .paths import Layout
 
 PROGRAM = "mihomo-proxy-management"
@@ -28,7 +29,9 @@ ENV_PYTHON = "MPM_PYTHON"
 
 # Every command that can change config, launchd, the proxy snapshot or files.
 # They are serialised by the lifecycle lock; the lifecycle functions they call
-# (install -> start -> fallback, restart -> stop + start) never take it again.
+# (install -> start, restart -> stop + start) never take it again.  ``switch``
+# is handled separately: the ordinary-user phase must not hold the lock while
+# its privileged child takes it.
 MUTATING_COMMANDS = frozenset(
     {"install", "configure", "start", "stop", "restart", "uninstall"}
 )
@@ -81,13 +84,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="force a mode (default: the recorded mode, then tun)",
     )
     for name, text in (
-        ("start", "start the LaunchDaemon and verify TUN (falls back to mixed)"),
-        ("stop", "bootout the LaunchDaemon and restore the system proxy"),
+        ("start", "start the LaunchDaemon and verify TUN (mixed only when asked)"),
+        ("stop", "bootout the LaunchDaemon, disable it and restore the system proxy"),
         ("restart", "stop, confirm stopped, start, verify"),
         ("status", "launchd/process/mode/proxy/controller status"),
         ("health", "controller readiness, provider health and live nodes"),
     ):
         common(name, text)
+    start = sub.choices["start"]
+    start.add_argument(
+        "--mode",
+        choices=("tun", "mixed"),
+        help="explicit mode; mixed also sets the system proxy (default: tun)",
+    )
+
+    switch = common("switch", "switch between Nextin and mihomo (mpm-switch)")
+    switch.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("mihomo", "nextin", "status", "rollback"),
+    )
+    switch.add_argument("--user", help="invoking user (passed to the root phase)")
+    switch.add_argument("--uid", type=int, help="invoking uid (passed to the root phase)")
+    switch.add_argument(
+        "--vpn-name",
+        help="VPN service name (default: Nextin / MPM_VPN_NAME); passed to the root phase",
+    )
+    switch.add_argument(
+        "--marker",
+        help="success marker for the shell wrapper (internal; root phase only)",
+    )
+    switch.add_argument(
+        "--drill-fail",
+        action="store_true",
+        help="force the post-switch probe to fail (rollback drill)",
+    )
+
+    probe = common("probe", "run the post-switch reachability probe")
+    probe.add_argument(
+        "--drill-fail",
+        action="store_true",
+        help="force the probe to fail (rollback drill)",
+    )
+
     uninstall = common("uninstall", "remove the LaunchDaemon and program files")
     uninstall.add_argument(
         "--purge", action="store_true", help="also remove config, provider, logs and state"
@@ -126,8 +166,18 @@ def dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Repo
     The lock is non-blocking: a concurrent operation is refused with a clear
     error and a non-zero exit instead of interleaving config, launchd and
     proxy-snapshot changes.
+
+    ``switch`` is special: the ordinary-user phase only stops the VPN and then
+    launches a privileged child, so it must not hold the lock (the child takes
+    it).  The root phase does take it.
     """
-    if args.command in MUTATING_COMMANDS:
+    needs_lock = args.command in MUTATING_COMMANDS
+    if args.command == "switch":
+        needs_lock = (
+            getattr(args, "action", "status") in ("mihomo", "nextin", "rollback")
+            and ctx.geteuid() == 0
+        )
+    if needs_lock:
         with ctx.lifecycle_guard():
             return _dispatch(ctx, args)
     return _dispatch(ctx, args)
@@ -142,7 +192,7 @@ def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Rep
     if command == "configure":
         return lifecycle.configure(ctx, quiet=args.quiet, mode=getattr(args, "mode", None))
     if command == "start":
-        return lifecycle.start(ctx, quiet=args.quiet)
+        return lifecycle.start(ctx, quiet=args.quiet, mode=getattr(args, "mode", None))
     if command == "stop":
         return lifecycle.stop(ctx, quiet=args.quiet)
     if command == "restart":
@@ -151,6 +201,54 @@ def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Rep
         return lifecycle.status(ctx)
     if command == "health":
         return lifecycle.health(ctx)
+    if command == "switch":
+        action = getattr(args, "action", "status")
+        drill = True if getattr(args, "drill_fail", False) else None
+        if action == "status":
+            return switch_mod.status(ctx)
+        if action == "mihomo":
+            return switch_mod.switch_to_mihomo(
+                ctx,
+                force_fail=drill,
+                uid=getattr(args, "uid", None),
+                user=getattr(args, "user", None),
+                vpn_name=getattr(args, "vpn_name", None),
+                marker=getattr(args, "marker", None),
+            )
+        if action == "rollback":
+            return switch_mod.rollback(
+                ctx,
+                uid=getattr(args, "uid", None),
+                user=getattr(args, "user", None),
+                vpn_name=getattr(args, "vpn_name", None),
+            )
+        return switch_mod.switch_to_nextin(
+            ctx,
+            uid=getattr(args, "uid", None),
+            user=getattr(args, "user", None),
+            vpn_name=getattr(args, "vpn_name", None),
+        )
+    if command == "probe":
+        report = lifecycle.Report(command="probe")
+        verdict = probe_mod.run_probe(
+            ctx.executor,
+            sleeper=ctx.sleeper,
+            force_fail=True if getattr(args, "drill_fail", False) else None,
+        )
+        report.data = verdict.to_dict()
+        for line in verdict.lines():
+            report.add(line)
+        if verdict.ok:
+            report.status = "OK"
+            location = probe_mod.exit_location(ctx.executor)
+            if location:
+                report.add("exit: " + location)
+                report.data["exit_location"] = location
+        else:
+            report.status = "FAILED"
+            report.exit_code = int(ExitCode.NOT_READY)
+            report.warn(verdict.reason or "probe failed")
+        return report
     if command == "uninstall":
         return lifecycle.uninstall(ctx, purge=bool(args.purge), quiet=args.quiet)
     raise FailClosed(f"unknown command: {sanitize(str(command))}")

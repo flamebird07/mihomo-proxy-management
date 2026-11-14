@@ -47,7 +47,7 @@ def test_tun_render_switches_the_technical_fields():
     assert document["tun"]["auto-detect-interface"] is True
     assert document["tun"]["stack"] == "gvisor"
     assert document["dns"]["enhanced-mode"] == "fake-ip"
-    assert document["proxy-providers"]["subscription"]["interval"] == 30
+    assert document["proxy-providers"]["subscription"]["interval"] == 3600
     assert document["proxy-providers"]["subscription"]["url"] == URL
 
 
@@ -229,3 +229,132 @@ def test_validate_passes_on_success(tmp_path):
     assert call is not None
     assert call.argv[0] == "/usr/local/bin/mihomo"
     assert "-f" in call.argv and "-d" in call.argv
+
+
+# ---- macOS-only policy regression tests (2026-11-14 outage) ---------------
+
+
+def test_region_filters_do_not_match_russia_australia():
+    """The old ``美|us|usa`` filter matched Russia/Australia and broke failover."""
+    us = config.REGION_FILTERS["US"]
+    not_us = ["Russia", "Australia", "Austria", "Belarus", "俄罗斯 RU", "澳大利亚 AU"]
+    for name in not_us:
+        assert not policy.matches(name, us), name
+    for name in ("🇺🇸 US Mocha", "美国 01 AnyTLS", "USA-2"):
+        assert policy.matches(name, us), name
+
+    assert not policy.matches("Russia", config.REGION_FILTERS["SG"])
+    assert not policy.matches("Japan", config.REGION_FILTERS["SG"])
+    assert policy.matches("新加坡 SG-01", config.REGION_FILTERS["SG"])
+    assert policy.matches("日本 JP-01", config.REGION_FILTERS["JP"])
+
+
+def test_provider_interval_seconds_minimum_3600():
+    assert config.provider_interval_seconds(1) == 3600
+    assert config.provider_interval_seconds(30) == 3600
+    assert config.provider_interval_seconds(60) == 3600
+    assert config.provider_interval_seconds(120) == 7200
+    # zero is a configuration mistake, not "use the floor"
+    with pytest.raises(config.RenderError):
+        config.provider_interval_seconds(0)
+    with pytest.raises(config.RenderError):
+        config.provider_interval_seconds(-5)
+
+    document = yaml.safe_load(_render("tun"))
+    provider = document["proxy-providers"]["subscription"]
+    assert provider["interval"] == 3600
+    assert provider["health-check"]["interval"] == 300
+    assert provider["health-check"]["lazy"] is True
+    assert provider["path"], "the provider path must stay (offline cache fallback)"
+
+    provider["interval"] = 60
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+
+def test_gpt_group_order_us_sg_jp():
+    document = yaml.safe_load(_render("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    order = [group["name"] for group in document["proxy-groups"]]
+    assert order.index("GPT-US") < order.index("GPT-SG") < order.index("GPT-JP") < order.index("GPT")
+    assert groups["GPT"]["type"] == "fallback"
+    assert groups["GPT"]["proxies"] == ["GPT-US", "GPT-SG", "GPT-JP"]
+    assert groups["GPT"]["url"] == "https://chatgpt.com/cdn-cgi/trace"
+    assert groups["GPT"]["interval"] == 300
+    assert groups["GPT"]["max-failed-times"] == 3
+    for name, region in (("GPT-US", "US"), ("GPT-SG", "SG"), ("GPT-JP", "JP")):
+        group = groups[name]
+        assert group["type"] == "fallback"
+        assert group["use"] == ["subscription"]
+        assert group["filter"] == config.REGION_FILTERS[region]
+        assert group["url"] == "https://chatgpt.com/cdn-cgi/trace"
+        assert group["expected-status"] == 200
+        assert group["interval"] == 300
+        assert group["timeout"] == 8000
+        assert group["lazy"] is False
+        assert group["max-failed-times"] == 3
+    assert "GPT" in groups["GLOBAL"]["proxies"]
+
+    rules = document["rules"]
+    assert "GEOSITE,openai,GPT" in rules
+    assert "DOMAIN-SUFFIX,chatgpt.com,GPT" in rules
+    assert "DOMAIN-SUFFIX,openai.com,GPT" in rules
+    assert "GEOSITE,openai,US-FAST" not in rules
+    gpt_index = min(
+        rules.index("GEOSITE,openai,GPT"),
+        rules.index("DOMAIN-SUFFIX,chatgpt.com,GPT"),
+        rules.index("DOMAIN-SUFFIX,openai.com,GPT"),
+    )
+    us_fast_or_proxy = [
+        index
+        for index, rule in enumerate(rules)
+        if rule.endswith(",US-FAST") or rule.endswith(",PROXY")
+    ]
+    assert gpt_index < min(us_fast_or_proxy)
+
+
+def test_us_fast_is_fallback_strict():
+    document = yaml.safe_load(_render("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    us_fast = groups["US-FAST"]
+    assert us_fast["type"] == "fallback"
+    assert us_fast["filter"] == config.US_FILTER
+    assert us_fast["url"] == "https://www.gstatic.com/generate_204"
+    assert us_fast["interval"] == 180
+    assert us_fast["timeout"] == 5000
+    assert us_fast["lazy"] is False
+    assert us_fast["max-failed-times"] == 3
+    assert "tolerance" not in us_fast
+
+
+def test_proxy_select_has_no_raw_nodes_and_store_selected_false():
+    document = yaml.safe_load(_render("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    proxy = groups["PROXY"]
+    assert proxy["type"] == "select"
+    assert "use" not in proxy
+    assert proxy["proxies"] == ["AUTO-FOREIGN", "US-FAST", "DIRECT"]
+    assert document["profile"]["store-selected"] is False
+
+    proxy["use"] = ["subscription"]
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+
+def test_fake_ip_range_avoids_198_18():
+    import ipaddress
+
+    document = yaml.safe_load(_render("tun"))
+    assert document["dns"]["fake-ip-range"] == "198.19.0.1/16"
+    network = ipaddress.ip_network(document["dns"]["fake-ip-range"], strict=False)
+    assert not network.overlaps(ipaddress.ip_network("198.18.0.0/16"))
+
+    mixed = yaml.safe_load(_render("mixed"))
+    assert "fake-ip-range" not in mixed["dns"]
+
+    document["dns"]["fake-ip-range"] = "198.18.0.1/16"
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")

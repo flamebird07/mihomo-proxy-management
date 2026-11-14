@@ -12,8 +12,13 @@ Invariants:
   it; ``state/`` only holds this project's secret/deployment/backup files;
 * TUN is only claimed when the process, the controller and an injected
   interface/route probe agree;
-* a TUN failure is a transaction: snapshot the system proxy, render mixed,
-  verify the core is healthy, and only then point the system proxy at it;
+* a start failure is a transaction: stop the core (``bootout`` + persistent
+  ``disable``), restore the proxy snapshot and report ``FAILED``.  There is no
+  automatic switch to mixed mode and never a system-proxy takeover: mixed is
+  only used when the operator explicitly asks for it
+  (``configure --mode mixed`` + ``start --mode mixed``);
+* an external VPN (Nextin) that already owns routing/DNS is a hard stop: the
+  core is not started and mixed is not used as a way around it;
 * ``stop`` always restores the proxy snapshot and only deletes it after a
   successful read-back;
 * every printed line is sanitised.
@@ -28,7 +33,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, NoReturn, TextIO
 
 from mpm_common import policy
 from mpm_common.atomicio import (
@@ -58,6 +63,7 @@ from mpm_common.platforms import PlatformFacts
 from mpm_common.sanitize import HOST, sanitize
 
 from . import config as config_mod
+from . import conflict as conflict_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
 from .launchdctl import Launchd
@@ -82,6 +88,8 @@ SUBCOMMANDS = (
     "status",
     "health",
     "uninstall",
+    "switch",
+    "probe",
 )
 
 STATE_SCHEMA = 1
@@ -259,8 +267,10 @@ def load_secrets(
         minutes = int(interval)
     except ValueError as exc:
         raise FailClosed("SUBSCRIPTION_INTERVAL must be an integer number of minutes") from exc
-    if minutes < 0:
-        raise FailClosed("SUBSCRIPTION_INTERVAL must not be negative")
+    if minutes <= 0:
+        # A zero interval would be silently clamped to the 3600 s floor, which
+        # hides the "minutes written into a seconds field" class of mistake.
+        raise FailClosed("SUBSCRIPTION_INTERVAL must be at least 1 minute")
     return Secrets(subscription_url=url, controller_secret=secret, interval_minutes=minutes)
 
 
@@ -338,6 +348,7 @@ class Context:
     validator: Callable[[str], None] | None = None
     proxy: NetworkProxy | None = None
     tun_observer: Callable[[], TunObservation] | None = None
+    conflict_detector: Callable[[], "conflict_mod.ConflictReport"] | None = None
     sleeper: Callable[[float], None] = time.sleep
     system_profile: bool = True
     dry_run: bool = False
@@ -361,8 +372,9 @@ class Context:
         """The single lock serialising every state-changing command.
 
         Only the CLI entry point acquires it; the lifecycle functions it calls
-        (``install`` -> ``start`` -> ``_fallback_to_mixed``) never re-acquire,
-        so there is no re-entrant flock and therefore no self-deadlock.
+        (``install`` -> ``start``, ``switch`` -> ``start`` -> ``stop``) never
+        re-acquire, so there is no re-entrant flock and therefore no
+        self-deadlock.
         """
         return FileLock(self.layout.lifecycle_lock, label="lifecycle", flock=self.flock)
 
@@ -381,6 +393,11 @@ class Context:
         if self.tun_observer is not None:
             return self.tun_observer()
         return observe_tun(self.executor)
+
+    def conflicts(self) -> "conflict_mod.ConflictReport":
+        if self.conflict_detector is not None:
+            return self.conflict_detector()
+        return conflict_mod.detect(self.executor)
 
     def secrets(self) -> Secrets:
         return load_secrets(
@@ -525,15 +542,28 @@ def _install_cli(ctx: Context) -> None:
     source = os.path.join(_source_dir(), "bin", "mihomo-proxy-management")
     if not os.path.isfile(source):
         if os.path.isfile(layout.cli_entry):
-            return  # installed copy is already in place
-        raise FailClosed(f"CLI wrapper source is missing: {source}")
-    payload = read_text_strict(source)
-    payload = payload.replace("__PACKAGE_DIR__", layout.share_python).replace(
+            pass  # installed copy is already in place
+        else:
+            raise FailClosed(f"CLI wrapper source is missing: {source}")
+    else:
+        payload = read_text_strict(source)
+        payload = payload.replace("__PACKAGE_DIR__", layout.share_python).replace(
+            "__PYTHON__", ctx.python
+        )
+        if not is_noop(layout.cli_entry, payload, mode=0o755):
+            write_atomic(layout.cli_entry, payload, mode=0o755)
+
+    switch_source = os.path.join(_source_dir(), "bin", "mpm-switch")
+    if not os.path.isfile(switch_source):
+        if os.path.isfile(layout.switch_entry):
+            return
+        raise FailClosed(f"mpm-switch wrapper source is missing: {switch_source}")
+    switch_payload = read_text_strict(switch_source)
+    switch_payload = switch_payload.replace("__PACKAGE_DIR__", layout.share_python).replace(
         "__PYTHON__", ctx.python
     )
-    if is_noop(layout.cli_entry, payload, mode=0o755):
-        return
-    write_atomic(layout.cli_entry, payload, mode=0o755)
+    if not is_noop(layout.switch_entry, switch_payload, mode=0o755):
+        write_atomic(layout.switch_entry, switch_payload, mode=0o755)
 
 
 _RUNNER_WRAPPER = """#!/bin/sh
@@ -795,6 +825,18 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
     else:
         report.add("LaunchDaemon plist unchanged")
 
+    # KeepAlive{SuccessfulExit:false} implies RunAtLoad, so the plist alone
+    # would start mihomo at every boot - exactly the 2026-11-14 outage.  The
+    # persistent launchd override is the only reliable "do not auto-start".
+    launchd = ctx.launchd()
+    launchd.disable()
+    if not launchd.is_disabled():
+        raise FailClosed(
+            "install finished but the LaunchDaemon is not disabled; refusing to "
+            "leave a service that would start at boot"
+        )
+    report.add("LaunchDaemon disabled: it does not start at boot (use mpm-switch mihomo)")
+
     if skip_start:
         report.status = "OK"
         report.add("install complete; service not started (--no-start)")
@@ -805,9 +847,10 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
     report.data["start"] = start_report.status
     report.messages.extend(start_report.messages)
     report.warnings.extend(start_report.warnings)
-    if start_report.status == "DEGRADED":
-        report.add("DEGRADED: TUN failed; running mixed-port with the system proxy set")
-    if not quiet:
+    if start_report.status == "FAILED":
+        report.exit_code = start_report.exit_code
+        report.warn("install finished but the core could not be started")
+    elif not quiet:
         report.add("installed; management CLI at " + layout.cli_entry)
     return report
 
@@ -815,29 +858,281 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
 # ---- start / stop / restart ----------------------------------------------
 
 
-def _stop_core(ctx: Context) -> None:
+@dataclass
+class StopOutcome:
+    """What a stop actually achieved; only ``safe`` allows Nextin.
+
+    ``disabled``  - the ``launchctl disable`` command returned success;
+    ``disabled_confirmed`` - ``launchctl print-disabled`` read the override back;
+    ``stopped``   - the job is confirmed not running;
+    ``orphan_free`` - no listener owned by *this project* on 7890/9090 and no
+                      utun still carrying a 198.19/16 address while a project
+                      core process runs (foreign owners such as Nextin's
+                      ``ProxyTunnel`` do not count);
+    ``warnings``  - non-fatal observations (e.g. an unidentifiable leftover
+                    that a fully confirmed stop allows past).
+    An unknown answer (command failure) is a failure, never a confirmation.
+    """
+
+    bootout: bool = False
+    disabled: bool = False
+    disabled_confirmed: bool = False
+    stopped: bool = False
+    orphan_free: bool = True
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def safe(self) -> bool:
+        """True only when the job cannot come back at boot *and* is not running."""
+        return self.disabled and self.disabled_confirmed and self.stopped and self.orphan_free
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bootout": self.bootout,
+            "disabled": self.disabled,
+            "disabled_confirmed": self.disabled_confirmed,
+            "stopped": self.stopped,
+            "orphan_free": self.orphan_free,
+            "safe": self.safe,
+            "errors": [HOST.text(item) for item in self.errors],
+            "warnings": [HOST.text(item) for item in self.warnings],
+        }
+
+
+def _orphan_core_problems(
+    ctx: Context, *, confirmed_stopped: bool
+) -> tuple[list[str], list[str]]:
+    """Evidence that *this project's* mihomo still owns routing after a stop.
+
+    Only resources confirmed to belong to the project count: a listener on
+    7890/9090 must be the launchd PID or run the fixed executable path
+    (``conflict.port_owner_identity``) - Nextin's ``ProxyTunnel`` and any
+    other software may own the ports legitimately.  A 198.19/16 utun counts
+    only while a project core process is alive (``pgrep -f`` of the fixed
+    executable path, or the launchd PID).  When identity cannot be
+    determined, a fully confirmed stop (launchd stopped, disable read back
+    true, no project executable running) still allows the rollback with a
+    warning: the machine must never be left offline by an unattributable
+    leftover.  A failed or unreadable check is a problem (unknown is never
+    "clean").
+
+    Returns ``(problems, warnings)``; only ``problems`` block the rollback.
+    """
+    problems: list[str] = []
+    warnings: list[str] = []
+    job_pid = conflict_mod.launchd_pid(ctx.executor)
+    core_state: str | None = None  # computed lazily, at most once
+
+    def core_state_once() -> str:
+        nonlocal core_state
+        if core_state is None:
+            core_state = conflict_mod.project_core_state(ctx.executor, job_pid=job_pid)
+        return core_state
+
+    for port in conflict_mod.PROJECT_PORTS:
+        try:
+            result = ctx.executor.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"]
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown is not clean
+            problems.append(f"port {port}: lsof failed: {_failure_reason(exc)}")
+            continue
+        if result.returncode not in (0, 1):
+            # lsof exits 1 when nothing listens: that is "no owner".
+            problems.append(f"port {port}: lsof failed (rc={result.returncode})")
+            continue
+        for owner in conflict_mod.parse_lsof_listeners(result.stdout or "", port):
+            identity = conflict_mod.port_owner_identity(
+                ctx.executor, owner, job_pid=job_pid
+            )
+            if identity == "project":
+                problems.append(
+                    f"port {port} is still listening after stop "
+                    f"(pid {owner.pid} runs the project mihomo)"
+                )
+            elif identity == "unknown":
+                if confirmed_stopped and core_state_once() == "stopped":
+                    warnings.append(
+                        f"port {port} is held by pid {owner.pid}, which cannot be "
+                        "identified; mihomo is confirmed stopped and disabled, so it "
+                        "is treated as foreign and Nextin may start"
+                    )
+                else:
+                    problems.append(
+                        f"port {port} is held by pid {owner.pid} and the process "
+                        "identity cannot be determined"
+                    )
+            # "foreign": another program owns the port, not our leftover.
+    try:
+        result = ctx.executor.run(["ifconfig"])
+    except Exception as exc:  # noqa: BLE001 - unknown is not clean
+        problems.append("interfaces unreadable: " + _failure_reason(exc))
+        return problems, warnings
+    if result.returncode != 0:
+        problems.append(f"ifconfig failed (rc={result.returncode})")
+        return problems, warnings
+    for name, address in conflict_mod.parse_utun_addresses(result.stdout or ""):
+        if not conflict_mod.in_project_block(address):
+            continue
+        state = core_state_once()
+        if state == "running":
+            problems.append(
+                f"utun {name} still holds project address {address} (198.19/16) "
+                "and the project core is running"
+            )
+        elif state == "stopped":
+            warnings.append(
+                f"utun {name} holds a 198.19/16 address but no project core "
+                "process is running; it is not treated as an orphan core"
+            )
+        else:
+            problems.append(
+                f"utun {name} holds project address {address} (198.19/16) and the "
+                "project core state is unknown"
+            )
+    return problems, warnings
+
+
+def _raise_unsafe(outcome: StopOutcome) -> NoReturn:
+    failure = NotReady("; ".join(outcome.errors) or "could not confirm the core stopped")
+    failure.stop_outcome = outcome  # type: ignore[attr-defined]
+    raise failure
+
+
+def _stop_core(ctx: Context) -> StopOutcome:
+    """bootout + persistent disable: a stopped core never comes back at boot.
+
+    ``disable`` runs even when ``bootout`` fails (``finally``): leaving the job
+    enabled while something else takes over the routes is the 2026-11-14
+    dual-stack state.  The disable override is read back via
+    ``launchctl print-disabled`` and the port/utun checks only count
+    resources that belong to *this project*.
+    Every step is recorded separately, and the caller may only hand the
+    machine to Nextin when :attr:`StopOutcome.safe` is true.
+    """
     launchd = ctx.launchd()
-    launchd.bootout()
-    if not launchd.wait_stopped():
-        raise NotReady("the core is still running after launchctl bootout")
+    outcome = StopOutcome()
+    try:
+        launchd.bootout()
+        outcome.bootout = True
+    except Exception as exc:  # noqa: BLE001 - keep going: disable still matters
+        outcome.errors.append("bootout: " + _failure_reason(exc))
+    finally:
+        try:
+            launchd.disable()
+            outcome.disabled = True
+        except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+            outcome.errors.append("disable: " + _failure_reason(exc))
+    try:
+        outcome.disabled_confirmed = launchd.is_disabled()
+        if not outcome.disabled_confirmed:
+            outcome.errors.append("disable override is not active")
+    except Exception as exc:  # noqa: BLE001 - unreadable override is a failure
+        outcome.errors.append("disable readback: " + _failure_reason(exc))
+    try:
+        outcome.stopped = launchd.wait_stopped()
+    except Exception as exc:  # noqa: BLE001
+        outcome.stopped = False
+        outcome.errors.append("wait-stopped: " + _failure_reason(exc))
+    if not outcome.stopped:
+        outcome.errors.append("the core is still running after launchctl bootout")
+    problems, warnings = _orphan_core_problems(
+        ctx, confirmed_stopped=outcome.stopped and outcome.disabled_confirmed
+    )
+    outcome.orphan_free = not problems
+    outcome.errors.extend(problems)
+    outcome.warnings.extend(warnings)
+    if not outcome.safe:
+        _raise_unsafe(outcome)
+    return outcome
+
+
+def _stop_unloaded(ctx: Context) -> StopOutcome:
+    """The same guarantees as :func:`_stop_core`, for a job that is not loaded.
+
+    Even a stopped-but-not-loaded job must stay disabled (a stale ``enable``
+    would let the next boot start it), the answer is read back, and the
+    port/utun checks catch a *project* core that runs orphaned without
+    launchd.
+    """
+    launchd = ctx.launchd()
+    outcome = StopOutcome()
+    try:
+        launchd.disable()
+        outcome.disabled = True
+    except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+        outcome.errors.append("disable: " + _failure_reason(exc))
+    try:
+        outcome.disabled_confirmed = launchd.is_disabled()
+        if not outcome.disabled_confirmed:
+            outcome.errors.append("disable override is not active")
+    except Exception as exc:  # noqa: BLE001 - unreadable override is a failure
+        outcome.errors.append("disable readback: " + _failure_reason(exc))
+    try:
+        outcome.stopped = launchd.wait_stopped()
+    except Exception as exc:  # noqa: BLE001
+        outcome.stopped = False
+        outcome.errors.append("wait-stopped: " + _failure_reason(exc))
+    problems, warnings = _orphan_core_problems(
+        ctx, confirmed_stopped=outcome.stopped and outcome.disabled_confirmed
+    )
+    outcome.orphan_free = not problems
+    outcome.errors.extend(problems)
+    outcome.warnings.extend(warnings)
+    if not outcome.safe:
+        _raise_unsafe(outcome)
+    return outcome
 
 
 def _readiness(ctx: Context, secrets: Secrets) -> str:
     return readiness(ctx.controller(secrets.controller_secret), sleeper=ctx.sleeper)
 
 
-def _health_check(ctx: Context, secrets: Secrets, *, mode: str) -> HealthReport:
-    """The shared verdict: provider healthcheck plus at least one live node.
+#: Groups that must have at least one live node before a start counts as good.
+REQUIRED_HEALTHY_GROUPS = ("AUTO-FOREIGN", "GPT")
 
-    Same code path as ``status``/``health``, so a mode is never declared usable
-    on a weaker check than the one the operator sees later.
+
+def _group_liveness(client: ControllerClient) -> dict[str, bool | None]:
+    """``alive`` flag of the routing groups (``None`` when not reported)."""
+    try:
+        payload = client.proxies()
+    except (ControllerError, FailClosed):
+        return {name: None for name in REQUIRED_HEALTHY_GROUPS}
+    proxies = payload.get("proxies") if isinstance(payload, dict) else None
+    if not isinstance(proxies, dict):
+        return {name: None for name in REQUIRED_HEALTHY_GROUPS}
+    result: dict[str, bool | None] = {}
+    for name in REQUIRED_HEALTHY_GROUPS:
+        info = proxies.get(name)
+        if isinstance(info, dict) and "alive" in info:
+            result[name] = bool(info["alive"])
+        else:
+            result[name] = None
+    return result
+
+
+def _health_check(ctx: Context, secrets: Secrets, *, mode: str) -> HealthReport:
+    """Provider health plus live routing groups (AUTO-FOREIGN and GPT).
+
+    The provider check alone is not enough: a provider can have live nodes
+    while both routing groups are empty, which is exactly how PROXY ended up
+    stuck on a dead node.  A missing/unknown group verdict fails closed.
     """
-    return evaluate(
-        ctx.controller(secrets.controller_secret),
-        provider=config_mod.PROVIDER_NAME,
-        mode=mode,
-        running=True,
-    )
+    client = ctx.controller(secrets.controller_secret)
+    verdict = evaluate(client, provider=config_mod.PROVIDER_NAME, mode=mode, running=True)
+    if not verdict.ok:
+        return verdict
+    groups = _group_liveness(client)
+    verdict.data["groups"] = {name: value for name, value in groups.items()}
+    empty = [name for name, alive in groups.items() if not alive]
+    if empty:
+        reasons = list(verdict.reasons)
+        for name in empty:
+            state = "has no live node" if groups[name] is False else "liveness is unknown"
+            reasons.append(f"group {name} {state}")
+        return HealthReport(HEALTH_FAILED, reasons, verdict.data)
+    return verdict
 
 
 def _health_failure(verdict: HealthReport, *, mode: str) -> str:
@@ -863,26 +1158,70 @@ def _restore_proxy_if_any(ctx: Context) -> list[str]:
     return restored
 
 
-def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Report:
-    """Transaction: snapshot -> mixed config -> healthy core -> system proxy."""
-    layout = ctx.layout
-    report = Report(command="start", status="DEGRADED")
+def _require_no_conflict(ctx: Context) -> None:
+    """Refuse to start a second network stack (Nextin etc.)."""
+    verdict = ctx.conflicts()
+    if not verdict.ok:
+        raise FailClosed(conflict_mod.describe(verdict))
+
+
+def _failed_start(
+    ctx: Context, report: Report, reason: str, *, target_mode: str = "tun"
+) -> Report:
+    """Stop, restore the proxy snapshot, and report FAILED.
+
+    This deliberately does **not** fall back to mixed mode: the 2026-11-14
+    outage was made worse by silently taking over the system proxy.
+    """
+    report.status = "FAILED"
+    report.exit_code = int(ExitCode.NOT_READY)
     report.warn(reason)
-    report.add("TUN unavailable: falling back to mixed-port mode")
-
-    # a leftover snapshot means an earlier fallback was interrupted
-    _restore_proxy_if_any(ctx)
-    _stop_core(ctx)
-
-    proxy = ctx.proxy_client()
-    snapshot = proxy.snapshot()
-    save_snapshot(layout.network_backup, snapshot)
-    _own(ctx, layout.network_backup)
-
+    report.add("start failed; mihomo was stopped (no mixed-mode/system-proxy fallback)")
     try:
-        configure(ctx, quiet=True, mode="mixed")
-        launchd = ctx.launchd()
-        launchd.bootstrap()
+        _stop_core(ctx)
+    except Exception as exc:  # noqa: BLE001 - report the original failure first
+        report.warn("stop after failure failed: " + _failure_reason(exc))
+    try:
+        restored = _restore_proxy_if_any(ctx)
+        if restored:
+            report.add("restored the system proxy on: " + ", ".join(restored))
+    except Exception as exc:  # noqa: BLE001
+        report.warn("proxy restore after failure failed: " + _failure_reason(exc))
+    state = load_state(ctx.layout) or DeploymentState()
+    if target_mode == "mixed":
+        # The live config is mixed, but a failed mixed start must not make the
+        # next plain ``start`` (TUN) reuse it.
+        try:
+            configure(ctx, quiet=True, mode="tun")
+            state.mode = "tun"
+        except Exception as exc:  # noqa: BLE001 - stopped is still safe
+            report.warn("could not restore the TUN config after failure: " + _failure_reason(exc))
+    else:
+        state.mode = "tun"
+    state.degraded = False
+    state.tun_ok = False
+    state.reasons = [HOST.text(reason)]
+    state.services = []
+    _save_state(ctx, state)
+    return report
+
+
+def _start_mixed(ctx: Context, report: Report, *, quiet: bool = False) -> Report:
+    """Explicit mixed mode: the only path that touches the system proxy."""
+    layout = ctx.layout
+    proxy = ctx.proxy_client()
+    launchd = ctx.launchd()
+    modified: list[str] = []
+    try:
+        snapshot = proxy.snapshot()
+        save_snapshot(layout.network_backup, snapshot)
+        _own(ctx, layout.network_backup)
+
+        launchd.enable()
+        if launchd.state().loaded:
+            launchd.kickstart()
+        else:
+            launchd.bootstrap()
         if not launchd.wait_running():
             raise NotReady("mixed-mode core did not reach running state")
         secrets = ctx.secrets()
@@ -890,48 +1229,50 @@ def _fallback_to_mixed(ctx: Context, reason: str, *, quiet: bool = False) -> Rep
         verdict = _health_check(ctx, secrets, mode="mixed")
         report.data["health"] = verdict.to_dict()
         if not verdict.ok:
-            # fail closed: never point the system proxy at an unhealthy core
             raise NotReady(_health_failure(verdict, mode="mixed"))
         modified = proxy.apply(snapshot)
         snapshot.stage = STAGE_APPLIED
         save_snapshot(layout.network_backup, snapshot, overwrite=True)
         _own(ctx, layout.network_backup)
-    except Exception:
-        # roll back; a failure here keeps the snapshot for the next run
-        try:
-            _stop_core(ctx)
-        except Exception:
-            pass
-        try:
-            proxy.restore(snapshot)
-            if snapshot_exists(layout.network_backup):
-                os.unlink(layout.network_backup)
-        except Exception:
-            pass
-        raise
+        # Same transaction rule as TUN: a job left enabled would auto-start at
+        # the next boot and race the VPN.
+        launchd.disable()
+        if not launchd.is_disabled():
+            raise NotReady(
+                "the persistent disable override did not take effect after start"
+            )
+    except (MpmError, ControllerError, NetworkProxyError, OSError) as exc:
+        # _failed_start stops the core and restores (then deletes) the snapshot
+        return _failed_start(ctx, report, _failure_reason(exc), target_mode="mixed")
 
     state = load_state(layout) or DeploymentState()
     state.mode = "mixed"
     state.degraded = True
     state.tun_ok = False
-    state.reasons = [HOST.text(reason)]
+    state.reasons = ["explicit mixed mode (configure --mode mixed)"]
     state.services = list(modified)
     _save_state(ctx, state)
 
+    report.status = "DEGRADED"
     report.data["mode"] = "mixed"
     report.data["services"] = list(modified)
     ctx.shout(
-        "DEGRADED: TUN failed, running mixed-port 127.0.0.1:7890; "
-        "system proxy set on: " + ", ".join(modified)
+        "mixed mode requested explicitly: 127.0.0.1:7890; system proxy set on: "
+        + ", ".join(modified)
     )
     if not quiet:
         report.add("mixed mode active; `stop` restores the saved proxy settings")
     return report
 
 
-def start(ctx: Context, *, quiet: bool = False) -> Report:
+def start(ctx: Context, *, quiet: bool = False, mode: str | None = None) -> Report:
+    """Start the core.  TUN by default; mixed only when explicitly requested."""
     report = Report(command="start")
     layout = ctx.layout
+    target_mode = mode or "tun"
+    if target_mode not in ("tun", "mixed"):
+        raise FailClosed(f"unknown start mode '{target_mode}' (expected tun or mixed)")
+
     check = preflight_mod.preflight(ctx.facts)
     for warning in check.warnings:
         report.warn(warning)
@@ -940,37 +1281,54 @@ def start(ctx: Context, *, quiet: bool = False) -> Report:
     current = launchd.state()
     state = load_state(layout) or DeploymentState()
 
+    if not os.path.isfile(layout.plist):
+        raise FailClosed("LaunchDaemon plist is not installed; run install first")
+
+    # Before any launchd action: a connected Nextin (or any foreign port /
+    # default utun) means starting mihomo would split routes and DNS.  This is
+    # checked even when the core is already running: that is exactly the
+    # dual-stack state the 2026-11-14 outage left behind.
+    _require_no_conflict(ctx)
+
     if current.running:
+        # A boot-started core (or a previous start) must not come back at the
+        # next boot either.  Same readback rule as the fresh paths below: an
+        # override that cannot be confirmed is a failed start, and the safety
+        # stop transaction runs instead of returning a false UNCHANGED.
+        try:
+            launchd.disable()
+            if not launchd.is_disabled():
+                raise NotReady(
+                    "the persistent disable override did not take effect after start"
+                )
+        except (MpmError, ControllerError, NetworkProxyError, OSError) as exc:
+            return _failed_start(ctx, report, _failure_reason(exc), target_mode=target_mode)
         report.status = "UNCHANGED"
-        if state.degraded:
+        if state.degraded and target_mode == "mixed":
             report.status = "DEGRADED"
             report.warn("; ".join(state.reasons) or "degraded mode recorded")
         if not quiet:
             report.add("core already running; no second instance started")
         return report
 
-    if not os.path.isfile(layout.plist):
-        raise FailClosed("LaunchDaemon plist is not installed; run install first")
-
-    # An unfinished proxy transaction (interrupted fallback) is restored before
-    # a fresh TUN attempt, so the host never starts from a half-applied state.
+    # An unfinished proxy transaction (from an older mixed session) is
+    # restored before a fresh attempt, so the host never starts half-applied.
     restored = _restore_proxy_if_any(ctx)
     if restored:
         report.add("restored an unfinished proxy transaction: " + ", ".join(restored))
 
-    if not os.path.isfile(layout.config):
-        configure(ctx, quiet=True)
+    if not os.path.isfile(layout.config) or state.mode != target_mode:
+        configure(ctx, quiet=True, mode=target_mode)
 
-    # A previous fallback left a mixed config behind.  Every explicit start
-    # retries TUN; the fallback is a runtime decision, not a permanent policy.
-    if state.mode == "mixed":
-        configure(ctx, quiet=True, mode="tun")
+    if target_mode == "mixed":
+        return _start_mixed(ctx, report, quiet=quiet)
 
     before = ctx.tun()
     after = before
     version = ""
     failure = ""
     try:
+        launchd.enable()
         if current.loaded:
             launchd.kickstart()
         else:
@@ -992,13 +1350,23 @@ def start(ctx: Context, *, quiet: bool = False) -> Report:
             raise NotReady(
                 "mihomo did not establish a utun interface or take over the default route"
             )
+
+        # The job stays loaded and running; only future loads (next boot) are
+        # disabled.  A crash in this boot session is still restarted by
+        # KeepAlive.  This is part of the transaction: a job left *enabled*
+        # after a successful start would come back at the next boot, which is
+        # the outage this project exists to prevent.  An unreadable override is
+        # a failure, never a confirmation.
+        launchd.disable()
+        if not launchd.is_disabled():
+            raise NotReady(
+                "the persistent disable override did not take effect after start"
+            )
     except (MpmError, ControllerError, NetworkProxyError, OSError) as exc:
-        # launch, readiness, health and utun verification are one transaction:
-        # every one of them failing leads to the same mixed-port fallback.
         failure = _failure_reason(exc)
 
     if failure:
-        return _fallback_to_mixed(ctx, failure, quiet=quiet)
+        return _failed_start(ctx, report, failure)
 
     state.mode = "tun"
     state.degraded = False
@@ -1008,17 +1376,53 @@ def start(ctx: Context, *, quiet: bool = False) -> Report:
     _save_state(ctx, state)
     report.data["mode"] = "tun"
     report.data["tun"] = after.to_dict()
+    report.data["new_utun_interfaces"] = [
+        name
+        for name in after.interfaces
+        if name not in before.interfaces and name.startswith("utun")
+    ]
     if not quiet:
         report.add(f"active in TUN mode, controller ready (mihomo {version})")
+        report.add("LaunchDaemon disabled: the next boot starts with Nextin, not mihomo")
     return report
 
 
 def stop(ctx: Context, *, quiet: bool = False) -> Report:
+    """Stop the core and confirm it: disable + readback + stopped + no orphan.
+
+    Always returns a structured :class:`StopOutcome` in ``data["stop_outcome"]``;
+    when the core is not confirmed stopped *and* disabled the report is
+    ``FAILED`` and callers must not hand the machine to Nextin.
+    """
     report = Report(command="stop")
     launchd = ctx.launchd()
     state = launchd.state()
-    if state.loaded:
-        _stop_core(ctx)
+    outcome: StopOutcome | None = None
+    try:
+        outcome = _stop_core(ctx) if state.loaded else _stop_unloaded(ctx)
+    except NotReady as exc:
+        attached = getattr(exc, "stop_outcome", None)
+        if attached is None:
+            raise
+        outcome = attached
+    assert outcome is not None  # narrow for the type checker
+    report.data["stop_outcome"] = outcome.to_dict()
+    report.warnings.extend(outcome.warnings)
+
+    if not outcome.safe:
+        report.status = "FAILED"
+        report.exit_code = int(ExitCode.NOT_READY)
+        for error in outcome.errors:
+            report.warn("stop not confirmed: " + error)
+        report.warn(
+            "mihomo is not confirmed stopped and disabled; do not connect Nextin yet"
+        )
+        report.warn(
+            "resolve the leftover core (listeners on ports 7890/9090, a utun with a "
+            "198.19/16 address), then run `mpm-switch nextin` again or handle it manually"
+        )
+        return report
+
     restored = _restore_proxy_if_any(ctx)
     if restored:
         report.add("system proxy restored on: " + ", ".join(restored))
@@ -1036,7 +1440,14 @@ def stop(ctx: Context, *, quiet: bool = False) -> Report:
 
 def restart(ctx: Context, *, quiet: bool = False) -> Report:
     report = Report(command="restart")
-    stop(ctx, quiet=True)
+    stopped = stop(ctx, quiet=True)
+    outcome = stopped.data.get("stop_outcome") or {}
+    if stopped.status == "FAILED" or not outcome.get("safe"):
+        report.status = "FAILED"
+        report.exit_code = int(ExitCode.NOT_READY)
+        report.warn("stop did not confirm a stopped and disabled core; not restarting")
+        report.warnings.extend(stopped.warnings)
+        return report
     started = start(ctx, quiet=True)
     report.status = started.status
     report.data.update(started.data)
@@ -1143,7 +1554,13 @@ def health(ctx: Context) -> Report:
 def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Report:
     report = Report(command="uninstall")
     layout = ctx.layout
-    stop(ctx, quiet=True)
+    stopped = stop(ctx, quiet=True)
+    if stopped.status == "FAILED":
+        report.warn("stop did not fully confirm; uninstall continues but check for an orphan core")
+    # ``stop`` already disables (and reads the override back); repeat explicitly
+    # so uninstall never leaves an enabled override behind even if the job was
+    # not loaded.
+    ctx.launchd().disable()
 
     removed: list[str] = []
 
@@ -1155,6 +1572,7 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
 
     discard(layout.plist)
     discard(layout.cli_entry)
+    discard(layout.switch_entry)
     discard(layout.libexec)
     discard(layout.share)
     if purge:

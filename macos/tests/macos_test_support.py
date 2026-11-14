@@ -24,6 +24,7 @@ from mpm_common.controller_health import ControllerError
 from mpm_common.executor import FakeExecutor
 from mpm_common.platforms import PlatformFacts
 from mpm_macos import lifecycle
+from mpm_macos.conflict import ConflictReport
 from mpm_macos.lifecycle import TunObservation
 from mpm_macos.locking import LOCK_UN
 from mpm_macos.paths import Layout
@@ -32,7 +33,18 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_TEMPLATE = ROOT / "config" / "config.yaml.template"
 PLIST_TEMPLATE = ROOT / "macos" / "templates" / "com.mihomo-proxy-management.core.plist.template"
 
-ALL_COMMANDS = ("launchctl", "networksetup", "mihomo", "caffeinate", "ifconfig", "route")
+ALL_COMMANDS = (
+    "launchctl",
+    "networksetup",
+    "mihomo",
+    "caffeinate",
+    "ifconfig",
+    "route",
+    "scutil",
+    "lsof",
+    "osascript",
+    "curl",
+)
 
 
 def assert_posix_mode(path, expected: int) -> None:
@@ -65,11 +77,17 @@ class FakeController:
         node_count: int = 3,
         alive: int = 3,
         reachable: bool = True,
+        group_alive: dict | None = None,
     ) -> None:
         self._version = version
         self._node_count = node_count
         self._alive = alive
         self._reachable = reachable
+        self.group_alive = (
+            dict(group_alive)
+            if group_alive is not None
+            else {"AUTO-FOREIGN": True, "GPT": True}
+        )
         self.healthchecks: list[str] = []
 
     def version(self) -> dict:
@@ -92,12 +110,13 @@ class FakeController:
         return {"providers": {"subscription": {"all": nodes}}}
 
     def proxies(self) -> dict:
-        return {
-            "proxies": {
-                f"node-{index}": {"alive": index < self._alive}
-                for index in range(self._node_count)
-            }
+        proxies = {
+            f"node-{index}": {"alive": index < self._alive}
+            for index in range(self._node_count)
         }
+        for name, alive in self.group_alive.items():
+            proxies[name] = {"alive": alive, "type": "Fallback"}
+        return {"proxies": proxies}
 
 
 class FakePopen:
@@ -139,14 +158,18 @@ class LaunchdHarness:
         self.executor = executor
         self.loaded = False
         self.running = False
+        self.disabled = True
         self.pid: int | None = None
         #: bootstrap/kickstart calls that load the job but leave it stopped,
         #: so ``wait_running`` times out (a start failure without a crash).
         self.start_failures = 0
         executor.set("launchctl print", self._print)
+        executor.set("launchctl print-disabled", self._print_disabled)
         executor.set("launchctl bootstrap", self._bootstrap)
         executor.set("launchctl bootout", self._bootout)
         executor.set("launchctl kickstart", self._kickstart)
+        executor.set("launchctl enable", self._enable)
+        executor.set("launchctl disable", self._disable)
 
     def _print(self, argv):
         if not self.loaded:
@@ -154,6 +177,20 @@ class LaunchdHarness:
         if self.running:
             return (0, f"state = running\n\tpid = {self.pid or 4242}\n", "")
         return (0, "state = not running\n\tlast exit code = 0\n", "")
+
+    def _print_disabled(self, argv):
+        entry = (
+            '\t"com.mihomo-proxy-management.core" => disabled\n' if self.disabled else ""
+        )
+        return (0, "disabled services = {\n" + entry + "}\n", "")
+
+    def _enable(self, argv):
+        self.disabled = False
+        return (0, "", "")
+
+    def _disable(self, argv):
+        self.disabled = True
+        return (0, "", "")
 
     def _start(self) -> None:
         self.loaded = True
@@ -303,10 +340,17 @@ def make_context(root, *, environ=None, **overrides) -> lifecycle.Context:
     }
     if environ:
         env.update(environ)
+    executor = overrides.pop("executor", None) or FakeExecutor()
+    # install verifies the persistent disable override; a bare FakeExecutor
+    # must answer ``print-disabled`` or every install test would fail closed.
+    executor.set(
+        "launchctl print-disabled",
+        (0, 'disabled services = {\n\t"com.mihomo-proxy-management.core" => disabled\n}\n', ""),
+    )
     values = {
         "layout": Layout(str(root)),
         "facts": darwin_facts(),
-        "executor": FakeExecutor(),
+        "executor": executor,
         "out": io.StringIO(),
         "err": io.StringIO(),
         "environ": env,
@@ -315,6 +359,7 @@ def make_context(root, *, environ=None, **overrides) -> lifecycle.Context:
         "sleeper": lambda _seconds: None,
         "validator": lambda _text: None,
         "tun_observer": lambda: lifecycle.TunObservation(("en0",), "en0"),
+        "conflict_detector": lambda: ConflictReport(ok=True),
     }
     values.update(overrides)
     return lifecycle.Context(**values)

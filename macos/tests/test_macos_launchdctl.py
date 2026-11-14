@@ -160,3 +160,47 @@ def test_bootstrap_failure_is_reported(monkeypatch):
     service = _launchd(executor)
     with pytest.raises(FailClosed):
         service.bootstrap()
+
+
+def test_parse_disabled_reads_the_label_entry():
+    text = (
+        "disabled services = {\n"
+        '\t"com.example.other" => true\n'
+        f'\t"{LABEL}" => disabled\n'
+        "}\n"
+    )
+    assert launchdctl.parse_disabled(text) is True
+    assert launchdctl.parse_disabled('disabled services = {\n}\n') is False
+    assert launchdctl.parse_disabled(f'disabled services = {{\n\t"{LABEL}" => false\n}}\n') is False
+
+
+def test_enable_and_disable_use_the_fixed_label():
+    executor = FakeExecutor()
+    harness = LaunchdHarness(executor)
+    service = _launchd(executor)
+
+    service.enable()
+    assert harness.disabled is False
+    assert executor.find("launchctl", "enable").argv == [
+        "launchctl",
+        "enable",
+        f"system/{LABEL}",
+    ]
+
+    service.disable()
+    assert harness.disabled is True
+    assert executor.find("launchctl", "disable").argv == [
+        "launchctl",
+        "disable",
+        f"system/{LABEL}",
+    ]
+    assert service.is_disabled() is True
+
+
+def test_disable_failure_is_reported():
+    executor = FakeExecutor()
+    LaunchdHarness(executor)
+    executor.set("launchctl disable", (1, "", "Operation not permitted"))
+    service = _launchd(executor)
+    with pytest.raises(FailClosed):
+        service.disable()

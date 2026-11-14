@@ -16,7 +16,11 @@ KeepAlive semantics (launchd.plist(5)):
   non-zero status or is killed by a signal, and leaves it stopped after a clean
   ``exit 0``;
 * ``launchctl bootout`` removes the job entirely, so an explicit ``stop`` is
-  never raced by the restart policy.
+  never raced by the restart policy;
+* ``KeepAlive{SuccessfulExit: false}`` implies ``RunAtLoad``, so a plist alone
+  cannot keep the job off at boot.  "Do not auto-start at boot" is enforced by
+  the persistent launchd override ``launchctl disable system/<label>`` (see
+  ``lifecycle.install`` / ``lifecycle.start``), not by ``RunAtLoad``.
 """
 
 from __future__ import annotations
@@ -140,7 +144,14 @@ def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> 
     """Static audit of a parsed LaunchDaemon document."""
     _require(isinstance(document, dict), "root is not a dictionary")
     _require(document.get("Label") == label, "Label must be the project label")
-    _require(document.get("RunAtLoad") is True, "RunAtLoad must be true")
+    # ``KeepAlive{SuccessfulExit: false}`` implies RunAtLoad, so RunAtLoad alone
+    # cannot prevent a boot start.  The plist keeps ``RunAtLoad: true`` for the
+    # crash-restart semantics; boot behaviour is controlled by the persistent
+    # ``launchctl disable`` override (see the module docstring).
+    _require(
+        isinstance(document.get("RunAtLoad"), bool),
+        "RunAtLoad must be a boolean",
+    )
     _require(
         document.get("KeepAlive") == {"SuccessfulExit": False},
         "KeepAlive must be {SuccessfulExit: false} (crash-only restart)",

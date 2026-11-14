@@ -25,6 +25,9 @@ _PID = re.compile(r"^\s*pid\s*=\s*(?P<value>\d+)", re.MULTILINE)
 _LAST_EXIT = re.compile(r"^\s*last exit code\s*=\s*(?P<value>-?\d+)", re.MULTILINE)
 _PROGRAM = re.compile(r"^\s*program\s*=\s*(?P<value>.+)$", re.MULTILINE)
 _NOT_FOUND = re.compile(r"could not find service|no such process", re.IGNORECASE)
+_DISABLED_ENTRY = re.compile(
+    r'"(?P<label>[^"]+)"\s*=>\s*(?P<value>true|false|disabled|enabled)', re.IGNORECASE
+)
 
 
 def validate_label(label: str) -> str:
@@ -81,6 +84,24 @@ def parse_print(text: str, *, label: str = LABEL, returncode: int = 0) -> Launch
     )
 
 
+def parse_disabled(text: str, *, label: str = LABEL) -> bool:
+    """Parse ``launchctl print-disabled system`` for one label.
+
+    ``launchctl print-disabled system`` prints entries such as::
+
+        disabled services = {
+        \t"com.example.job" => true
+        \t"com.example.other" => disabled
+        }
+
+    A label that is absent is enabled (the launchd default).
+    """
+    for match in _DISABLED_ENTRY.finditer(text or ""):
+        if match.group("label") == label:
+            return match.group("value").lower() in ("true", "disabled")
+    return False
+
+
 class Launchd:
     """``launchctl`` operations for the fixed label only."""
 
@@ -120,6 +141,15 @@ class Launchd:
     def print_argv(self) -> list[str]:
         return ["launchctl", "print", self.service_target]
 
+    def enable_argv(self) -> list[str]:
+        return ["launchctl", "enable", self.service_target]
+
+    def disable_argv(self) -> list[str]:
+        return ["launchctl", "disable", self.service_target]
+
+    def print_disabled_argv(self) -> list[str]:
+        return ["launchctl", "print-disabled", self.domain]
+
     # ---- state ---------------------------------------------------------
     def state(self) -> LaunchdState:
         result = self.executor.run(self.print_argv())
@@ -134,6 +164,16 @@ class Launchd:
 
     def running(self) -> bool:
         return self.state().running
+
+    def is_disabled(self) -> bool:
+        """Whether the persistent launchd override disables this label."""
+        result = self.executor.run(self.print_disabled_argv())
+        if not result.ok:
+            raise FailClosed(
+                "launchctl print-disabled failed: "
+                + HOST.text((result.stderr or result.stdout or "").strip())[:200]
+            )
+        return parse_disabled((result.stdout or "") + (result.stderr or ""), label=self.label)
 
     # ---- operations ----------------------------------------------------
     def bootstrap(self) -> None:
@@ -167,6 +207,29 @@ class Launchd:
                 + HOST.text((result.stderr or result.stdout or "").strip())[:200]
             )
 
+    def enable(self) -> None:
+        """Remove the persistent disable override before an explicit start."""
+        result = self.executor.run(self.enable_argv())
+        if not result.ok:
+            raise FailClosed(
+                "launchctl enable failed: "
+                + HOST.text((result.stderr or result.stdout or "").strip())[:200]
+            )
+
+    def disable(self) -> None:
+        """Persistently disable the label: it will not load at the next boot.
+
+        An already-loaded job keeps running (``disable`` only affects future
+        loads), so a successful start can disable immediately and still be
+        restarted by ``KeepAlive`` if it crashes in this boot session.
+        """
+        result = self.executor.run(self.disable_argv())
+        if not result.ok:
+            raise FailClosed(
+                "launchctl disable failed: "
+                + HOST.text((result.stderr or result.stdout or "").strip())[:200]
+            )
+
     def wait_running(self, *, attempts: int | None = None) -> bool:
         for _ in range(attempts or self.attempts):
             if self.state().running:
@@ -186,6 +249,7 @@ __all__ = [
     "DOMAIN",
     "Launchd",
     "LaunchdState",
+    "parse_disabled",
     "parse_print",
     "validate_label",
 ]

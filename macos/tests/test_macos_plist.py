@@ -82,6 +82,17 @@ def test_keep_alive_audit_rejects_unconditional_restart():
         plist.audit(document)
 
 
+def test_audit_allows_run_at_load_false_but_keeps_keep_alive():
+    """Boot behaviour comes from ``launchctl disable``, not RunAtLoad."""
+    document = plistlib.loads(_rendered().encode("utf-8"))
+    document["RunAtLoad"] = False
+    result = plist.audit(document)
+    assert result["keep_alive"] == {"SuccessfulExit": False}
+    document["KeepAlive"] = True
+    with pytest.raises(FailClosed):
+        plist.audit(document)
+
+
 def test_audit_rejects_missing_throttle():
     document = plistlib.loads(_rendered().encode("utf-8"))
     document.pop("ThrottleInterval")

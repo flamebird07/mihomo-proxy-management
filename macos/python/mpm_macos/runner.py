@@ -10,8 +10,13 @@ launchd restarts this job when it exits non-zero (``KeepAlive =
 * the runner itself is ``SIGKILL``-ed -> launchd sees an unsuccessful exit and
   restarts the job (the core lock is released by the kernel when the process
   dies, so the new instance can acquire it);
-* an explicit ``stop`` uses ``launchctl bootout``, which removes the job, so
-  the restart policy cannot race it.
+* an external VPN/route conflict (Nextin still connected) -> the runner prints
+  the reason and exits ``0`` *without spawning mihomo*: launchd treats that as
+  a successful exit and does not restart in a loop.  A broken check is treated
+  as a conflict (fail-safe);
+* an explicit ``stop`` uses ``launchctl bootout`` plus ``launchctl disable``,
+  which removes the job and keeps it off at the next boot, so the restart
+  policy cannot race it.
 
 ``caffeinate`` is *not* part of the LaunchDaemon: it is an explicit opt-in for
 manual/foreground runs, and only ``caffeinate -i`` is ever built.
@@ -27,8 +32,10 @@ import sys
 from typing import Callable, Sequence
 
 from mpm_common.errors import FailClosed
+from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST
 
+from . import conflict as conflict_mod
 from .locking import FileLock, LockBusy
 
 EXIT_TEMPFAIL = 75
@@ -100,6 +107,18 @@ def _restore_handlers(previous: dict[int, object]) -> None:
             pass
 
 
+def _conflict_verdict(checker) -> "conflict_mod.ConflictReport":
+    """Run the injected checker; any error is a conflict (fail-safe)."""
+    try:
+        return checker()
+    except Exception as exc:  # noqa: BLE001 - never start on a broken check
+        return conflict_mod.ConflictReport(
+            ok=False,
+            error=HOST.text(str(exc) or type(exc).__name__)[:200],
+            reasons=["conflict check failed; treating it as a conflict"],
+        )
+
+
 def run(
     *,
     binary: str,
@@ -112,8 +131,22 @@ def run(
     flock=None,
     install_signal_handlers: bool = True,
     terminate_timeout: float = TERMINATE_TIMEOUT,
+    conflict_checker: Callable[[], "conflict_mod.ConflictReport"] | None = None,
+    skip_conflict_check: bool = False,
 ) -> int:
     """Acquire the core lock, run mihomo, and translate its outcome."""
+    # Boot path defence: launchd can start this job with Nextin already
+    # connected.  Refuse to spawn a second stack and exit 0 (SuccessfulExit) so
+    # launchd does not retry in a loop.
+    if not skip_conflict_check:
+        checker = conflict_checker or (lambda: conflict_mod.detect(Executor()))
+        verdict = _conflict_verdict(checker)
+        if not verdict.ok:
+            sys.stderr.write(
+                HOST.text("[runner] " + conflict_mod.describe(verdict)) + "\n"
+            )
+            return 0
+
     lock = FileLock(core_lock, label="core", flock=flock)
     try:
         lock.acquire()
@@ -144,7 +177,10 @@ def run(
         )
         stop = _StopRequest()
         previous = _install_handlers(child, stop) if install_signal_handlers else {}
+        returncode = 0
         try:
+            # Assign, never ``return`` here: the signal handlers are restored in
+            # ``finally`` and the mapping below must still see ``stop.requested``.
             returncode = child.wait()
         finally:
             _restore_handlers(previous)
@@ -153,6 +189,9 @@ def run(
             # An explicit SIGTERM/SIGINT is a clean stop: exit 0 so launchd
             # does not immediately restart the job.
             return 0
+        # A negative wait status means the child died from a signal; mapping it
+        # through ``exit_code_for`` (128 + signum) keeps launchd's
+        # SuccessfulExit=false restart policy working.
         return exit_code_for(int(returncode))
     finally:
         lock.release()
@@ -172,6 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="wrap with 'caffeinate -i' (explicit opt-in; never in the LaunchDaemon)",
     )
+    parser.add_argument(
+        "--skip-conflict-check",
+        action="store_true",
+        help="testing only: do not probe for an external VPN/route conflict",
+    )
     return parser
 
 
@@ -184,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             config=args.config,
             core_lock=os.path.join(args.run_dir, "core.lock"),
             caffeinate=bool(args.caffeinate),
+            skip_conflict_check=bool(args.skip_conflict_check),
         )
     except FailClosed as exc:
         sys.stderr.write(HOST.text(f"[runner] {exc.message}") + "\n")

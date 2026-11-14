@@ -56,6 +56,11 @@ class Layout:
         return os.path.join(self.usr_local_bin, PROJECT)
 
     @property
+    def switch_entry(self) -> str:
+        """``mpm-switch`` - the user-facing Nextin/mihomo switch."""
+        return os.path.join(self.usr_local_bin, "mpm-switch")
+
+    @property
     def libexec(self) -> str:
         return os.path.join(self.root, "usr", "local", "libexec", PROJECT)
 
@@ -183,6 +188,7 @@ class Layout:
     def deletable_prefixes(self) -> list[str]:
         return [
             self.cli_entry,
+            self.switch_entry,
             self.libexec,
             self.share,
             self.support,
