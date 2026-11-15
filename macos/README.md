@@ -289,10 +289,28 @@ TUN 判定链（缺一不可）：
 3. **没有外部 VPN/路由冲突**（见下）；
 4. LaunchDaemon running；
 5. `127.0.0.1:9090/version` 可用（带 secret 认证）；
-6. provider healthcheck 通过且至少一个节点存活；并且 `AUTO-FOREIGN` 与 `GPT` 两个组
+6. provider healthcheck **已触发**且至少一个节点存活；并且 `AUTO-FOREIGN` 与 `GPT` 两个组
    都有存活节点（`/proxies` 的 `alive`）；
 7. 注入式探针观察到**新增的 `utun*`** 或默认路由切到 `utun*`（仅“存在 utun”不算成功，
    其他 VPN 也会创建 utun）。
+
+启动健康门（`lifecycle.start`）用的是带总截止时间的 `evaluate_with_deadline`
+（`common/python/mpm_common/controller_health.py`），不再把 healthcheck 的超时误报成
+“controller 不可达”：
+
+* `/providers/proxies/<p>/healthcheck` 只带 **2 秒**超时**触发**；该端点要等所有节点测完
+  才返回，所以超时/阻塞算“已触发”，不算“不可达”；
+* 随后在总 deadline（默认 **45 秒**，`MPM_HEALTH_DEADLINE_SECONDS`，夹在 `[10, 300]`）内
+  轮询 `/providers/proxies` 与 `/proxies`，只要该 provider `alive_count >= 1` 即通过；
+* deadline 到期仍无存活节点 → `no alive node in provider <p> after <N>s (k nodes tested)`；
+  存活状态未知 → `provider '<p>' liveness is unknown after <N>s ...`；
+  `/version` 也失败 → `controller unreachable: ...`。三类错误信息互不混淆；
+* provider 接口失败（例如持续 HTTP 500）**不等于** controller 不可达：每次轮询失败都会用
+  剩余预算再请求一次 `/version`，只有 `/version` 复核也失败才报 `controller unreachable`；
+  复核成功则报 `provider state unreadable: <错误>`（一次都没读到）或沿用最后一次读到的
+  `no alive node ...`（并注明此后已读不到）。复核同样计入总 deadline，不会把预算撑大；
+* `status` / `health` 仍用原来的 `evaluate()`（不做 45 秒轮询），Windows/Linux 行为不变；
+* 轮询间隔与时钟可注入，测试不会真的等待。
 
 ### 外部 VPN / 冲突检测
 
@@ -348,14 +366,106 @@ mpm-switch nextin   # 停 mihomo（bootout + disable + 恢复系统代理）-> �
 mpm-switch status   # 谁在接管：Nextin 连接状态 / mihomo launchd 状态 / 默认路由 / 系统代理
 ```
 
+### 前置条件：先在 Nextin App 里关闭 Always On VPN（On Demand）
+
+2026-11-14 20:52 的回退事故根因之一：Nextin 的 NetworkExtension 开着
+`OnDemandEnabled : TRUE`，`scutil --nc stop` 之后约 1.3 秒就被系统按 Always On VPN
+（On Demand）规则重连，mihomo 与 Nextin 同时抢路由。
+
+`mpm-switch mihomo` 现在会**先检查并拒绝**，不会“边切边抢”：
+
+* 用户阶段在弹密码框之前、在任何 stop/osascript/代理改动之前，用当前用户会话执行
+  `scutil --nc show <VPN>`，解析 `OnDemandEnabled : TRUE/FALSE`（大小写不敏感、空格宽松）；
+* `TRUE` → 直接拒绝（退出码非 0），提示
+  “请在 Nextin App 里关闭 Always On VPN（scutil 显示为 On Demand）后再切换 /
+  disable Always On VPN (On Demand) in the Nextin app first”，
+  并明确说明**没有停止 VPN、没有弹出密码框、没有修改代理**；
+* 读不到（命令失败、字段缺失、两行互相矛盾）→ 同样拒绝（fail closed），并给出原因；
+  **例外**：`scutil` 明确报 `No service`（VPN 服务根本不存在）且当前没有任何 VPN 连接时允许继续
+  —— 不存在的东西不会在背后重连；
+* `FALSE` → 继续。root 阶段在 `scutil --nc stop` 之前会再读一次（走
+  `launchctl asuser` 的用户会话），`TRUE` 则不 stop、直接拒绝；这种拒绝以**专用退出码
+  `5`** 结束并**不进入回滚**（没有 stop、没有 `launchctl disable`、没有 `scutil --nc start`），
+  用户阶段识别该码后只报告拒绝，不再尝试恢复 Nextin。即使拒绝标记文件写入失败，包装
+  shell 也凭退出码跳过 `switch rollback`。
+
+本项目**绝不修改** Always On VPN（On Demand）：不写 plist、不调用快捷指令、不做 UI 脚本。
+`mpm-switch nextin` 与所有回退路径仍然只用 `scutil --nc start <VPN>` 连接并轮询核对；
+读到 `OnDemandEnabled` 只记入报告的 `on_demand` 字段（`enabled` / `disabled` / `unknown`），
+不做任何修改。
+
+### stop 完成条件：状态 Disconnected、隧道插件退出、端口释放
+
+`scutil --nc stop` 返回 0 只说明“命令成功”，`scutil --nc list` 里 `(Connected)` 消失也只说明
+隧道开始拆除。2026-11-15 12:09:48 的回退事故就是在这里抢跑：`(Connected)` 消失后约 0.3 秒
+代码就做了冲突检测，而 Nextin 的 `ProxyTunnel`（pid 1380）仍监听 7890，直到 48.534 才真正
+退出，于是被正确判为外部占用并 fail closed。
+
+现在 root 阶段在 stop 之后、稳定窗口之前，用**同一个 deadline**（默认 15 秒，每 0.5 秒轮询）
+等待以下条件**同时**成立：
+
+* `scutil --nc status <VPN>`（失败时回退到 `scutil --nc list` 的状态字段）为 `Disconnected`；
+  `Disconnecting` / `Stopping` 都算“还在拆除”，不继续；
+* 7890 与 9090 上**没有任何非本项目的监听者**——原 NE 插件（`ProxyTunnel`）已退出；
+  本项目自己的 mihomo 若已在运行（端口由 launchd PID 或固定可执行文件路径识别）不算残留，
+  身份无法判定的监听者按“仍被占用”处理；
+* **stop 之前**在 7890/9090 上记录下来的外部监听者 PID（`ProxyTunnel` 等）**都已不存在**：
+  stop 前用同一套 `lsof` 结果取 PID，之后每次轮询用 `ps -p <pid>` 核对（非零退出或无输出
+  即“已退出”）。只释放端口但进程还活着的插件属于同一类抢跑——端口空了、旧网络栈还在跑；
+  读不到端口列表时**不会发 stop**（无法核对的 stop 不确认）；
+* 以上在同一次轮询中同时成立。
+
+状态读不到（命令失败）不算确认；deadline 到期仍被占用（端口被占或 PID 未退出）则
+**fail closed**，报 `<VPN> did not finish disconnecting within 15s (...)`（明细里会写明
+`7890: ProxyTunnel (pid N)` 或 `pid N still alive`），绝不忽略 `ProxyTunnel`、也不启动 mihomo。
+期间 VPN 曾经断开又连回来 → 报
+`<VPN> reconnected Ns after stop while waiting for the teardown to finish (Always On VPN / On Demand?)`
+并按回退处理。
+
+### 稳定断开窗口（stop 之后必须“安静”足够久）
+
+拆除完成后，root 阶段继续观察：
+
+* 默认 **4 秒**（`MPM_STABLE_DISCONNECT_SECONDS`，夹在 `[3, 5]` 秒），每 **≤0.5 秒**
+  以用户会话读一次状态（`scutil --nc status`，失败时回退到 `scutil --nc list` 的状态字段）；
+* 窗口内**每一次**都必须读到 `Disconnected`。只要求“不在 Connected 列表里”是不够的：
+  `Disconnecting` / `Stopping` 说明旧会话还在拆除、随时可能连回来，状态读不到同样不算确认；
+* 读到 `Connected` → 判定“Nextin 自动重连”，**不启动 mihomo**，直接回滚（以用户身份
+  `scutil --nc start` 并核对已连接），错误信息写明
+  `Nextin reconnected within Ns after stop (Always On VPN / On Demand?)`；
+  读到其它状态 → 同样不启动，报
+  `<VPN> was not continuously disconnected during the 4s window (state stopping after 0.5s)`；
+* 窗口全程为 `Disconnected` 才继续：完整冲突检测 → `start` → 探测；
+* mihomo 启动成功、**健康检查/探测之前**会再检查一次 Nextin（以及冲突检测里的 VPN 项）；
+  已连接则立即回退，并写明 `reconnected after mihomo start (Always On VPN / On Demand?)`。
+
+时钟与 sleeper 都可注入，测试不会真的等待。
+
+### 连接 VPN 的状态机（回退、`nextin`、用户阶段恢复）
+
+`scutil --nc start` 只是“请求”：上一次会话还处于 `Disconnecting`/`Stopping` 时，
+nesessionmanager 会记 `Skip` 并丢弃它（2026-11-15 12:09:48 的第一次 start 就是这样被忽略的），
+而“被丢弃”和“连接慢”看起来完全一样。因此 `_root_rollback`、`switch_to_nextin` 与用户阶段
+恢复统一使用同一个状态机：
+
+* 状态是 `Disconnecting`/`Stopping` 时**不发 start**，先等到 `Disconnected`；
+* start 之后若 5 秒内状态仍未进入 `Connecting`/`Connected`，**重发 start**；
+* 总 deadline 60 秒，期间可多次重发；只有读到 `Connected` 才算成功，否则报告
+  `could not connect <VPN>; open it manually`。
+
+时钟与 sleeper 同样可注入，测试不会真的等待 60 秒。
+
 * `mpm-switch mihomo` **先要密码，再断网**：普通用户阶段只通过
   `osascript ... with administrator privileges` 弹密码框，不碰 Nextin。用户取消或弹窗
   失败时 Nextin 原样保持连接，命令直接返回非零。
 * 密码框里执行的是带兜底的 shell 包装（`<cli> switch mihomo … --marker <tmp>;
-  rc=$?; [ -f <tmp> ] || <cli> switch rollback …; exit $rc`）。marker 只在探测全部
-  通过后由 Python 写入，所以 root 阶段崩溃、被 `SIGKILL`、或返回非零时，
-  `switch rollback`（幂等）会执行。所有参数都经过 `shlex.quote`，AppleScript
-  的反斜杠/双引号转义保留。
+  rc=$?; [ "$rc" -eq 5 ] || [ -f <tmp> ] || <cli> switch rollback …; exit $rc`）。
+  marker 只在探测全部通过后由 Python 写入，所以 root 阶段崩溃、被 `SIGKILL`、或返回非零时，
+  `switch rollback`（幂等）会执行。退出码 `5` 表示“Always On VPN（On Demand）预检拒绝、
+  什么都没改”，包装
+  shell 因此不跑 rollback，即使 marker 写入失败也一样；用户阶段凭该码（或 marker、或输出中
+  的 `refused before touching anything`）识别拒绝，不再执行自己的恢复逻辑。所有参数都经过
+  `shlex.quote`，AppleScript 的反斜杠/双引号转义保留。
   **边界**：这条兜底只覆盖 *root Python 子进程* 的死亡（崩溃/`SIGKILL`/非零退出）。
   如果 osascript、包装 shell 或整个授权进程组本身被杀，rollback 不会运行，机器可能
   停留在中间状态。此时下一次 `mpm-switch nextin` 或 `mpm-switch status` 可以幂等修复：
@@ -366,12 +476,16 @@ mpm-switch status   # 谁在接管：Nextin 连接状态 / mihomo launchd 状态
   可用 `MPM_VPN_NAME` 覆盖；**不删除** VPN，也不改它的自动连接配置）。root 进程
   看不到用户的 NetworkExtension 会话，所以命令与**状态轮询**都必须走 `asuser`
   （`launchctl asuser <uid> sudo -u <user> scutil --nc list`）；root 自己的
-  `scutil --nc list` 看不到用户会话，不能作为断开/连接的判据。断开失败则不启动 mihomo。
-* 之后：冲突检测 → `start` → 探测。**任何**失败（含冲突检测本身抛异常）都统一收敛到
+  `scutil --nc list` 看不到用户会话，不能作为断开/连接的判据。断开失败、或 15 秒内没有
+  完成拆除（仍是 `Disconnecting`/`Stopping`、7890/9090 仍被占用、或 stop 前记录的外部
+  监听者 PID 仍存活）则不启动 mihomo。
+* 之后：完整冲突检测 → `start` → 探测。**任何**失败（含冲突检测本身抛异常）都统一收敛到
   回滚：`bootout` + `disable`（`disable` 放在 `finally`，即使 bootout 失败也执行）+
   disable 读回（`launchctl print-disabled` 必须确认 override 生效）+ 确认不再运行 +
   孤立 core 检查（端口 7890/9090 无监听、无 198.19/16 utun；检查失败按"可能仍在运行"
-  处理）+ 恢复系统代理快照 + 以用户身份 `scutil --nc start <VPN>` + 等待 `(Connected)`。
+  处理）+ 恢复系统代理快照 + 以用户身份 `scutil --nc start <VPN>`（状态机：等
+  `Disconnected`、5 秒未进入 `Connecting`/`Connected` 就重发、60 秒总 deadline）+ 等待
+  `(Connected)`。
   只有结构化 StopOutcome 的 `safe` 为真（disable 成功且读回为真、已停止、无孤立 core）
   才会连接 Nextin；任何一项未知或失败都会打印明确提示，要求运行 `mpm-switch nextin`
   或手动处理，绝不制造双栈。
@@ -397,9 +511,9 @@ mpm-switch status   # 谁在接管：Nextin 连接状态 / mihomo launchd 状态
 * `mpm-switch nextin`：弹密码框执行 `mihomo-proxy-management stop`（root 阶段则直接
   调用 `stop`），stop 必须返回 `safe` 的 StopOutcome——disable 成功且
   `launchctl print-disabled` 读回为真、job 已停止、端口 7890/9090 无监听、无
-  198.19/16 utun——然后才以用户身份 `scutil --nc start <VPN>`，等待 `(Connected)` 后
-  再做一次简单探测并报告。stop 未确认（含 disable 读回失败或孤立 core）时不会连接
-  Nextin，并提示先处理孤立 core 再运行 `mpm-switch nextin` 或手动处理。
+  198.19/16 utun——然后才以用户身份 `scutil --nc start <VPN>`（走上面的连接状态机），
+  等待 `(Connected)` 后再做一次简单探测并报告。stop 未确认（含 disable 读回失败或孤立
+  core）时不会连接 Nextin，并提示先处理孤立 core 再运行 `mpm-switch nextin` 或手动处理。
   `mpm-switch nextin` 与 `mpm-switch status` 都是幂等的：重复运行会重新验证并修复
   上一次切换留下的中间状态（如 wrapper 兜底未执行的残留）。
 * **开机默认不自启**：`install` 结束、`start` 成功后、`stop` 之后都处于
@@ -471,10 +585,20 @@ mpm-switch mihomo --drill-fail
   fcntl/controller 均为注入，可在 Windows、Linux、macOS 上运行（含 Windows 2209 /
   Python 3.11.9）；
 * 冲突检测与切换的测试不读取真实主机：`test_macos_conflict.py`（scutil/lsof/route/
-  ifconfig 解析、launchd PID/可执行文件身份判定与 fail-safe）、`test_macos_probe.py`
+  ifconfig 解析、`OnDemandEnabled` 与 `Connected`/`Disconnecting` 状态解析、launchd
+  PID/可执行文件身份判定与 fail-safe）、
+  `test_macos_probe.py`
   （HTTP 状态、fake-ip 经 `route -n get` + utun 差集、60 秒单调时钟 deadline、演练开关）、
   `test_macos_switch.py`（先密码后断网、取消不动 Nextin、异常恢复、shell 包装兜底回滚、
-  双向切换、回滚恢复代理快照）；
+  Always On VPN（On Demand）拒绝与放行及其提示文案、stop 完成条件（Connected 消失 →
+  Disconnecting → 端口稍后释放 → 原 ProxyTunnel PID 退出）、端口始终不释放或 PID 始终不退出
+  则 fail closed、稳定断开窗口（每次轮询都必须是 Disconnected）、启动后重连
+  回退、首次 start 被忽略后重发、双向切换、回滚恢复代理快照）；
+* 健康门的总 deadline 单独测在 `tests/test_controller_health_deadline.py`
+  （healthcheck 超时算“已触发”、轮询到 alive 即通过、deadline 到期无 alive 的准确信息、
+  controller 真不可达、存活未知、provider 不可见、`/providers/proxies` 正常但 `/proxies`
+  持续 500 时区分“provider state unreadable”与“controller unreachable”、`evaluate()`
+  行为不变、短超时 2 秒），全部注入 sleeper/clock；
 * plist 审计按**目标平台**判定绝对路径（`posixpath`），测试用 sandbox root 在渲染
   plist 前映射为 POSIX 目标路径（`Layout.to_target_path`），因此 Windows 宿主不会
   把 `C:\...` 写进 LaunchDaemon；

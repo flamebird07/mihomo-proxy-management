@@ -67,6 +67,24 @@ def darwin_facts(**overrides) -> PlatformFacts:
     return PlatformFacts(**values)
 
 
+class FakeClock:
+    """Deterministic monotonic clock whose ``sleep`` advances time."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = float(now)
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += max(0.0, float(seconds))
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
 class FakeController:
     """Minimal stand-in for :class:`ControllerClient`."""
 
@@ -89,18 +107,20 @@ class FakeController:
             else {"AUTO-FOREIGN": True, "GPT": True}
         )
         self.healthchecks: list[str] = []
+        self.healthcheck_timeouts: list[float | None] = []
 
-    def version(self) -> dict:
+    def version(self, *, timeout: float | None = None) -> dict:
         if not self._reachable:
             raise ControllerError("controller unreachable")
         return {"version": self._version}
 
-    def healthcheck(self, name: str) -> None:
+    def healthcheck(self, name: str, *, timeout: float | None = None) -> None:
         self.healthchecks.append(name)
+        self.healthcheck_timeouts.append(timeout)
         if not self._reachable:
             raise ControllerError("healthcheck failed")
 
-    def providers(self) -> dict:
+    def providers(self, *, timeout: float | None = None) -> dict:
         if not self._reachable:
             raise ControllerError("controller unreachable")
         nodes = [
@@ -109,7 +129,7 @@ class FakeController:
         ]
         return {"providers": {"subscription": {"all": nodes}}}
 
-    def proxies(self) -> dict:
+    def proxies(self, *, timeout: float | None = None) -> dict:
         proxies = {
             f"node-{index}": {"alive": index < self._alive}
             for index in range(self._node_count)
@@ -341,6 +361,9 @@ def make_context(root, *, environ=None, **overrides) -> lifecycle.Context:
     if environ:
         env.update(environ)
     executor = overrides.pop("executor", None) or FakeExecutor()
+    # A fake clock paired with the sleeper: deadline loops (stable disconnect
+    # window, health gate, probe) advance instantly and never really sleep.
+    clock = overrides.pop("clock", None) or FakeClock()
     # install verifies the persistent disable override; a bare FakeExecutor
     # must answer ``print-disabled`` or every install test would fail closed.
     executor.set(
@@ -356,7 +379,8 @@ def make_context(root, *, environ=None, **overrides) -> lifecycle.Context:
         "environ": env,
         "system_profile": False,
         "python": "/usr/bin/python3",
-        "sleeper": lambda _seconds: None,
+        "sleeper": clock.sleep,
+        "clock": clock,
         "validator": lambda _text: None,
         "tun_observer": lambda: lifecycle.TunObservation(("en0",), "en0"),
         "conflict_detector": lambda: ConflictReport(ok=True),

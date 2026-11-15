@@ -6,7 +6,9 @@ NetworkExtension already owned ``utun`` 198.18.0.1, port 7890 and fake-ip DNS.
 Nothing in mihomo's own logs says "another VPN is here", so this module looks
 at the host directly:
 
-* ``scutil --nc list`` - connected VPN services (name + bundle id);
+* ``scutil --nc list`` - connected VPN services (name + bundle id), and the
+  transient states (``Disconnecting``/``Stopping``) a stop must wait out;
+* ``scutil --nc status <vpn>`` - the same state for one service;
 * ``lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpc`` - who listens on 7890/9090;
 * ``launchctl print system/<label>`` - the PID of *our* LaunchDaemon job;
 * ``ps -o comm= -p <pid>`` - the executable path of a port owner;
@@ -98,6 +100,27 @@ class ConflictReport:
 _CONNECTED = re.compile(r"\(Connected\)", re.IGNORECASE)
 _QUOTED = re.compile(r'"([^"]+)"')
 _BUNDLE = re.compile(r"\[(?:VPN:)?([^\]]+)\]")
+#: Service states a NetworkExtension reports.  A teardown is *not* finished
+#: while the service is still ``Disconnecting``/``Stopping``: the tunnel plugin
+#: and its listener outlive the ``(Connected)`` flag by a few hundred
+#: milliseconds (2026-11-15 rollback).
+_NC_STATE_WORD = r"(?:connected|connecting|disconnecting|stopping|disconnected)"
+#: ``scutil --nc status <name>`` prints the state as its first meaningful line.
+_NC_STATUS = re.compile(
+    r"^[ \t]*(" + _NC_STATE_WORD + r")\b", re.IGNORECASE | re.MULTILINE
+)
+#: ``scutil --nc list`` carries the same state in parentheses, e.g.
+#: ``* (Disconnecting)    "Nextin" [VPN:com.example.nextin]``.
+_NC_LIST_STATE = re.compile(r"\((" + _NC_STATE_WORD + r")\)", re.IGNORECASE)
+#: ``scutil --nc show <name>`` prints ``  OnDemandEnabled : TRUE``; the spacing
+#: around the colon varies between macOS releases, the case is not stable.
+#: The key is anchored at the start of a line (leading blanks allowed) so a
+#: longer key such as ``SomeOnDemandEnabled`` is never read as this flag.
+_ON_DEMAND = re.compile(
+    r"^[ \t]*OnDemandEnabled[ \t]*:[ \t]*(TRUE|FALSE)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NO_SERVICE = re.compile(r"\bNo\s+service\b", re.IGNORECASE)
 
 
 def parse_scutil_nc_list(text: str) -> list[VpnConnection]:
@@ -123,6 +146,69 @@ def parse_scutil_nc_list(text: str) -> list[VpnConnection]:
             VpnConnection(name=name, bundle=bundle.group(1).strip() if bundle else "")
         )
     return connections
+
+
+def parse_on_demand_enabled(text: str) -> bool | None:
+    """``OnDemandEnabled`` from ``scutil --nc show <vpn>``.
+
+    Returns ``True``/``False`` for the flag, and ``None`` when it cannot be
+    read: the line is missing, the command failed, or two contradictory lines
+    are present.  ``None`` is *not* "disabled" - callers must fail closed.
+    Only a line whose first non-blank characters are ``OnDemandEnabled``
+    counts, so a look-alike key cannot switch the answer.
+
+    A VPN with Always On VPN (On Demand) enabled reconnects ~1.3 s after
+    ``scutil --nc stop`` (the 2026-11-14 outage), so this flag decides whether
+    switching is even attempted.  This module only *reads* it; nothing here
+    ever changes it.
+    """
+    values = {
+        match.group(1).upper() == "TRUE" for match in _ON_DEMAND.finditer(text or "")
+    }
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def is_missing_service_output(text: str) -> bool:
+    """Whether ``scutil`` said the VPN service does not exist ("No service")."""
+    return bool(_NO_SERVICE.search(text or ""))
+
+
+def parse_nc_status(text: str) -> str:
+    """State word from ``scutil --nc status <vpn>``, lowercased.
+
+    Returns ``connected``/``connecting``/``disconnecting``/``stopping``/
+    ``disconnected``, or ``unknown`` when no state line is present.  The
+    difference matters: ``Disconnecting``/``Stopping`` mean the previous
+    session is still tearing down, so a ``start`` sent now is skipped by
+    nesessionmanager and the tunnel plugin may still own port 7890.
+    """
+    match = _NC_STATUS.search(text or "")
+    return match.group(1).lower() if match else "unknown"
+
+
+def parse_scutil_nc_states(text: str) -> dict[str, str]:
+    """``name -> state`` for every service line of ``scutil --nc list``.
+
+    Unlike :func:`parse_scutil_nc_list` this keeps the transient states, so a
+    caller can tell ``(Disconnecting)`` from ``(Disconnected)``.
+    """
+    states: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        match = _NC_LIST_STATE.search(line)
+        if not match:
+            continue
+        quoted = _QUOTED.search(line)
+        bundle = _BUNDLE.search(line)
+        name = quoted.group(1).strip() if quoted else ""
+        if not name:
+            tail = _NC_LIST_STATE.split(line, maxsplit=1)[-1]
+            tail = _BUNDLE.sub("", tail).strip()
+            name = tail.split()[0] if tail.split() else ""
+        if name:
+            states[name] = match.group(1).lower()
+    return states
 
 
 def parse_lsof_listeners(text: str, port: int) -> list[PortOwner]:
@@ -431,10 +517,14 @@ __all__ = [
     "describe",
     "detect",
     "in_project_block",
+    "is_missing_service_output",
     "is_project_executable",
     "launchd_pid",
     "parse_default_interface",
     "parse_lsof_listeners",
+    "parse_nc_status",
+    "parse_on_demand_enabled",
     "parse_scutil_nc_list",
+    "parse_scutil_nc_states",
     "parse_utun_addresses",
 ]

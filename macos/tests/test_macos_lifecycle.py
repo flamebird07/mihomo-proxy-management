@@ -447,7 +447,7 @@ def test_start_wait_running_failure_stops_without_mixed(tmp_path):
 
 def test_start_readiness_failure_stops_without_mixed(tmp_path):
     class _ReadinessFails(FakeController):
-        def version(self):
+        def version(self, *, timeout: float | None = None):
             raise ControllerError("controller not ready")
 
     ctx, harness, network = _installed(tmp_path)

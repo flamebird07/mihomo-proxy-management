@@ -80,6 +80,94 @@ def test_parse_utun_addresses():
     assert addresses == [("utun3", "198.18.0.1")]
 
 
+# ---- Always On VPN (On Demand) flag ---------------------------------------
+
+SCUTIL_SHOW_ON_DEMAND = """SCNetworkReachability information:
+  "Nextin" [VPN:com.Tommy.Nextin]
+  OnDemandEnabled : TRUE
+  OnDemandRules : [
+    {Action: Connect}
+  ]
+"""
+
+
+def test_parse_on_demand_enabled_true():
+    assert conflict.parse_on_demand_enabled(SCUTIL_SHOW_ON_DEMAND) is True
+
+
+def test_parse_on_demand_enabled_false():
+    assert conflict.parse_on_demand_enabled("OnDemandEnabled : FALSE\n") is False
+
+
+def test_parse_on_demand_is_case_and_space_tolerant():
+    assert conflict.parse_on_demand_enabled("ondemandenabled:true") is True
+    assert conflict.parse_on_demand_enabled("  OnDemandEnabled    :    FALSE  ") is False
+
+
+def test_parse_on_demand_missing_returns_none():
+    assert conflict.parse_on_demand_enabled("") is None
+    assert conflict.parse_on_demand_enabled('"Nextin" [VPN:com.Tommy.Nextin]\n') is None
+
+
+def test_parse_on_demand_key_is_anchored_at_the_line_start():
+    """A longer key must not be mistaken for ``OnDemandEnabled``."""
+    assert conflict.parse_on_demand_enabled("SomeOnDemandEnabled : TRUE\n") is None
+    assert conflict.parse_on_demand_enabled("X-OnDemandEnabled: FALSE\n") is None
+    # leading blanks are what scutil actually prints, and still count
+    assert conflict.parse_on_demand_enabled("\t  OnDemandEnabled : TRUE\n") is True
+
+
+def test_parse_on_demand_contradictory_lines_return_none():
+    """Ambiguity is never "disabled": the caller has to fail closed."""
+    text = "OnDemandEnabled : TRUE\nOnDemandEnabled : FALSE\n"
+    assert conflict.parse_on_demand_enabled(text) is None
+
+
+def test_missing_service_output_is_recognised():
+    assert conflict.is_missing_service_output("No service\n") is True
+    assert conflict.is_missing_service_output("no service") is True
+    assert conflict.is_missing_service_output(SCUTIL_SHOW_ON_DEMAND) is False
+
+
+# ---- service states (a stop is not finished while it is Disconnecting) ----
+
+
+def test_disconnecting_is_not_reported_as_connected():
+    """``(Disconnecting)`` is a teardown, not a connection."""
+    text = (
+        "Available network connection services in the current set (*=enabled):\n"
+        '* (Disconnecting)    "Nextin" [VPN:com.Tommy.Nextin]\n'
+    )
+    assert conflict.parse_scutil_nc_list(text) == []
+
+
+def test_parse_nc_status_keeps_the_transient_states():
+    """``Disconnecting``/``Stopping`` are not ``Disconnected``."""
+    assert conflict.parse_nc_status("Connected\n") == "connected"
+    assert conflict.parse_nc_status("Connecting\n") == "connecting"
+    assert (
+        conflict.parse_nc_status("Disconnecting\nExtended Status <dictionary> {\n}\n")
+        == "disconnecting"
+    )
+    assert conflict.parse_nc_status("Stopping\n") == "stopping"
+    assert conflict.parse_nc_status("Disconnected\n") == "disconnected"
+    assert conflict.parse_nc_status("No service\n") == "unknown"
+    assert conflict.parse_nc_status("") == "unknown"
+
+
+def test_parse_scutil_nc_states_reads_every_service_line():
+    text = (
+        "Available network connection services in the current set (*=enabled):\n"
+        '* (Disconnecting)    "Nextin" [VPN:com.Tommy.Nextin]\n'
+        '* (Connected)    "Corp VPN" [VPN:com.example.corp]\n'
+        "* (Disconnected)   1234-... PPP --> ...\n"
+    )
+    states = conflict.parse_scutil_nc_states(text)
+    assert states["Nextin"] == "disconnecting"
+    assert states["Corp VPN"] == "connected"
+    assert set(states.values()) == {"disconnecting", "connected", "disconnected"}
+
+
 # ---- detection ------------------------------------------------------------
 
 

@@ -55,6 +55,7 @@ from mpm_common.controller_health import (
     HEALTH_OK,
     HealthReport,
     evaluate,
+    evaluate_with_deadline,
     readiness,
 )
 from mpm_common.errors import ExitCode, FailClosed, MpmError, NotReady
@@ -93,6 +94,29 @@ SUBCOMMANDS = (
 )
 
 STATE_SCHEMA = 1
+
+#: Total budget for the start-time health gate (healthcheck trigger + polling).
+#: The healthcheck endpoint blocks until every node was tested; on a slow
+#: subscription the old 5 s client timeout produced a bogus "controller
+#: unreachable" (2026-11-14).  ``MPM_HEALTH_DEADLINE_SECONDS`` overrides it.
+HEALTH_DEADLINE_ENV = "MPM_HEALTH_DEADLINE_SECONDS"
+HEALTH_DEADLINE_DEFAULT = 45.0
+HEALTH_DEADLINE_RANGE = (10.0, 300.0)
+
+
+def health_deadline_seconds(environ: dict[str, str] | None = None) -> float:
+    """Configured start-time health budget, clamped to a sane range."""
+    values = environ if environ is not None else dict(os.environ)
+    raw = (values.get(HEALTH_DEADLINE_ENV) or "").strip()
+    if not raw:
+        return HEALTH_DEADLINE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return HEALTH_DEADLINE_DEFAULT
+    low, high = HEALTH_DEADLINE_RANGE
+    return min(high, max(low, value))
+
 
 #: Geo databases copied next to the binary into the mihomo ``-d`` directory.
 #: ``GeoIP.dat``/``GeoSite.dat`` are what ``geodata-mode: true`` loads;
@@ -350,6 +374,9 @@ class Context:
     tun_observer: Callable[[], TunObservation] | None = None
     conflict_detector: Callable[[], "conflict_mod.ConflictReport"] | None = None
     sleeper: Callable[[float], None] = time.sleep
+    #: monotonic clock paired with ``sleeper``; tests inject a fake so no
+    #: deadline test ever really sleeps
+    clock: Callable[[], float] = time.monotonic
     system_profile: bool = True
     dry_run: bool = False
     python: str = sys.executable
@@ -1112,15 +1139,31 @@ def _group_liveness(client: ControllerClient) -> dict[str, bool | None]:
     return result
 
 
-def _health_check(ctx: Context, secrets: Secrets, *, mode: str) -> HealthReport:
+def _health_check(
+    ctx: Context, secrets: Secrets, *, mode: str, deadline: float | None = None
+) -> HealthReport:
     """Provider health plus live routing groups (AUTO-FOREIGN and GPT).
 
     The provider check alone is not enough: a provider can have live nodes
     while both routing groups are empty, which is exactly how PROXY ended up
     stuck on a dead node.  A missing/unknown group verdict fails closed.
+
+    The provider verdict is deadline-bounded (``evaluate_with_deadline``): the
+    healthcheck request is only *triggered* with a short timeout and the
+    verdict waits for ``alive_count >= 1`` instead of failing on a timeout.
     """
     client = ctx.controller(secrets.controller_secret)
-    verdict = evaluate(client, provider=config_mod.PROVIDER_NAME, mode=mode, running=True)
+    verdict = evaluate_with_deadline(
+        client,
+        provider=config_mod.PROVIDER_NAME,
+        mode=mode,
+        running=True,
+        deadline_seconds=(
+            health_deadline_seconds(ctx.environ) if deadline is None else float(deadline)
+        ),
+        sleeper=ctx.sleeper,
+        clock=ctx.clock,
+    )
     if not verdict.ok:
         return verdict
     groups = _group_liveness(client)
@@ -1206,7 +1249,13 @@ def _failed_start(
     return report
 
 
-def _start_mixed(ctx: Context, report: Report, *, quiet: bool = False) -> Report:
+def _start_mixed(
+    ctx: Context,
+    report: Report,
+    *,
+    quiet: bool = False,
+    health_guard: Callable[[], None] | None = None,
+) -> Report:
     """Explicit mixed mode: the only path that touches the system proxy."""
     layout = ctx.layout
     proxy = ctx.proxy_client()
@@ -1224,6 +1273,10 @@ def _start_mixed(ctx: Context, report: Report, *, quiet: bool = False) -> Report
             launchd.bootstrap()
         if not launchd.wait_running():
             raise NotReady("mixed-mode core did not reach running state")
+        if health_guard is not None:
+            # Runs before any controller call: an external VPN that came back
+            # must roll back immediately, not after a slow health gate.
+            health_guard()
         secrets = ctx.secrets()
         report.data["version"] = _readiness(ctx, secrets)
         verdict = _health_check(ctx, secrets, mode="mixed")
@@ -1265,8 +1318,20 @@ def _start_mixed(ctx: Context, report: Report, *, quiet: bool = False) -> Report
     return report
 
 
-def start(ctx: Context, *, quiet: bool = False, mode: str | None = None) -> Report:
-    """Start the core.  TUN by default; mixed only when explicitly requested."""
+def start(
+    ctx: Context,
+    *,
+    quiet: bool = False,
+    mode: str | None = None,
+    health_guard: Callable[[], None] | None = None,
+) -> Report:
+    """Start the core.  TUN by default; mixed only when explicitly requested.
+
+    ``health_guard`` runs after launchd reports the job running and *before*
+    the controller readiness/health gate.  ``mpm-switch`` uses it to abort a
+    start whose external VPN came back, so the rollback does not wait for a
+    slow provider healthcheck first.
+    """
     report = Report(command="start")
     layout = ctx.layout
     target_mode = mode or "tun"
@@ -1321,7 +1386,7 @@ def start(ctx: Context, *, quiet: bool = False, mode: str | None = None) -> Repo
         configure(ctx, quiet=True, mode=target_mode)
 
     if target_mode == "mixed":
-        return _start_mixed(ctx, report, quiet=quiet)
+        return _start_mixed(ctx, report, quiet=quiet, health_guard=health_guard)
 
     before = ctx.tun()
     after = before
@@ -1335,6 +1400,12 @@ def start(ctx: Context, *, quiet: bool = False, mode: str | None = None) -> Repo
             launchd.bootstrap()
         if not launchd.wait_running():
             raise NotReady("LaunchDaemon did not reach running state")
+
+        if health_guard is not None:
+            # An external VPN that reconnected while mihomo started must roll
+            # back now - before the deadline-bounded health gate spends its
+            # budget on a controller that is about to be torn down.
+            health_guard()
 
         secrets = ctx.secrets()
         version = _readiness(ctx, secrets)
