@@ -24,6 +24,8 @@
 		<string>__PACKAGE_DIR__</string>
 		<key>PYTHONUNBUFFERED</key>
 		<string>1</string>
+		<key>MPM_MIHOMO_BINARY</key>
+		<string>__BINARY__</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>

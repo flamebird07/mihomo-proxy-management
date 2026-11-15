@@ -46,6 +46,9 @@ def test_non_root_is_rejected():
 def test_missing_required_command_is_fatal():
     commands = {name: f"/usr/bin/{name}" for name in preflight.REQUIRED_COMMANDS}
     commands.pop("networksetup")
+    # mihomo is not a PATH command: the shared context builder registers the
+    # absolute installed path (mpm_macos.context.register_binary).
+    commands[preflight.MIHOMO_COMMAND] = "/usr/local/libexec/mihomo-proxy-management/current/mihomo"
     facts = PlatformFacts(system="darwin", machine="arm64", is_root=True, commands=commands)
     check = preflight.evaluate(facts)
     assert check.supported is False
@@ -54,6 +57,9 @@ def test_missing_required_command_is_fatal():
 
 def test_missing_optional_command_is_only_a_warning():
     commands = {name: f"/usr/bin/{name}" for name in preflight.REQUIRED_COMMANDS}
+    # mihomo is not a PATH command: the shared context builder registers the
+    # absolute installed path (mpm_macos.context.register_binary).
+    commands[preflight.MIHOMO_COMMAND] = "/usr/local/libexec/mihomo-proxy-management/current/mihomo"
     facts = PlatformFacts(system="darwin", machine="arm64", is_root=True, commands=commands)
     check = preflight.evaluate(facts)
     assert check.supported is True
@@ -75,6 +81,52 @@ def test_old_release_is_a_warning_not_an_error():
 def test_strict_mode_raises_unsupported():
     with pytest.raises(Unsupported):
         preflight.preflight(darwin_facts(is_root=False))
+
+
+# ---- install's platform preflight (require_mihomo=False) -------------------
+
+
+def _facts_without_mihomo(**overrides) -> PlatformFacts:
+    commands = {
+        name: f"/usr/bin/{name}"
+        for name in preflight.REQUIRED_COMMANDS + preflight.OPTIONAL_COMMANDS
+    }
+    values = {"commands": commands}
+    values.update(overrides)
+    return darwin_facts(**values)
+
+
+def test_runtime_preflight_still_requires_the_registered_binary():
+    check = preflight.evaluate(_facts_without_mihomo())
+    assert check.supported is False
+    assert preflight.MIHOMO_MISSING_REASON in check.reasons
+    assert check.commands["mihomo"] is False
+
+
+def test_install_preflight_does_not_require_the_runtime_binary():
+    facts = _facts_without_mihomo()
+    check = preflight.evaluate(facts, require_mihomo=False)
+    assert check.supported is True, check.reasons
+    assert check.mode == "tun"
+    assert check.commands["mihomo"] is False
+    assert preflight.preflight(facts, require_mihomo=False).supported is True
+
+
+def test_install_preflight_keeps_every_other_capability_check():
+    facts = _facts_without_mihomo(is_root=False)
+    check = preflight.evaluate(facts, require_mihomo=False)
+    assert check.supported is False
+    assert any("root" in reason for reason in check.reasons)
+
+    commands = dict(_facts_without_mihomo().commands)
+    commands.pop("networksetup")
+    facts = _facts_without_mihomo(commands=commands)
+    check = preflight.evaluate(facts, require_mihomo=False)
+    assert check.supported is False
+    assert any("networksetup" in reason for reason in check.reasons)
+    assert preflight.MIHOMO_MISSING_REASON not in check.reasons
+    with pytest.raises(Unsupported):
+        preflight.preflight(facts, require_mihomo=False)
 
 
 def test_no_tun_device_probe(monkeypatch):

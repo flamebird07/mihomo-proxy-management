@@ -16,6 +16,8 @@
 		<string>__PACKAGE_DIR__</string>
 		<key>PYTHONUNBUFFERED</key>
 		<string>1</string>
+		<key>MPM_MIHOMO_BINARY</key>
+		<string>__BINARY__</string>
 	</dict>
 	<!-- Runs once at boot; no KeepAlive on purpose (a failing switch must not
 	     be retried every few seconds and flap the network). -->

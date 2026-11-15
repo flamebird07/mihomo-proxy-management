@@ -59,6 +59,7 @@ from mpm_common.executor import Executor
 from mpm_common.sanitize import sanitize
 
 from . import conflict as conflict_mod
+from . import context as context_mod
 from . import lifecycle, probe as probe_mod, switch as switch_mod
 
 CONSOLE_DEADLINE_ENV = "MPM_BOOT_CONSOLE_DEADLINE_SECONDS"
@@ -392,7 +393,7 @@ def main(
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    ctx = context_factory() if context_factory is not None else switch_mod.build_context(args.root)
+    ctx = context_factory() if context_factory is not None else context_mod.build_context(args.root)
     if stdout is not None:
         ctx.out = stdout
     if stderr is not None:

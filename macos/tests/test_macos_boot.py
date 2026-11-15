@@ -16,14 +16,17 @@ import pytest
 
 from mpm_common.errors import ExitCode, FailClosed
 from mpm_common.executor import FakeExecutor
-from mpm_macos import boot, lifecycle, plist, probe, switch
+from mpm_macos import boot, context, lifecycle, plist, preflight, probe, switch
 
 from macos_test_support import (
     BOOT_LABEL,
     BOOT_PLIST_TEMPLATE,
+    FakeController,
     LaunchdHarness,
     _target_label,
     assert_posix_mode,
+    darwin_facts,
+    launchd_facts,
     make_context,
     prepare_install,
 )
@@ -867,6 +870,68 @@ def test_a_kickstart_after_install_runs_the_full_switch(tmp_path, monkeypatch):
     assert not os.path.isfile(ctx.layout.boot_hold)
 
 
+def test_boot_switch_runs_under_the_launchd_path_with_an_installed_binary(tmp_path):
+    """Regression (2026-11-15 kickstart): minimal PATH + installed executable.
+
+    The boot entry's facts must register the installed absolute path exactly
+    like the CLI does, so preflight no longer refuses with "required command
+    not found: mihomo" and the whole switch runs.
+    """
+    ctx = _root_ctx(tmp_path, connected=True)
+    prepare_install(ctx)
+    ctx.facts = context.register_binary(launchd_facts(), ctx.layout)
+    ctx.controller_factory = lambda _secret: FakeController()
+    observations = iter(
+        [
+            lifecycle.TunObservation(("en0",), "en0"),
+            lifecycle.TunObservation(("en0", "utun7"), "utun7"),
+        ]
+    )
+    ctx.tun_observer = lambda: next(observations)
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    # A fresh boot-entry process (the kickstart) rebuilds its facts: now the
+    # installed binary exists and wins over the install-source override.
+    ctx.facts = context.register_binary(launchd_facts(), ctx.layout)
+    assert ctx.facts.commands["mihomo"] == ctx.layout.binary
+    assert preflight.evaluate(ctx.facts).supported is True
+
+    report = boot.boot_switch(
+        ctx,
+        console_reader=_console_ready,
+        route_reader=_route_ready,
+        probe_runner=lambda: probe.ProbeReport(ok=True),
+    )
+
+    assert report.status == "OK", report.warnings
+    assert not any("mihomo binary not available" in warning for warning in report.warnings)
+    harness = LaunchdHarness.attached(ctx.executor)
+    assert harness.running is True
+    assert harness.disabled is True
+    assert ctx.executor.connected is False
+
+
+def test_boot_without_a_usable_binary_rolls_back_to_nextin(tmp_path):
+    """Nothing installed and no override: fail closed, Nextin stays in charge."""
+    ctx = _root_ctx(tmp_path, connected=True)
+    # A stale PATH entry must not satisfy the runtime check.
+    ctx.facts = context.register_binary(darwin_facts(), ctx.layout)
+    assert "mihomo" not in ctx.facts.commands
+
+    report = boot.boot_switch(
+        ctx, console_reader=_console_ready, route_reader=_route_ready
+    )
+
+    assert report.status == "FAILED"
+    assert report.exit_code == int(ExitCode.UNSUPPORTED)
+    assert any(preflight.MIHOMO_MISSING_REASON in warning for warning in report.warnings)
+    harness = LaunchdHarness.attached(ctx.executor)
+    assert harness.loaded is False
+    assert harness.disabled is True
+    assert ctx.executor.count("launchctl", "bootstrap") == 0
+    assert ctx.executor.connected is True, "rollback must end with Nextin connected"
+
+
 def test_the_installed_boot_plist_runs_the_boot_module(tmp_path):
     ctx, _harness = _installed_no_start(tmp_path)
     with open(ctx.layout.boot_plist, "rb") as handle:
@@ -973,6 +1038,18 @@ def test_boot_plist_audit_does_not_flag_the_apple_dtd():
     assert result["label"] == BOOT_LABEL
     assert result["keep_alive"] is False
     assert "mpm_macos.boot" in result["program_arguments"]
+
+
+def test_boot_plist_injects_the_absolute_installed_binary():
+    document = plistlib.loads(_rendered_boot().encode("utf-8"))
+    assert document["EnvironmentVariables"]["MPM_MIHOMO_BINARY"] == BOOT_RENDER_ARGS["binary"]
+
+
+def test_boot_plist_audit_rejects_a_relative_binary_env_override():
+    document = plistlib.loads(_rendered_boot().encode("utf-8"))
+    document["EnvironmentVariables"]["MPM_MIHOMO_BINARY"] = "mihomo"
+    with pytest.raises(FailClosed):
+        plist.audit(document, label=BOOT_LABEL)
 
 
 def test_audit_rejects_a_restart_policy_on_the_boot_entry():

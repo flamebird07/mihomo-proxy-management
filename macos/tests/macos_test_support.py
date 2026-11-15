@@ -70,6 +70,35 @@ def darwin_facts(**overrides) -> PlatformFacts:
     return PlatformFacts(**values)
 
 
+#: The PATH a LaunchDaemon runs with: no /usr/local/bin, no Homebrew, and
+#: certainly not the installed mihomo under libexec.
+LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def launchd_facts(**overrides) -> PlatformFacts:
+    """Darwin facts as a LaunchDaemon sees them: mihomo is *not* on the PATH.
+
+    The runtime capability must come from the shared context builder
+    registering the installed absolute path, never from a PATH lookup.
+    """
+    commands = {
+        name: f"/usr/bin/{name}"
+        for name in (
+            "launchctl",
+            "networksetup",
+            "caffeinate",
+            "ifconfig",
+            "route",
+            "scutil",
+            "lsof",
+            "osascript",
+        )
+    }
+    values = {"commands": commands}
+    values.update(overrides)
+    return darwin_facts(**values)
+
+
 class FakeClock:
     """Deterministic monotonic clock whose ``sleep`` advances time."""
 

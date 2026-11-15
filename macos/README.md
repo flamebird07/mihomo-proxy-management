@@ -17,6 +17,7 @@ common/python/mpm_common/        平台/执行器/脱敏/原子写/controller �
 macos/python/mpm_macos/
   paths.py            系统路径布局（root 可注入，测试用临时目录）
   preflight.py        Darwin + arm64 + root + 命令能力（不探测 /dev/net/tun）
+  context.py          CLI/mpm-switch/boot 共用的安装上下文：登记唯一绝对 mihomo 路径
   launchdctl.py       只操作固定 label 的 launchctl 适配器
   plist.py            plistlib 渲染 + 静态审计
   network_proxy.py    networksetup 快照/设置/恢复/读回校验/事务状态
@@ -301,6 +302,60 @@ sudo /usr/local/bin/mihomo-proxy-management switch boot --drill-fail
 ```
 
 预期：报告 FAILED，机器回到 Nextin 已连接、core 已 stop + disable 的状态。
+
+### 3.2 开机预检与安装上下文：boot 与 CLI 共用同一个绝对二进制（2026-11-15 kickstart 修复）
+
+**真实故障**：一次真正的 `launchctl kickstart system/com.mihomo-proxy-management.boot-switch`
+失败了。LaunchDaemon 的环境只有最小 `PATH=/usr/bin:/bin:/usr/sbin:/sbin`，而安装版
+mihomo 在 `Layout.binary`（`/usr/local/libexec/mihomo-proxy-management/current/mihomo`），
+**不在 PATH 上**。当时 `boot` 用的 `switch.build_context` 直接拿 `collect_facts()` 的
+PATH 结果当事实，没有像 CLI 那样把安装的 `layout.binary` 登记进去，于是预检误报
+`required command not found: mihomo`。机器已安全回退 Nextin。
+
+**修复**：新增共享模块 `mpm_macos/context.py`，CLI（`cli.make_context`）、`mpm-switch`
+（`switch.build_context`）与开机入口（`boot.main`）**全部**走同一个
+`context.build_context`，从此三者构造的 facts/上下文一致：
+
+* `context.resolve_runtime_binary(layout)` 决定唯一的运行时绝对路径：
+  **只承认安装版**——`layout.binary` 必须存在、是普通文件且可执行（`os.path.isfile` +
+  `os.access(X_OK)`），否则返回空。**不再回退 `MPM_MIHOMO_BINARY`**：core runner
+  永远执行 `layout.binary`，若允许 override 参与运行时解析，就会出现
+  “预检/`mihomo -t` 验证 A、实际启动 B”的分叉。
+* `context.register_binary` 把安装版绝对路径写进 `facts.commands["mihomo"]`；
+  安装版不可用就**删除** mihomo 条目（包括 PATH 上的陈旧条目与安装来源 override），
+  预检随即 fail closed。运行时**从不**查 PATH，也从不读 override——两者都只是安装来源候选。
+* 安装来源单独解析（`context.resolve_install_source`）：`MPM_MIHOMO_BINARY` 优先，
+  否则 `shutil.which("mihomo", path=ctx.environ["PATH"])`，且必须是绝对、普通、
+  可执行文件（相对 override 会 `abspath` 成绝对）。`install` 的平台预检用
+  `require_mihomo=False`——它自己负责装入二进制，不能在复制前要求“运行时 mihomo 已安装”，
+  否则仅 PATH 来源的首次安装会被提前拒绝；其余能力检查（arm64/root/launchctl/networksetup）
+  一项不放宽。无来源且无安装版时在写入任何文件前 fail closed；复制成功后重新
+  `register_binary` 登记 `layout.binary`，再做配置验证、plist 安装与启动。
+* 独立 `preflight`/`configure`/`start` 在安装版缺失/不可执行时**直接 fail closed**：
+  `configure` 在读写任何文件前检查安装版，`start` 在预检后再核对一次 `layout.binary`
+  （facts 是构造时快照，陈旧能力不能放行 bootstrap）。即便 override 指向有效的 A，
+  也不会执行或验证 A，更不会 bootstrap core；修复损坏安装请重跑 `install`
+  （从 override/PATH 重新复制并重新登记）。
+* 为避免循环 import，`context` 模块级只 import `preflight`/`paths`，`lifecycle.Context`
+  在 `build_context` 内部 import；`lifecycle`/`plist` 则在模块级 import `context`。
+
+**验证与启动用同一个文件**：`lifecycle._default_validator` 在 `mihomo -t` 时**重新**调用
+`resolve_runtime_binary`，而不是信任某个缓存路径——运行时解析只认 `layout.binary`，
+override 完全不参与，验证不可能被导向别的文件。两个 plist（core 与 boot-switch）都在
+`EnvironmentVariables` 注入 `MPM_MIHOMO_BINARY=__BINARY__`（与 runner 的 `--binary`
+同一个占位符，**只是路径，不含 secret/订阅 URL**）。`plist.audit` 额外强制：
+`MPM_MIHOMO_BINARY` 若存在必须是 POSIX 绝对路径；core 里它还必须等于 runner 的
+`--binary` 参数。runner 原样执行 plist 的 `--binary`，于是预检、`mihomo -t`、常驻启动
+三者锁定同一个绝对路径。**没有**靠扩展 PATH 来掩盖问题。
+
+**fail closed 与回退不变**：未安装/不可执行/错误路径 → 预检 `Unsupported`（退出码 4）→
+`switch_to_mihomo_root` 的 except → `_root_rollback`：core stop + disable、Nextin 重新连接。
+原有“网络未就绪 / Nextin 残留 / 端口释放”等测试全部保留。
+
+**真实重启未验**：本修复同样只用 host-free 单测覆盖（见第 7 节
+`test_macos_context.py` 与 boot/plist 回归），**没有真的重启过机器**，也没有在真机执行
+`launchctl`/`scutil`/`osascript`。最小 PATH 下 boot 与 CLI 事实一致、未安装即 fail closed
+回退 Nextin，都由注入式测试证明；真实重启后的开机自动切换仍需网管在维护窗口确认。
 
 ## 4. 过滤表达式与生产顺序对照表
 
@@ -715,6 +770,16 @@ mpm-switch mihomo --drill-fail
   Disconnecting → 端口稍后释放 → 原 ProxyTunnel PID 退出）、端口始终不释放或 PID 始终不退出
   则 fail closed、稳定断开窗口（每次轮询都必须是 Disconnected）、启动后重连
   回退、首次 start 被忽略后重发、双向切换、回滚恢复代理快照）；
+* `test_macos_context.py`（2026-11-15 kickstart 回归 + 运行时分叉回归）：LaunchDaemon 最小 PATH
+  （`/usr/bin:/bin:/usr/sbin:/sbin`）+ 已安装可执行文件时，CLI / `mpm-switch` / boot
+  三个入口的 facts/上下文完全一致且预检通过；运行时只认安装版，override/PATH 只是安装来源；
+  未安装/不可执行/目录占位/无效 override 一律 fail closed（删除 mihomo 条目）；
+  override（含相对路径）只作为安装来源解析为绝对路径；`configure` 验证的是安装版而非 override，
+  安装前独立 configure 直接 fail closed（不再验证安装来源）；
+  **B 缺失/不可执行、A 有效且 plist 已存在**时 `preflight`/`start`/`configure` 全部 fail closed：
+  不执行/不验证 A、不 bootstrap core（陈旧 facts 仍登记 A 时 start 也拒绝）；
+  `install` 能从 override 重新复制修复缺失的安装版；安装后的两个 plist 都注入绝对安装路径
+  且 core 的环境变量等于 runner 的 `--binary`；
 * `test_macos_boot.py`（开机入口，全部注入 clock/sleeper/executor，不真实 sleep、不调真机
   `launchctl`）：控制台用户未就绪超时零副作用、默认路由一直不就绪不启动任何东西、网络先失败
   后就绪仍继续切换、Nextin 残留/端口延迟释放时先等 teardown 再 start、探测/健康失败回退
@@ -723,6 +788,10 @@ mpm-switch mihomo --drill-fail
   boot-switch enabled（读回）且不 kickstart、`start` 成功后 core 仍 disabled、
   `uninstall` 处理 boot-switch、boot plist 审计（无 forbidden token、无
   `SuccessfulExit:false` 的 `KeepAlive`、入口必须是 `mpm_macos.boot`）；
+  **kickstart 回归**：最小 PATH + 安装版可执行文件时 boot 事实登记安装绝对路径、
+  预检通过并跑完整切换（不再误报 `required command not found: mihomo`）；无可用二进制时
+  fail closed（退出码 4）并回退 Nextin（core 不 bootstrap、保持 disabled、Nextin 已连接）；
+  boot plist 注入绝对安装路径、审计拒绝相对 `MPM_MIHOMO_BINARY`；
 * 健康门的总 deadline 单独测在 `tests/test_controller_health_deadline.py`
   （healthcheck 超时算“已触发”、轮询到 alive 即通过、deadline 到期无 alive 的准确信息、
   controller 真不可达、存活未知、provider 不可见、`/providers/proxies` 正常但 `/proxies`
@@ -730,7 +799,9 @@ mpm-switch mihomo --drill-fail
   行为不变、短超时 2 秒），全部注入 sleeper/clock；
 * plist 审计按**目标平台**判定绝对路径（`posixpath`），测试用 sandbox root 在渲染
   plist 前映射为 POSIX 目标路径（`Layout.to_target_path`），因此 Windows 宿主不会
-  把 `C:\...` 写进 LaunchDaemon；
+  把 `C:\...` 写进 LaunchDaemon；`test_macos_plist.py` 还覆盖 core plist 的
+  `MPM_MIHOMO_BINARY` 必须等于 runner 的 `--binary`、审计拒绝相对路径或与 `--binary`
+  不一致的环境变量；
 * `linux/tests` 在 Windows 上整体 skip（`linux/tests/conftest.py` 的
   `pytest_collection_modifyitems`，reason 写明 Linux/POSIX-only）：这些是 Linux 宿主
   测试，在 Windows 上运行没有意义，属于平台不适用而非真实缺陷；Linux/macOS 上的行为不变；

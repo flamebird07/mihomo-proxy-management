@@ -44,6 +44,7 @@ from xml.sax.saxutils import escape
 
 from mpm_common.errors import FailClosed
 
+from .context import BINARY_ENV
 from .paths import BOOT_LABEL, LABEL
 
 PLACEHOLDERS = (
@@ -204,6 +205,12 @@ def _audit_paths_and_environment(document: Any) -> str:
         not any("secret" in str(key).lower() for key in environment),
         "EnvironmentVariables must not carry a secret",
     )
+    binary_env = environment.get(BINARY_ENV)
+    if binary_env is not None:
+        _require(
+            _is_target_absolute(binary_env),
+            f"{BINARY_ENV} must be the absolute installed mihomo path",
+        )
     return str(working)
 
 
@@ -228,6 +235,16 @@ def _audit_core(document: Any, *, label: str, home_dir: str | None) -> dict[str,
 
     arguments = _audit_program_arguments(document)
     _require("mpm_macos.runner" in arguments, "ProgramArguments must point at mpm_macos.runner")
+
+    # Verification and start must use one file: the injected environment path
+    # may not diverge from the ``--binary`` argument the runner executes.
+    environment = document.get("EnvironmentVariables", {})
+    binary_env = environment.get(BINARY_ENV) if isinstance(environment, dict) else None
+    if binary_env is not None and "--binary" in arguments:
+        _require(
+            arguments[arguments.index("--binary") + 1] == binary_env,
+            f"{BINARY_ENV} must equal the runner's --binary path",
+        )
 
     working = _audit_paths_and_environment(document)
     if home_dir is not None:

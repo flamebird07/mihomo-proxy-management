@@ -10,22 +10,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-from dataclasses import replace
 from typing import TextIO
 
 from mpm_common.errors import ExitCode, FailClosed, MpmError
-from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST, sanitize
 
-from . import __version__, boot as boot_mod, lifecycle, preflight as preflight_mod, probe as probe_mod
+from . import __version__, boot as boot_mod, context as context_mod, lifecycle
+from . import probe as probe_mod
 from . import switch as switch_mod
-from .paths import Layout
 
 PROGRAM = "mihomo-proxy-management"
-ENV_ROOT = "MPM_ROOT"
-ENV_PYTHON = "MPM_PYTHON"
 
 # Every command that can change config, launchd, the proxy snapshot or files.
 # They are serialised by the lifecycle lock; the lifecycle functions they call
@@ -136,28 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def make_context(args: argparse.Namespace, *, stdout: TextIO, stderr: TextIO) -> lifecycle.Context:
-    root = args.root or os.environ.get(ENV_ROOT, "/")
-    layout = Layout(root)
-    facts = preflight_mod.collect_facts()
-    # mihomo is installed under libexec (not on PATH); a fresh install can point
-    # at an explicit source binary.  Either satisfies the preflight check.
-    binary = os.environ.get("MPM_MIHOMO_BINARY") or (
-        layout.binary if os.path.isfile(layout.binary) else ""
-    )
-    if binary:
-        commands = dict(facts.commands)
-        commands["mihomo"] = binary
-        facts = replace(facts, commands=commands)
-    return lifecycle.Context(
-        layout=layout,
-        facts=facts,
-        executor=Executor(),
-        out=stdout,
-        err=stderr,
-        environ=dict(os.environ),
-        system_profile=True,
-        python=os.environ.get(ENV_PYTHON) or sys.executable,
-    )
+    # Shared with mpm-switch/boot so every entry registers the same installed binary.
+    ctx = context_mod.build_context(args.root)
+    ctx.out = stdout
+    ctx.err = stderr
+    return ctx
 
 
 def dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Report:

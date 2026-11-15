@@ -29,7 +29,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -65,6 +64,7 @@ from mpm_common.sanitize import HOST, sanitize
 
 from . import config as config_mod
 from . import conflict as conflict_mod
+from . import context as context_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
 from .launchdctl import Launchd
@@ -644,8 +644,12 @@ def _ensure_provider(ctx: Context, secrets: Secrets) -> list[str]:
 
 def _default_validator(ctx: Context) -> Callable[[str], None]:
     def validate(text: str) -> None:
-        if not os.path.isfile(ctx.layout.binary):
-            return  # nothing to validate against; install will require the binary
+        # The same absolute path the plist hands the runner: only the installed
+        # binary qualifies, so ``mihomo -t`` can never run a different file
+        # than the start.
+        binary = context_mod.resolve_runtime_binary(ctx.layout)
+        if not binary:
+            raise FailClosed(preflight_mod.MIHOMO_MISSING_REASON)
         # Fail closed *before* mihomo runs: a missing geo database makes mihomo
         # fetch it from GitHub, which hangs an offline install.
         config_mod.ensure_geodata(text, ctx.layout.mihomo_home)
@@ -653,7 +657,7 @@ def _default_validator(ctx: Context) -> Callable[[str], None]:
             candidate = os.path.join(staging, "config.yaml")
             write_atomic(candidate, text, mode=0o600, mkdir=False)
             config_mod.validate(
-                ctx.layout.binary, candidate, ctx.layout.mihomo_home, ctx.executor
+                binary, candidate, ctx.layout.mihomo_home, ctx.executor
             )
 
     return validate
@@ -675,6 +679,12 @@ def configure(
     """
     report = Report(command="configure")
     layout = ctx.layout
+    # Fail closed before any read/write: without a usable installed binary
+    # there is nothing the runner could execute, and an install-source
+    # override must not be validated in its place (install re-runs configure
+    # after the copy, when the installed path exists).
+    if not context_mod.resolve_runtime_binary(layout):
+        raise FailClosed(preflight_mod.MIHOMO_MISSING_REASON)
     if secrets is None:
         secrets = ctx.secrets()
     state = load_state(layout) or DeploymentState()
@@ -929,26 +939,40 @@ def _confirmed_bootout(boot: Launchd) -> tuple[bool, str]:
 # ---- install --------------------------------------------------------------
 
 
+_MIHOMO_SOURCE_MISSING = (
+    "mihomo binary not found: set MPM_MIHOMO_BINARY or put mihomo on PATH "
+    "(this installer never downloads)"
+)
+
+
 def _install_binary(ctx: Context) -> bool:
     """Copy a user-supplied mihomo into ``libexec`` (this installer never downloads).
 
-    ``MPM_MIHOMO_BINARY`` selects the source explicitly; otherwise ``mihomo``
-    on ``PATH`` is used.  Geo databases found next to the source are copied into
-    the **mihomo home** (``layout.support``), because that is the ``-d``
-    directory used by both ``mihomo -t`` (``config.validate``) and the resident
-    runner (``mihomo -d``), and the rendered provider path is below it too.
+    The install source is resolved separately from the runtime capability
+    (``context.resolve_install_source``): ``MPM_MIHOMO_BINARY`` selects it
+    explicitly, otherwise ``mihomo`` on the context's ``PATH`` is used; it must
+    be an absolute regular executable file.  Geo databases found next to the
+    source are copied into the **mihomo home** (``layout.support``), because
+    that is the ``-d`` directory used by both ``mihomo -t``
+    (``config.validate``) and the resident runner (``mihomo -d``), and the
+    rendered provider path is below it too.
     """
     layout = ctx.layout
-    source = ctx.environ.get("MPM_MIHOMO_BINARY") or shutil.which("mihomo")
+    source = context_mod.resolve_install_source(ctx.environ)
     if not source:
-        if os.path.isfile(layout.binary):
+        if context_mod.is_usable_binary(layout.binary):
             return False
-        raise FailClosed(
-            "mihomo binary not found: set MPM_MIHOMO_BINARY or put mihomo on PATH "
-            "(this installer never downloads)"
-        )
-    if not os.path.isfile(source):
-        raise FailClosed(f"mihomo binary does not exist: {source}")
+        override = (ctx.environ.get(context_mod.BINARY_ENV) or "").strip()
+        if override:
+            raise FailClosed(
+                "mihomo binary is not a regular executable file: "
+                + os.path.abspath(override)
+            )
+        if os.path.isfile(layout.binary):
+            raise FailClosed(
+                "mihomo binary is not a regular executable file: " + layout.binary
+            )
+        raise FailClosed(_MIHOMO_SOURCE_MISSING)
 
     changed = False
     if os.path.abspath(source) != os.path.abspath(layout.binary):
@@ -979,9 +1003,19 @@ def _install_binary(ctx: Context) -> bool:
 def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> Report:
     report = Report(command="install")
     layout = ctx.layout
-    check = preflight_mod.preflight(ctx.facts)
+    # install supplies the binary itself (override or PATH source), so the
+    # platform preflight must not require the runtime mihomo to be installed
+    # already - a first install from PATH only would otherwise be refused
+    # before the copy.  Every other capability check stays strict.
+    check = preflight_mod.preflight(ctx.facts, require_mihomo=False)
     for warning in check.warnings:
         report.warn(warning)
+    # No runtime binary and no install source: fail before any artifact is
+    # written (the copy re-checks the source at install time).
+    if not context_mod.resolve_runtime_binary(layout) and not context_mod.resolve_install_source(
+        ctx.environ
+    ):
+        raise FailClosed(_MIHOMO_SOURCE_MISSING)
     _prepare_dirs(ctx)
     # A previous root install may have left root:admin artifacts behind (BSD
     # group inheritance); repair them before the ownership check reads them.
@@ -1002,6 +1036,10 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
     report.data["installed_files"] = len(changed)
     if _install_binary(ctx):
         report.add("mihomo binary installed")
+    # The facts were built before the copy existed (a PATH find is never a
+    # runtime capability).  Re-register now so configure's ``mihomo -t`` and
+    # start's preflight see the installed absolute path - never the source.
+    ctx.facts = context_mod.register_binary(ctx.facts, layout)
 
     nodes = _ensure_provider(ctx, secrets)
     report.data["provider_nodes"] = len(nodes)
@@ -1630,6 +1668,12 @@ def start(
     check = preflight_mod.preflight(ctx.facts)
     for warning in check.warnings:
         report.warn(warning)
+
+    # The facts are a snapshot from context construction: re-check the
+    # installed binary itself so a stale mihomo capability can never bootstrap
+    # the runner while the file the plist executes is missing/unusable.
+    if not context_mod.resolve_runtime_binary(layout):
+        raise FailClosed(preflight_mod.MIHOMO_MISSING_REASON)
 
     launchd = ctx.launchd()
     current = launchd.state()

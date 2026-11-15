@@ -142,6 +142,7 @@ from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST, sanitize
 
 from . import conflict as conflict_mod
+from . import context as context_mod
 from . import lifecycle, probe as probe_mod
 from .launchdctl import Launchd, parse_print
 
@@ -1872,18 +1873,7 @@ def switch_to_nextin(
 
 
 def build_context(argv_root: str | None = None) -> lifecycle.Context:
-    from . import preflight as preflight_mod
-    from .paths import Layout
-
-    layout = Layout(argv_root or os.environ.get("MPM_ROOT", "/"))
-    return lifecycle.Context(
-        layout=layout,
-        facts=preflight_mod.collect_facts(),
-        executor=Executor(),
-        environ=dict(os.environ),
-        system_profile=True,
-        python=os.environ.get("MPM_PYTHON") or sys.executable,
-    )
+    return context_mod.build_context(argv_root)
 
 
 def _print_report(ctx: lifecycle.Context, report: lifecycle.Report) -> int:

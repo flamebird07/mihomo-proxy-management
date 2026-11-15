@@ -139,3 +139,25 @@ def test_foreign_label_is_refused():
 
 def test_render_is_deterministic():
     assert _rendered() == _rendered()
+
+
+def test_core_plist_env_binary_matches_the_runner_argument():
+    document = plistlib.loads(_rendered().encode("utf-8"))
+    arguments = document["ProgramArguments"]
+    binary = arguments[arguments.index("--binary") + 1]
+    assert document["EnvironmentVariables"]["MPM_MIHOMO_BINARY"] == binary
+    assert binary == RENDER_ARGS["binary"]
+
+
+def test_audit_rejects_a_relative_binary_env_override():
+    document = plistlib.loads(_rendered().encode("utf-8"))
+    document["EnvironmentVariables"]["MPM_MIHOMO_BINARY"] = "mihomo"
+    with pytest.raises(FailClosed):
+        plist.audit(document)
+
+
+def test_audit_rejects_an_env_binary_that_diverges_from_the_runner_argument():
+    document = plistlib.loads(_rendered().encode("utf-8"))
+    document["EnvironmentVariables"]["MPM_MIHOMO_BINARY"] = RENDER_ARGS["binary"] + "-other"
+    with pytest.raises(FailClosed):
+        plist.audit(document)
