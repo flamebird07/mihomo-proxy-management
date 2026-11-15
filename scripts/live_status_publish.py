@@ -23,7 +23,9 @@ text: aware UTC stamps (ippool ``updated_at``) are converted, naive stamps are
 read as Beijing time. Tokens, secrets and subscription URLs are never printed,
 logged or written.
 
-The exit code is always 0. A failed collection or evaluation still writes a
+The exit code is 0 except when Feishu credentials are missing
+(``credentials_missing`` exits 1, so a misconfigured scheduled task is visible
+to the scheduler). A failed collection or evaluation still writes a
 best-effort 数据陈旧 row (状态等级=严重) rather than raising. A failed
 collection row names the failure category in its summary (api_unreachable,
 timeout, invalid_json, ...) — never a URL, token or raw error text.
@@ -60,7 +62,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
+# Kept for compatibility; the token itself is resolved by resolve_app_token,
+# never hardcoded.
+DEFAULT_APP_TOKEN = None
+APP_TOKEN_ENV_KEY = "FEISHU_BITABLE_APP_TOKEN"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\live-status-publish.log"
 DEFAULT_LOCK_FILE = r"C:\mihomo\live-status-publish.lock"
@@ -431,6 +436,18 @@ def read_env_file(path: str) -> dict[str, str]:
     return values
 
 
+def resolve_app_token(cli_token: str | None, env: dict[str, str]) -> str:
+    """Bitable app token: --app-token > process env > env file; "" when absent.
+
+    The returned value is a credential: never log or print it.
+    """
+    for candidate in (cli_token, os.environ.get(APP_TOKEN_ENV_KEY), env.get(APP_TOKEN_ENV_KEY)):
+        value = (candidate or "").strip()
+        if value:
+            return value
+    return ""
+
+
 class FeishuClient:
     BASE = "https://open.feishu.cn/open-apis"
 
@@ -635,7 +652,11 @@ def build_client(args, log: Logger) -> FeishuClient:
     app_secret = (env.get("FEISHU_APP_SECRET") or "").strip()
     if not app_id or not app_secret:
         raise PublishError("credentials_missing", "FEISHU_APP_ID/FEISHU_APP_SECRET not set")
-    return FeishuClient(app_id, app_secret, args.app_token, log)
+    app_token = resolve_app_token(args.app_token, env)
+    if not app_token:
+        raise PublishError("credentials_missing",
+                           "FEISHU_BITABLE_APP_TOKEN not set (--app-token / env / --env-file)")
+    return FeishuClient(app_id, app_secret, app_token, log)
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1116,8 @@ def _add_collector_defaults(parser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Upsert the single 实时状态 row in Feishu Bitable (exit code always 0).",
+        description="Upsert the single 实时状态 row in Feishu Bitable "
+                    "(exit 1 only when Feishu credentials are missing).",
         epilog=(f"default --log-file {DEFAULT_LOG_FILE} and --lock-file {DEFAULT_LOCK_FILE}; "
                 "a --dry-run run still writes the log (redirect it with --log-file); "
                 "Feishu calls retry HTTP 429/5xx, timeouts and connection errors "
@@ -1118,9 +1140,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="remembers the last successfully published collection time")
     parser.add_argument("--stale-minutes", type=float, default=DEFAULT_STALE_MINUTES,
                         help=f"data age above which 数据是否陈旧=是 (default {DEFAULT_STALE_MINUTES})")
-    parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN, help="Bitable app token")
+    parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
+                        help="Bitable app token (overrides env FEISHU_BITABLE_APP_TOKEN and the env file)")
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                        help="file holding FEISHU_APP_ID/FEISHU_APP_SECRET")
+                        help="file holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN")
     parser.add_argument("--table-id", default=None,
                         help=f"skip the {TABLE_NAME} table lookup and use this table_id")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE,
@@ -1230,6 +1253,7 @@ def main(argv=None, client_factory: Callable[[Any, Logger], Any] | None = None,
     log.info(f"start mode={mode} table={TABLE_NAME} key={KEY_VALUE} "
              f"log={args.log_file} lock={args.lock_file}")
     result = "failed"
+    exit_code = 0
     if client_factory is None:
         client_factory = build_client
     lock = (lock_factory or PublishLock)(args.lock_file, log)
@@ -1244,6 +1268,8 @@ def main(argv=None, client_factory: Callable[[Any, Logger], Any] | None = None,
     except PublishError as exc:
         log.error(f"publish failed kind={exc.kind} detail={exc.detail}")
         result = f"failed_{exc.kind}"
+        if exc.kind == "credentials_missing":
+            exit_code = 1
     except Exception:
         log.exception("publish failed unexpectedly")
         result = "failed_unexpected"
@@ -1254,7 +1280,7 @@ def main(argv=None, client_factory: Callable[[Any, Logger], Any] | None = None,
             except Exception:
                 log.exception("lock release failed")
         log.info(f"end mode={mode} result={result} duration_sec={time.time() - started:.2f}")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

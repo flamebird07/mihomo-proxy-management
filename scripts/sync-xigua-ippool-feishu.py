@@ -261,13 +261,18 @@ def main(argv=None) -> int:
         app_secret = (env.get("FEISHU_APP_SECRET") or "").strip()
         if not app_id or not app_secret:
             raise base.SyncError("config_error", "feishu_credentials_missing")
-        client = base.FeishuClient(app_id, app_secret, args.app_token, log)
+        app_token = base.resolve_app_token(args.app_token, env)
+        if not app_token:
+            raise base.SyncError(
+                "config_error",
+                "feishu_app_token_missing: FEISHU_BITABLE_APP_TOKEN (--app-token > env > --env-file)")
+        client = base.FeishuClient(app_id, app_secret, app_token, log)
         result = sync_snapshot(client, Path(args.ippool_state), Path(args.final_provider),
                                Path(args.cursor), log)
         print(json.dumps({"status": result, "table": TABLE_NAME}, ensure_ascii=False))
         return 0
     except base.SyncError as exc:
-        log.error(f"sync failed class={exc.kind}")
+        log.error(f"sync failed class={exc.kind} detail={exc.detail}")
         print(json.dumps({"status": "error", "class": exc.kind}), file=sys.stderr)
         return 3 if exc.kind == "lock_busy" else 1
     except Exception as exc:

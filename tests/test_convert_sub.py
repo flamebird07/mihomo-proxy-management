@@ -32,6 +32,8 @@ import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, os.pardir, "scripts", "convert_sub.py")
 
@@ -920,6 +922,8 @@ class SafetyRegressionTests(unittest.TestCase):
         self.assertIn("exit $result", script)
 
 
+@pytest.mark.windows_only
+@unittest.skipUnless(sys.platform == "win32", "windows_only: real PowerShell execution")
 class PowerShellIsolationTests(unittest.TestCase):
     def test_wrapper_exit_codes_with_temporary_stub_converter(self):
         shell = shutil.which("powershell.exe") or shutil.which("pwsh")

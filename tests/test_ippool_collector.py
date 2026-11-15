@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -10,6 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +19,14 @@ SCRIPT = ROOT / "scripts" / "ippool-collector.py"
 spec = importlib.util.spec_from_file_location("ippool_collector", SCRIPT)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+
+
+def windows_only(func):
+    """Tests that really launch powershell.exe/cmd.exe; pure parsing stays."""
+    func = pytest.mark.windows_only(func)
+    return pytest.mark.skipif(
+        sys.platform != "win32", reason="windows_only: real powershell.exe execution"
+    )(func)
 
 
 def node(name="西瓜-美国", server="us.example.indxg.com", port=46002):
@@ -247,6 +257,7 @@ class CollectorTests(unittest.TestCase):
             mod.run(self.args(), self.resolver, self.healthy)
         self.assertFalse(self.output.exists())
 
+    @windows_only
     def test_production_wrapper_requires_explicit_final_provider(self):
         wrapper = ROOT / "scripts" / "run-xigua-ippool.ps1"
         completed = subprocess.run([
@@ -257,6 +268,7 @@ class CollectorTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("FinalProvider", completed.stdout + completed.stderr)
 
+    @windows_only
     def test_stage2_failure_keeps_final_and_passes_bound_arguments(self):
         wrapper = ROOT / "scripts" / "run-xigua-ippool.ps1"
         fake_bin = self.root / "fake-bin"
@@ -315,6 +327,7 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(calls[2][0].endswith("sync-xigua-ippool-feishu.py"))
         self.assertTrue(os.path.samefile(calls[2][calls[2].index("--final-provider") + 1], final))
 
+    @windows_only
     def test_task_installer_uses_short_launcher_and_whatif_has_no_side_effect(self):
         installer = ROOT / "scripts" / "install-xigua-ippool-task.ps1"
         runtime = self.root / "rt"
@@ -381,6 +394,7 @@ class CollectorTests(unittest.TestCase):
         self.assertFalse(whatif_root.exists())
         self.assertFalse(whatif_log.exists())
 
+    @windows_only
     def test_task_installer_surfaces_schtasks_failure(self):
         installer = ROOT / "scripts" / "install-xigua-ippool-task.ps1"
         runtime = self.root / "failure-rt"
@@ -400,6 +414,7 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("FAKE-SCHTASKS-ERROR", output)
         self.assertIn("schtasks failed with exit code 9", output)
 
+    @windows_only
     def test_task_installer_passes_explicit_account_and_run_level(self):
         installer = ROOT / "scripts" / "install-xigua-ippool-task.ps1"
         runtime = self.root / "ru-rt"

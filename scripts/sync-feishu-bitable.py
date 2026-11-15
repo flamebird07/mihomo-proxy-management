@@ -10,8 +10,8 @@ Three tables are maintained in one Bitable app (one sync batch per run):
 
 Security contract
 -----------------
-* Subscription URLs, FEISHU_APP_SECRET and tenant_access_token are never
-  printed, logged or persisted by this script.
+* Subscription URLs, FEISHU_APP_SECRET, FEISHU_BITABLE_APP_TOKEN and
+  tenant_access_token are never printed, logged or persisted by this script.
 * Log lines carry only HTTP status codes, row counts and error
   classifications (http_403 / token_error / timeout / tls_error / dns_error /
   connection_reset / connection_refused / network_error / parse_error /
@@ -73,7 +73,10 @@ except ImportError:  # pragma: no cover - convert_sub fails closed on its own
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
+# Kept for entrypoints that reference base.DEFAULT_APP_TOKEN; the token itself
+# is resolved by resolve_app_token, never hardcoded.
+DEFAULT_APP_TOKEN = None
+APP_TOKEN_ENV_KEY = "FEISHU_BITABLE_APP_TOKEN"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
 DEFAULT_STATE_FILE = r"C:\mihomo\feishu-bitable-tables.json"
 DEFAULT_SYNC_STATE_FILE = r"C:\mihomo\state\feishu-bitable-sync-state.json"
@@ -466,6 +469,18 @@ def read_env_file(path: str) -> dict[str, str]:
     except (OSError, UnicodeError):
         pass
     return values
+
+
+def resolve_app_token(cli_token: str | None, env: dict[str, str]) -> str:
+    """Bitable app token: --app-token > process env > env file; "" when absent.
+
+    The returned value is a credential: never log or print it.
+    """
+    for candidate in (cli_token, os.environ.get(APP_TOKEN_ENV_KEY), env.get(APP_TOKEN_ENV_KEY)):
+        value = (candidate or "").strip()
+        if value:
+            return value
+    return ""
 
 
 class SyncError(Exception):
@@ -3162,8 +3177,10 @@ def select_write_keys(speedtest_ran: bool, speedtest_write: bool,
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync mihomo status into a Feishu Bitable.")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE, help="File holding FEISHU_APP_ID/SECRET")
-    parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN)
+    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
+                        help="File holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN")
+    parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
+                        help="Bitable app token (overrides env FEISHU_BITABLE_APP_TOKEN and the env file)")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--ninja-only", action="store_true", help="Probe Ninja and update only table 2")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
@@ -3283,7 +3300,11 @@ def main(argv: list[str] | None = None) -> int:
         app_secret = (env.get("FEISHU_APP_SECRET") or "").strip()
         if not app_id or not app_secret:
             raise SyncError("token_error", "credentials_missing")
-        client = FeishuClient(app_id, app_secret, args.app_token, log)
+        app_token = resolve_app_token(args.app_token, env)
+        if not app_token and not args.dry_run:
+            raise SyncError("token_error",
+                            "app_token_missing: FEISHU_BITABLE_APP_TOKEN (--app-token > env > --env-file)")
+        client = FeishuClient(app_id, app_secret, app_token, log)
         if args.ninja_only:
             if args.dry_run:
                 raise SyncError("invalid_args", "--ninja-only requires a write run")
@@ -3296,7 +3317,7 @@ def main(argv: list[str] | None = None) -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
                 jobs = []
                 if (SOURCE1_ROOT / "all-nodes.private.yaml").exists():
-                    source1_client = FeishuClient(app_id, app_secret, args.app_token, log)
+                    source1_client = FeishuClient(app_id, app_secret, app_token, log)
                     jobs.append(workers.submit(sync_source1, source1_client, table_id,
                                 (tables.get("gpt_regions") or {}).get("table_id"), log, globals()))
                 if (ROOT / "nodes.yaml").exists():

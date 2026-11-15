@@ -7,8 +7,12 @@
 #   __SUBSCRIPTION_INTERVAL__  订阅刷新间隔（分钟，0=仅启动拉一次）
 #   __SECRET__                 Dashboard 密码（留空 = 无密码）
 #
-# 节点命名不同？调整下方 US-FAST / VIETNAM 组的 filter
+# 本模板是 Windows / macOS 共用的生产策略单一来源。
+# 模板中不得出现真实节点名、订阅地址或密钥：所有组成员都通过
+# proxy-provider 的 use + filter（或区域子组）获得。
 # =====================================================================
+
+mode: rule
 
 external-controller: 127.0.0.1:9090
 secret: "__SECRET__"
@@ -88,6 +92,9 @@ proxy-providers:
 
 # =====================================================================
 # Proxy groups
+#
+# 区域子组只通过 filter 从订阅里挑节点，模板本身不含任何节点名。
+# 组顺序 = 生产候选顺序（fallback 按列表顺序选第一个可用项）。
 # =====================================================================
 proxy-groups:
   - name: PROXY
@@ -108,25 +115,91 @@ proxy-groups:
     tolerance: 100
     timeout: 5000
 
-  - name: CODEBUDDY
+  # ---- CURSOR: 美国优先，日本兜底（无 DIRECT） ----
+  - name: CURSOR-US
     type: fallback
+    use:
+      - subscription
+    filter: '(?i)美国|美國|\bUS\b|USA|United States|🇺🇸'
+    url: https://cursor.com/
+    interval: 180
+    timeout: 8000
+    lazy: false
+
+  - name: CURSOR-JP
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)日本|\bJP\b|Japan|🇯🇵'
+    url: https://cursor.com/
+    interval: 180
+    timeout: 8000
+    lazy: false
+
+  - name: CURSOR
+    type: fallback
+    proxies:
+      - CURSOR-US
+      - CURSOR-JP
+    url: https://cursor.com/
+    interval: 180
+    timeout: 8000
+    lazy: false
+
+  # ---- CODEBUDDY: DIRECT 首位，其后 香港→台湾→新加坡→日本 ----
+  - name: CODEBUDDY-HK
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)香港|\bHK\b|Hong ?Kong|🇭🇰'
     url: https://www.codebuddy.ai/
     interval: 60
+    timeout: 5000
+
+  - name: CODEBUDDY-TW
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)台湾|台灣|\bTW\b|Taiwan|🇹🇼'
+    url: https://www.codebuddy.ai/
+    interval: 60
+    timeout: 5000
+
+  - name: CODEBUDDY-SG
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)新加坡|\bSG\b|Singapore|🇸🇬'
+    url: https://www.codebuddy.ai/
+    interval: 60
+    timeout: 5000
+
+  - name: CODEBUDDY-JP
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)日本|\bJP\b|Japan|🇯🇵'
+    url: https://www.codebuddy.ai/
+    interval: 60
+    timeout: 5000
+
+  - name: CODEBUDDY
+    type: fallback
     proxies:
       - DIRECT
-      - 香港05-×0.3
-      - 台湾08-×1
-      - 新加坡01-×0.3
-      - 台湾03-×0.3
-      - 香港01-×0.3
-      - 台湾01-×0.3
-      - 日本06-×1
+      - CODEBUDDY-HK
+      - CODEBUDDY-TW
+      - CODEBUDDY-SG
+      - CODEBUDDY-JP
+    url: https://www.codebuddy.ai/
+    interval: 60
+    timeout: 5000
 
   - name: US-FAST
     type: url-test
-    filter: "(?i)美|us|usa|🇺🇸"
     use:
       - subscription
+    filter: "(?i)美|us|usa|🇺🇸"
     url: https://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
@@ -153,8 +226,12 @@ proxy-groups:
 
 # =====================================================================
 # Rules
+# 顺序即语义（mihomo 命中第一条即停）：不要重排。
 # =====================================================================
 rules:
+  # 生产首条：火山引擎 Ark API 必须直连
+  - DOMAIN,ark.cn-beijing.volces.com,DIRECT
+
   - DOMAIN-SUFFIX,superboss.cc,DIRECT
   - GEOSITE,private,DIRECT
   - GEOIP,private,DIRECT,no-resolve
@@ -168,7 +245,14 @@ rules:
   - DOMAIN-SUFFIX,grok.com,US-FAST
   - DOMAIN-SUFFIX,chatgpt.com,US-FAST
 
-  # TikTok
+  # Cursor 五域
+  - DOMAIN-SUFFIX,cursor.com,CURSOR
+  - DOMAIN-SUFFIX,cursor.sh,CURSOR
+  - DOMAIN-SUFFIX,cursorapi.com,CURSOR
+  - DOMAIN-SUFFIX,cursor-auth.com,CURSOR
+  - DOMAIN-SUFFIX,cursorvm.com,CURSOR
+
+  # TikTok（jinritemai 的 DIRECT 必须排在 GEOSITE,tiktok 之前）
   - DOMAIN-SUFFIX,jinritemai.com,DIRECT
   - GEOSITE,tiktok,VIETNAM
   - DOMAIN-SUFFIX,tiktok.com,VIETNAM

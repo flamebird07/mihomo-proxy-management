@@ -1,0 +1,304 @@
+"""``mihomo-proxy-management`` command line for macOS.
+
+The CLI holds no business logic: it builds a :class:`mpm_macos.lifecycle.Context`
+and dispatches.  Secrets are never command-line arguments - they come from the
+0600 file or the process environment - and every byte written to stdout/stderr
+passes through the sanitizer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import TextIO
+
+from mpm_common.errors import ExitCode, FailClosed, MpmError
+from mpm_common.sanitize import HOST, sanitize
+
+from . import __version__, boot as boot_mod, context as context_mod, lifecycle
+from . import probe as probe_mod
+from . import switch as switch_mod
+
+PROGRAM = "mihomo-proxy-management"
+
+# Every command that can change config, launchd, the proxy snapshot or files.
+# They are serialised by the lifecycle lock; the lifecycle functions they call
+# (install -> start, restart -> stop + start) never take it again.  ``switch``
+# is handled separately: the ordinary-user phase must not hold the lock while
+# its privileged child takes it.
+MUTATING_COMMANDS = frozenset(
+    {"install", "configure", "start", "stop", "restart", "uninstall"}
+)
+
+
+class _SanitisingWriter:
+    """Fallback guard: nothing reaches a stream unsanitised."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+
+    def write(self, data: str) -> int:
+        return self.stream.write(sanitize(data))
+
+    def flush(self) -> None:
+        try:
+            self.stream.flush()
+        except Exception:  # pragma: no cover - interpreter shutdown
+            pass
+
+    def isatty(self) -> bool:  # pragma: no cover - UI hint only
+        try:
+            return self.stream.isatty()
+        except Exception:
+            return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Deploy and operate mihomo on macOS (arm64, LaunchDaemon).",
+    )
+    parser.add_argument("--version", action="store_true", help="print the project version")
+    sub = parser.add_subparsers(dest="command")
+
+    def common(name: str, help_text: str) -> argparse.ArgumentParser:
+        item = sub.add_parser(name, help=help_text)
+        item.add_argument("--root", help="alternate filesystem root (staging/tests only)")
+        item.add_argument("--json", action="store_true", help="machine-readable output")
+        item.add_argument("--quiet", action="store_true", help="suppress progress lines")
+        return item
+
+    common("preflight", "report Darwin/arm64/root and command capabilities")
+    install = common("install", "install packages, config and LaunchDaemon, then start")
+    install.add_argument("--no-start", action="store_true", help="install without starting")
+    configure = common("configure", "re-render and validate config (idempotent)")
+    configure.add_argument(
+        "--mode",
+        choices=("tun", "mixed"),
+        help="force a mode (default: the recorded mode, then tun)",
+    )
+    for name, text in (
+        ("start", "start the LaunchDaemon and verify TUN (mixed only when asked)"),
+        ("stop", "bootout the LaunchDaemon, disable it and restore the system proxy"),
+        ("restart", "stop, confirm stopped, start, verify"),
+        ("status", "launchd/process/mode/proxy/controller status"),
+        ("health", "controller readiness, provider health and live nodes"),
+    ):
+        common(name, text)
+    start = sub.choices["start"]
+    start.add_argument(
+        "--mode",
+        choices=("tun", "mixed"),
+        help="explicit mode; mixed also sets the system proxy (default: tun)",
+    )
+
+    switch = common("switch", "switch between Nextin and mihomo (mpm-switch)")
+    switch.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=("mihomo", "nextin", "status", "rollback", "boot"),
+    )
+    switch.add_argument("--user", help="invoking user (passed to the root phase)")
+    switch.add_argument("--uid", type=int, help="invoking uid (passed to the root phase)")
+    switch.add_argument(
+        "--vpn-name",
+        help="VPN service name (default: Nextin / MPM_VPN_NAME); passed to the root phase",
+    )
+    switch.add_argument(
+        "--marker",
+        help="success marker for the shell wrapper (internal; root phase only)",
+    )
+    switch.add_argument(
+        "--drill-fail",
+        action="store_true",
+        help="force the post-switch probe to fail (rollback drill)",
+    )
+
+    probe = common("probe", "run the post-switch reachability probe")
+    probe.add_argument(
+        "--drill-fail",
+        action="store_true",
+        help="force the probe to fail (rollback drill)",
+    )
+
+    uninstall = common("uninstall", "remove the LaunchDaemon and program files")
+    uninstall.add_argument(
+        "--purge", action="store_true", help="also remove config, provider, logs and state"
+    )
+    return parser
+
+
+def make_context(args: argparse.Namespace, *, stdout: TextIO, stderr: TextIO) -> lifecycle.Context:
+    # Shared with mpm-switch/boot so every entry registers the same installed binary.
+    ctx = context_mod.build_context(args.root)
+    ctx.out = stdout
+    ctx.err = stderr
+    return ctx
+
+
+def dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Report:
+    """Single entry point; state-changing commands run under the lifecycle lock.
+
+    The lock is non-blocking: a concurrent operation is refused with a clear
+    error and a non-zero exit instead of interleaving config, launchd and
+    proxy-snapshot changes.
+
+    ``switch`` is special: the ordinary-user phase only stops the VPN and then
+    launches a privileged child, so it must not hold the lock (the child takes
+    it).  The root phase does take it.
+    """
+    needs_lock = args.command in MUTATING_COMMANDS
+    if args.command == "switch":
+        needs_lock = (
+            getattr(args, "action", "status") in ("mihomo", "nextin", "rollback", "boot")
+            and ctx.geteuid() == 0
+        )
+    if needs_lock:
+        with ctx.lifecycle_guard():
+            return _dispatch(ctx, args)
+    return _dispatch(ctx, args)
+
+
+def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Report:
+    command = args.command
+    if command == "preflight":
+        return lifecycle.run_preflight(ctx)
+    if command == "install":
+        return lifecycle.install(ctx, quiet=args.quiet, skip_start=bool(args.no_start))
+    if command == "configure":
+        return lifecycle.configure(ctx, quiet=args.quiet, mode=getattr(args, "mode", None))
+    if command == "start":
+        return lifecycle.start(ctx, quiet=args.quiet, mode=getattr(args, "mode", None))
+    if command == "stop":
+        return lifecycle.stop(ctx, quiet=args.quiet)
+    if command == "restart":
+        return lifecycle.restart(ctx, quiet=args.quiet)
+    if command == "status":
+        return lifecycle.status(ctx)
+    if command == "health":
+        return lifecycle.health(ctx)
+    if command == "switch":
+        action = getattr(args, "action", "status")
+        drill = True if getattr(args, "drill_fail", False) else None
+        if action == "status":
+            return switch_mod.status(ctx)
+        if action == "mihomo":
+            return switch_mod.switch_to_mihomo(
+                ctx,
+                force_fail=drill,
+                uid=getattr(args, "uid", None),
+                user=getattr(args, "user", None),
+                vpn_name=getattr(args, "vpn_name", None),
+                marker=getattr(args, "marker", None),
+            )
+        if action == "rollback":
+            return switch_mod.rollback(
+                ctx,
+                uid=getattr(args, "uid", None),
+                user=getattr(args, "user", None),
+                vpn_name=getattr(args, "vpn_name", None),
+            )
+        if action == "boot":
+            # The boot-switch LaunchDaemon's entry point, also usable for a
+            # manual `launchctl kickstart` acceptance run (no reboot needed).
+            return boot_mod.boot_switch(
+                ctx,
+                force_fail=drill,
+                vpn_name=getattr(args, "vpn_name", None),
+            )
+        return switch_mod.switch_to_nextin(
+            ctx,
+            uid=getattr(args, "uid", None),
+            user=getattr(args, "user", None),
+            vpn_name=getattr(args, "vpn_name", None),
+        )
+    if command == "probe":
+        report = lifecycle.Report(command="probe")
+        verdict = probe_mod.run_probe(
+            ctx.executor,
+            sleeper=ctx.sleeper,
+            force_fail=True if getattr(args, "drill_fail", False) else None,
+        )
+        report.data = verdict.to_dict()
+        for line in verdict.lines():
+            report.add(line)
+        if verdict.ok:
+            report.status = "OK"
+            location = probe_mod.exit_location(ctx.executor)
+            if location:
+                report.add("exit: " + location)
+                report.data["exit_location"] = location
+        else:
+            report.status = "FAILED"
+            report.exit_code = int(ExitCode.NOT_READY)
+            report.warn(verdict.reason or "probe failed")
+        return report
+    if command == "uninstall":
+        return lifecycle.uninstall(ctx, purge=bool(args.purge), quiet=args.quiet)
+    raise FailClosed(f"unknown command: {sanitize(str(command))}")
+
+
+def emit(ctx: lifecycle.Context, report: lifecycle.Report, *, as_json: bool) -> int:
+    if as_json:
+        ctx.out.write(json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n")
+    else:
+        if not ctx.quiet:
+            for message in report.messages:
+                ctx.say(message)
+        for warning in report.warnings:
+            ctx.err.write(sanitize("[WARN] " + warning) + "\n")
+        if report.status in ("DEGRADED", "FAILED", "INACTIVE"):
+            ctx.say(f"STATUS: {report.status}")
+    if report.status == "FAILED":
+        return int(report.exit_code or ExitCode.FAILURE)
+    return 0
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+    context_factory=None,
+) -> int:
+    out = _SanitisingWriter(stdout or sys.stdout)
+    err = _SanitisingWriter(stderr or sys.stderr)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.version:
+        out.write(f"{PROGRAM} {__version__}\n")
+        return 0
+    if not args.command:
+        out.write("usage: see --help; a subcommand is required\n")
+        return ExitCode.FAILURE
+
+    try:
+        ctx = context_factory(args) if context_factory is not None else make_context(
+            args, stdout=out, stderr=err
+        )
+        ctx.out = out
+        ctx.err = err
+        ctx.quiet = bool(getattr(args, "quiet", False))
+        report = dispatch(ctx, args)
+    except MpmError as exc:
+        err.write(sanitize(f"[FAIL] {exc.message}") + "\n")
+        return int(exc.exit_code or ExitCode.FAILURE)
+    except KeyboardInterrupt:  # pragma: no cover
+        err.write("[FAIL] interrupted\n")
+        return 130
+    except Exception as exc:  # last-resort guard: never leak exception text
+        err.write(HOST.text(f"[FAIL] unexpected {type(exc).__name__}"))
+        err.write("\n")
+        return 1
+
+    try:
+        return emit(ctx, report, as_json=bool(getattr(args, "json", False)))
+    except Exception:  # pragma: no cover - output stream failure
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

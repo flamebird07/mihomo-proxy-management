@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Build an atomically published provider from nodes healthy on every target."""
+"""Build an atomically published provider from nodes healthy on every target.
+
+The command line, exit codes and stdout format are unchanged.  The work is
+split into importable functions (:func:`run_health_check`, :func:`wait_ready`,
+:func:`request_delay`, ...) so the macOS lifecycle can reuse the readiness and
+delay semantics without shelling out to this script.
+
+Security properties kept from the original:
+
+* the isolated core runs on dedicated ports (default 17890/19090), never the
+  production 7890/9090;
+* only node names and counts are printed - never a node endpoint or credential;
+* the output provider is written atomically.
+"""
 
 from __future__ import annotations
 
@@ -16,11 +29,12 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from typing import Any, Callable, Iterable
 
 import yaml
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -32,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--controller-port", type=int, default=19090)
     parser.add_argument("--timeout-ms", type=int, default=7000)
     parser.add_argument("--workers", type=int, default=12)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def port_is_free(port: int) -> bool:
@@ -55,7 +69,7 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int) -> int | No
         return None
 
 
-def wait_ready(api: str, process: subprocess.Popen[bytes]) -> None:
+def wait_ready(api: str, process: Any) -> None:
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -80,9 +94,41 @@ def atomic_write_yaml(path: Path, document: dict) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def main() -> int:
-    args = parse_args()
-    if not port_is_free(args.mixed_port) or not port_is_free(args.controller_port):
+def build_isolated_config(args: argparse.Namespace, proxies: list[dict], names: Iterable[str]) -> dict:
+    """Config for the throw-away core: no TUN, no DNS, no production ports."""
+    return {
+        "mixed-port": args.mixed_port,
+        "allow-lan": False,
+        "mode": "global",
+        "log-level": "warning",
+        "ipv6": False,
+        "external-controller": f"127.0.0.1:{args.controller_port}",
+        "dns": {"enable": False},
+        "tun": {"enable": False},
+        "proxies": proxies,
+        "proxy-groups": [{"name": "TEST", "type": "select", "proxies": list(names)}],
+        "rules": ["MATCH,TEST"],
+    }
+
+
+def run_health_check(
+    args: argparse.Namespace,
+    *,
+    popen: Callable[..., Any] | None = None,
+    delay_probe: Callable[[str, str, str, int], int | None] | None = None,
+    ready_probe: Callable[[str, Any], None] | None = None,
+    port_probe: Callable[[int], bool] | None = None,
+) -> dict:
+    """Run the isolated health check and return the stdout payload.
+
+    Every side effect is injectable; the defaults are the production functions.
+    """
+    probe_port = port_probe or port_is_free
+    probe_delay = delay_probe or request_delay
+    probe_ready = ready_probe or wait_ready
+    spawn = popen or subprocess.Popen
+
+    if not probe_port(args.mixed_port) or not probe_port(args.controller_port):
         raise SystemExit("isolated Mihomo ports are already in use")
     document = yaml.safe_load(args.candidate.read_text(encoding="utf-8"))
     proxies = document.get("proxies", []) if isinstance(document, dict) else []
@@ -95,31 +141,19 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mihomo-health-") as runtime_name:
         runtime = Path(runtime_name)
         config_path = runtime / "config.yaml"
-        config = {
-            "mixed-port": args.mixed_port,
-            "allow-lan": False,
-            "mode": "global",
-            "log-level": "warning",
-            "ipv6": False,
-            "external-controller": f"127.0.0.1:{args.controller_port}",
-            "dns": {"enable": False},
-            "tun": {"enable": False},
-            "proxies": proxies,
-            "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
-            "rules": ["MATCH,TEST"],
-        }
+        config = build_isolated_config(args, proxies, names)
         config_path.write_text(
             yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen(
+        process = spawn(
             [str(args.core), "-d", str(runtime), "-f", str(config_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=flags,
         )
         try:
-            wait_ready(api, process)
+            probe_ready(api, process)
             survivors = set(names)
             target_counts: dict[str, int] = {}
             for target in args.target:
@@ -128,7 +162,7 @@ def main() -> int:
                         zip(
                             names,
                             pool.map(
-                                lambda name: request_delay(api, name, target, args.timeout_ms),
+                                lambda name: probe_delay(api, name, target, args.timeout_ms),
                                 names,
                             ),
                         )
@@ -152,19 +186,20 @@ def main() -> int:
             f"publish blocked: matching healthy nodes {len(matching)} < {args.minimum_matching}"
         )
     digest = atomic_write_yaml(args.output, {"proxies": healthy})
-    print(
-        json.dumps(
-            {
-                "tested": len(proxies),
-                "healthy_all_targets": len(healthy),
-                "matching_pool": len(matching),
-                "targets": target_counts,
-                "output_sha256": digest,
-                "isolated_mihomo_stopped": process.poll() is not None,
-            },
-            ensure_ascii=False,
-        )
-    )
+    return {
+        "tested": len(proxies),
+        "healthy_all_targets": len(healthy),
+        "matching_pool": len(matching),
+        "targets": target_counts,
+        "output_sha256": digest,
+        "isolated_mihomo_stopped": process.poll() is not None,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    payload = run_health_check(args)
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 

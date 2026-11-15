@@ -1,0 +1,5 @@
+#!/bin/sh
+# mpm-switch - move the machine between Nextin and mihomo-proxy-management.
+# The installer replaces __PACKAGE_DIR__ / __PYTHON__; all logic is in Python.
+: "${MPM_PYTHON:=__PYTHON__}"
+exec "$MPM_PYTHON" -c 'import sys; sys.path.insert(0, "__PACKAGE_DIR__"); from mpm_macos.switch import main; raise SystemExit(main())' "$@"

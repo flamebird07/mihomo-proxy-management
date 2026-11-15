@@ -204,7 +204,7 @@ def main() -> int:
 
     sys.path.insert(0, HERE)
     rec = Recorder()
-    print(f"== mpm test run ({sys.version.split()[0]}, euid={os.geteuid()}) ==")
+    print(f"== mpm test run ({sys.version.split()[0]}, euid={getattr(os, 'geteuid', lambda: -1)()}) ==")
 
     all_ok = True
     for name, filename in SUITES:

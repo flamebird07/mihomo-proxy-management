@@ -2,11 +2,13 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +16,14 @@ SCRIPT = ROOT / "scripts" / "sync-xigua-ippool-feishu.py"
 spec = importlib.util.spec_from_file_location("sync_xigua_ippool_feishu", SCRIPT)
 sync = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sync)
+
+
+def windows_only(func):
+    """Tests that really launch powershell.exe/cmd.exe; pure parsing stays."""
+    func = pytest.mark.windows_only(func)
+    return pytest.mark.skipif(
+        sys.platform != "win32", reason="windows_only: real powershell.exe/cmd.exe execution"
+    )(func)
 
 
 class FakeLog:
@@ -214,6 +224,7 @@ class XiguaFeishuTests(unittest.TestCase):
         self.assertEqual(captured.get("mutex_name"), sync.XIGUA_SYNC_MUTEX_NAME)
         self.assertNotEqual(sync.XIGUA_SYNC_MUTEX_NAME, sync.base.SYNC_MUTEX_NAME)
 
+    @windows_only
     def test_wrapper_exit_priority_and_sync_order_matrix(self):
         wrapper = ROOT / "scripts" / "run-xigua-ippool.ps1"
         fake_bin = self.root / "fake-bin"
@@ -274,6 +285,7 @@ class XiguaFeishuTests(unittest.TestCase):
                 self.assertIn("FEISHU_RESULT", completed.stdout)
                 self.assertIn(f"ROUND_RESULT exit={expected}", completed.stdout)
 
+    @windows_only
     def test_log_failure_is_visible_and_nonzero(self):
         wrapper = ROOT / "scripts" / "run-xigua-ippool.ps1"
         fake_bin = self.root / "fake-bin-logfail"
@@ -302,6 +314,7 @@ class XiguaFeishuTests(unittest.TestCase):
         self.assertIn("XIGUA_LOG_FAILED", completed.stderr)
         self.assertIn("ROUND_RESULT exit=8", completed.stdout)
 
+    @windows_only
     def test_wrapper_log_records_stages_without_secrets(self):
         wrapper = ROOT / "scripts" / "run-xigua-ippool.ps1"
         fake_bin = self.root / "fake-bin-logok"
@@ -345,6 +358,7 @@ class NinjaAndBatExitTests(unittest.TestCase):
     def psq(value):
         return "'" + str(value).replace("'", "''") + "'"
 
+    @windows_only
     def test_ninja_installer_inherits_main_principal(self):
         installer = ROOT / "scripts" / "install-ninja-grok-sync-task.ps1"
         captured = self.root / "principal.json"
@@ -370,6 +384,7 @@ class NinjaAndBatExitTests(unittest.TestCase):
         self.assertEqual(principal["LogonType"], "S4U")
         self.assertEqual(principal["RunLevel"], "Highest")
 
+    @windows_only
     def test_ninja_installer_permission_failure_is_nonzero(self):
         installer = ROOT / "scripts" / "install-ninja-grok-sync-task.ps1"
         expression = (
@@ -381,6 +396,7 @@ class NinjaAndBatExitTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Access is denied", completed.stdout + completed.stderr)
 
+    @windows_only
     def test_bat_any_stage_failure_makes_final_nonzero(self):
         bat = ROOT / "scripts" / "run-feishu-bitable-sync.bat"
         site_dir = self.root / "sitecustomize"
