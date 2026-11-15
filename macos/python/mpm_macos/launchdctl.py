@@ -20,6 +20,12 @@ from .paths import LABEL
 
 DOMAIN = "system"
 
+#: ``wait_running``/``wait_stopped`` poll ``WAIT_ATTEMPTS`` times every
+#: ``WAIT_INTERVAL`` seconds, i.e. at most ``WAIT_ATTEMPTS * WAIT_INTERVAL``
+#: seconds per wait.
+WAIT_ATTEMPTS = 40
+WAIT_INTERVAL = 0.5
+
 _STATE = re.compile(r"^\s*state\s*=\s*(?P<value>\S+)", re.MULTILINE)
 _PID = re.compile(r"^\s*pid\s*=\s*(?P<value>\d+)", re.MULTILINE)
 _LAST_EXIT = re.compile(r"^\s*last exit code\s*=\s*(?P<value>-?\d+)", re.MULTILINE)
@@ -113,8 +119,8 @@ class Launchd:
         label: str = LABEL,
         domain: str = DOMAIN,
         sleeper: Callable[[float], None] = time.sleep,
-        attempts: int = 40,
-        interval: float = 0.5,
+        attempts: int = WAIT_ATTEMPTS,
+        interval: float = WAIT_INTERVAL,
     ) -> None:
         self.executor = executor
         self.plist = plist
@@ -249,6 +255,8 @@ __all__ = [
     "DOMAIN",
     "Launchd",
     "LaunchdState",
+    "WAIT_ATTEMPTS",
+    "WAIT_INTERVAL",
     "parse_disabled",
     "parse_print",
     "validate_label",

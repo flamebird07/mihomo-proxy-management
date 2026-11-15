@@ -23,7 +23,12 @@ network stacks fighting.
      Nextin is not connected and mihomo is confirmed *not* running, Nextin is
      started again; if mihomo may still be running, nothing is started (two
      stacks are worse than one) and the operator is told to run
-     ``mpm-switch nextin``.
+     ``mpm-switch nextin``;
+  4. a *timeout* is handled defensively: ``osascript`` runs without a timeout,
+     so this should not happen, but if one is reported it says nothing about
+     the root child behind it.  The user phase then writes nothing at all (no
+     ``scutil --nc start/stop``, no ``launchctl``, no ``networksetup``), only
+     reports the read-only state and points at ``mpm-switch nextin``.
 
 Root phase of ``switch mihomo``
   1. re-read Always On VPN (On Demand) as the invoking user and refuse (before
@@ -90,6 +95,25 @@ Shell wrapper (``SIGKILL`` safety)
   ``switch rollback`` is idempotent.  Every argument is ``shlex.quote``-d and
   the AppleScript string escaping is kept.
 
+Privileged hop: no timeout
+  One ``osascript`` covers the password dialog *and* the whole root phase, so
+  it is started with ``timeout=None``: the executor never kills the authorized
+  process, and a killed dialog can therefore never leave an orphan root
+  behind.  The 2026-11-15 12:57 failure was exactly the executor's 60 s
+  default killing the dialog while the operator was still typing, with the
+  root child continuing behind it.
+  The operator may cancel the password dialog at any time; ``osascript`` then
+  returns non-zero and the ordinary failure path applies (nothing was
+  touched).  Every command *inside* the root phase keeps its own bounded
+  deadline, so the hop cannot hang forever on a wedged external command.
+  A timeout is still handled defensively: should a custom runner return
+  :data:`TIMEOUT_EXIT_CODE` or the executor raise ``TimeoutExpired`` anyway,
+  the user phase reports ``特权阶段超时，状态未知`` and **fails closed** - no
+  ``scutil --nc start/stop``, no ``launchctl``, no ``networksetup``.  A
+  read-only snapshot (mihomo listeners/utun, the launchd job, the Nextin
+  state) is reported for diagnosis only; the operator runs ``mpm-switch
+  nextin``, which does the full fallback behind its own dialog.
+
 ``mpm-switch nextin``
   privileged ``<cli> stop`` (bootout + disable + proxy restore), then start the
   VPN as the user, wait for ``(Connected)`` and run a short probe.  Nextin is
@@ -106,6 +130,7 @@ from __future__ import annotations
 import getpass
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -118,7 +143,7 @@ from mpm_common.sanitize import HOST, sanitize
 
 from . import conflict as conflict_mod
 from . import lifecycle, probe as probe_mod
-from .launchdctl import Launchd
+from .launchdctl import Launchd, parse_print
 
 DEFAULT_VPN_NAME = "Nextin"
 VPN_NAME_ENV = "MPM_VPN_NAME"
@@ -150,6 +175,32 @@ STOP_TEARDOWN_POLL = 0.5
 START_CONNECT_TIMEOUT = 5.0
 START_DEADLINE_SECONDS = 60.0
 START_POLL_INTERVAL = 0.5
+
+# ---- privileged hop --------------------------------------------------------
+#
+# The password dialog and the root phase share one ``osascript`` process.  It
+# is run with ``timeout=None`` (see :func:`run_privileged`): no static sum of
+# per-command deadlines can keep up with the real call chain, and a wrong sum
+# kills the authorized process and leaves an orphan root behind.  Each command
+# inside the root phase is bounded on its own by the executor's default
+# deadline, and the operator can cancel the dialog at any time.
+#
+# :data:`TIMEOUT_EXIT_CODE` is kept for the defensive path only: a custom
+# runner or an unexpected executor timeout must still fail closed.
+#: Return code the executor reports when it killed a command at its deadline
+#: (``mpm_common.executor.Executor`` follows the ``timeout(1)`` convention).
+TIMEOUT_EXIT_CODE = 124
+
+
+class PrivilegedTimeout(RuntimeError):
+    """The privileged phase reported a timeout; its state is unknown.
+
+    Not expected any more - ``run_privileged`` passes ``timeout=None`` so the
+    authorized process is never killed - but a custom runner or an unexpected
+    executor timeout must still be treated as *unknown*: the root child may
+    have run to completion, or may still be running.
+    """
+
 
 #: Both languages on purpose: the operator may read either.
 ON_DEMAND_REFUSAL = (
@@ -916,11 +967,35 @@ def run_privileged(
     emit: Callable[[str], None] | None = None,
     shell_command: str | None = None,
 ) -> int:
-    """Run ``<cli> ...`` as root through the macOS password dialog."""
+    """Run ``<cli> ...`` as root through the macOS password dialog.
+
+    The dialog stays alive for the password prompt *and* the root phase, so
+    ``osascript`` is run with ``timeout=None``: the executor must never kill
+    the authorized process.  A static deadline cannot cover the real call
+    chain (start, two stops/rollbacks, proxy restore, ...) and killing the
+    dialog leaves the root child running as an orphan - the 2026-11-15 12:57
+    failure.  Each command inside the root phase keeps its own bounded
+    deadline, and the operator can cancel the dialog at any time, which
+    ``osascript`` reports as a non-zero exit and the ordinary failure path.
+
+    A timeout is still handled defensively: if a custom runner or an
+    unexpected executor timeout reports :data:`TIMEOUT_EXIT_CODE`,
+    :class:`PrivilegedTimeout` is raised instead of returning a code -
+    "killed" is not "cancelled", because the root child may outlive the
+    dialog and the caller has to treat the root phase as unknown.
+    """
     command = shell_command if shell_command is not None else shlex.join([cli, *arguments])
     if runner is not None:
         return int(runner(command))
-    result = executor.run(["osascript", "-e", _applescript(command)])
+    timed_out_message = (
+        "the privileged phase reported a timeout; its state is unknown"
+    )
+    try:
+        result = executor.run(
+            ["osascript", "-e", _applescript(command)], timeout=None
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PrivilegedTimeout(timed_out_message) from exc
     if emit is not None:
         for line in (result.stdout or "").splitlines():
             if line.strip():
@@ -928,6 +1003,8 @@ def run_privileged(
         for line in (result.stderr or "").splitlines():
             if line.strip():
                 emit("[stderr] " + line)
+    if result.returncode == TIMEOUT_EXIT_CODE:
+        raise PrivilegedTimeout(timed_out_message)
     return int(result.returncode)
 
 
@@ -1436,6 +1513,99 @@ def _recover_after_failed_hop(
     return report
 
 
+def launchd_loaded(ctx: lifecycle.Context) -> bool | None:
+    """Whether the core job is loaded - read-only, ``None`` when unreadable.
+
+    ``launchctl print system/<label>`` is not guaranteed to be readable by an
+    ordinary user, so only "it printed state" and "Could not find service" are
+    taken as answers.  Everything else is unknown, and unknown is treated like
+    "loaded" by the caller: it may start at any moment.
+    """
+    launchd = Launchd(ctx.executor, plist=ctx.layout.plist, sleeper=ctx.sleeper)
+    try:
+        result = ctx.executor.run(launchd.print_argv())
+    except Exception:  # noqa: BLE001 - unknown, never "not loaded"
+        return None
+    text = (result.stdout or "") + (result.stderr or "")
+    if result.returncode == 0:
+        return parse_print(text, label=launchd.label, returncode=0).loaded
+    if "could not find service" in text.lower():
+        return False
+    return None
+
+
+def _recover_after_privileged_timeout(
+    ctx: lifecycle.Context,
+    report: lifecycle.Report,
+    *,
+    name: str,
+) -> lifecycle.Report:
+    """A reported privileged timeout: fail closed, write nothing.
+
+    ``run_privileged`` passes ``timeout=None`` so the dialog is not killed any
+    more; this path is defensive.  Should a timeout be reported anyway, it
+    says nothing about the root child: the root phase may still be stopping
+    Nextin, waiting out the stable window, or about to ``bootstrap`` mihomo.
+    No read-only check can prove that it has *finished* -
+    ``core_may_be_running`` and :func:`launchd_loaded` are snapshots, and an
+    orphan that looks idle now may start mihomo a moment later - so nothing is
+    decided from them:
+
+    * no ``scutil --nc start/stop``, no ``launchctl``, no ``networksetup``:
+      starting Nextin on a "looks down" snapshot is exactly the dual-stack
+      race this project exists to prevent;
+    * the report only *describes* what was seen (mihomo, launchd job, Nextin)
+      and points at ``mpm-switch nextin``, which stops mihomo behind its own
+      password dialog and then reconnects Nextin.
+    """
+    report.status = "FAILED"
+    report.exit_code = int(ExitCode.FAIL_CLOSED)
+    report.warn(
+        "特权阶段超时，状态未知；请运行 mpm-switch nextin 恢复 Nextin"
+        "（会再弹一次密码框） / the privileged phase reported a timeout: its "
+        "state is unknown (the root phase may still be running); run "
+        "`mpm-switch nextin` to restore "
+        + name
+        + " (it asks for the password again)"
+    )
+    # Read-only only: every value below is a snapshot that may be stale a
+    # moment later, which is exactly why nothing is decided from it.
+    may_run = core_may_be_running(ctx.executor)
+    loaded = launchd_loaded(ctx)
+    connected: bool | None
+    try:
+        connected = vpn_is_connected(ctx.executor, name)
+    except Exception as exc:  # noqa: BLE001 - unreadable is "unknown", not "down"
+        connected = None
+        report.warn("cannot read the " + name + " state: " + _reason(exc))
+    report.data["privileged_timeout"] = {
+        "mihomo_may_run": may_run,
+        "launchd_loaded": loaded,
+        "nextin_connected": connected,
+        "wrote_nothing": True,
+    }
+    report.add(
+        "state after the timeout (read-only): mihomo "
+        + ("may be running" if may_run else "was not seen running")
+        + "; launchd job "
+        + ("unknown" if loaded is None else ("loaded" if loaded else "not loaded"))
+        + "; "
+        + name
+        + " "
+        + (
+            "connected"
+            if connected
+            else ("not connected" if connected is False else "unknown")
+        )
+    )
+    report.warn(
+        "mihomo may be running: the timeout proves nothing about the root child, so "
+        "nothing was started or stopped here; run `mpm-switch nextin` to stop mihomo "
+        "and reconnect " + name
+    )
+    return report
+
+
 def switch_to_mihomo(
     ctx: lifecycle.Context,
     *,
@@ -1512,6 +1682,7 @@ def switch_to_mihomo(
     output: list[str] = []
     error = ""
     code = 1
+    timed_out = False
     try:
         code = run_privileged(
             ctx.executor,
@@ -1521,6 +1692,10 @@ def switch_to_mihomo(
             emit=output.append,
             shell_command=shell_command,
         )
+    except PrivilegedTimeout as exc:  # a reported timeout is not a cancel
+        code = TIMEOUT_EXIT_CODE
+        timed_out = True
+        error = _reason(exc)
     except Exception as exc:  # noqa: BLE001 - an osascript failure is a failed hop
         code = 1
         error = _reason(exc)
@@ -1529,13 +1704,19 @@ def switch_to_mihomo(
 
     marker_present = os.path.isfile(marker_path)
     succeeded = code == 0 and marker_present
+    # A custom runner can return the executor's timeout code without raising;
+    # either way the root phase must be treated as *unknown*, and a marker left
+    # by a root phase that did finish must never be read as the "refused"
+    # verdict below (the marker means "there is nothing to undo", not "nothing
+    # happened").
+    timed_out = timed_out or code == TIMEOUT_EXIT_CODE
     # A refusal that touched nothing must not be "recovered" by starting
     # Nextin.  Three independent signals, because each one can be lost:
     #   * the dedicated exit code (what the wrapper itself sees),
     #   * the marker (a refusal writes it too, when the write succeeds),
     #   * the sentinel in the emitted output (``do shell script`` turns the
     #     exit code into a generic error but keeps stderr).
-    refused = not succeeded and (
+    refused = not succeeded and not timed_out and (
         code == REFUSED_EXIT_CODE
         or marker_present
         or any(REFUSAL_SENTINEL in line for line in output)
@@ -1548,6 +1729,8 @@ def switch_to_mihomo(
 
     report.status = "FAILED"
     report.exit_code = int(ExitCode.NOT_READY)
+    if timed_out:
+        return _recover_after_privileged_timeout(ctx, report, name=name)
     if refused:
         # Nothing was stopped, no proxy was changed: there is nothing to
         # recover and starting Nextin here would be a needless side effect.
@@ -1599,6 +1782,15 @@ def switch_to_nextin(
     else:
         try:
             code = run_privileged(ctx.executor, ctx.layout.cli_entry, "stop", runner=privileged)
+        except PrivilegedTimeout as exc:
+            # Same rule as the switch direction: a reported timeout says
+            # nothing about the root child, so the stop is unknown - never
+            # confirmed.
+            code = TIMEOUT_EXIT_CODE
+            report.warn(
+                "特权阶段超时，状态未知 / the privileged stop reported a timeout: "
+                "its state is unknown (" + _reason(exc) + ")"
+            )
         except Exception as exc:  # noqa: BLE001
             code = 1
             report.warn("privileged stop failed: " + _reason(exc))

@@ -33,6 +33,10 @@ PROVIDER_NAME = "subscription"
 
 MODES = ("tun", "mixed")
 
+#: HTTP timeout for one subscription fetch.  It lives here instead of being a
+#: literal in ``convert_provider`` so the bound is visible to callers.
+SUBSCRIPTION_TIMEOUT_SECONDS = 30
+
 #: Files mihomo loads from its ``-d`` directory when ``geodata-mode`` is true.
 GEODATA_FILES = ("GeoIP.dat", "GeoSite.dat")
 
@@ -623,7 +627,7 @@ def convert_provider(
     destination: str,
     *,
     module,
-    timeout: int = 30,
+    timeout: int = SUBSCRIPTION_TIMEOUT_SECONDS,
     user_agent: str | None = None,
 ) -> list[str]:
     """Fetch + convert a subscription and write the provider atomically.
@@ -708,6 +712,7 @@ __all__ = [
     "PROXY_MEMBERS",
     "REGION_FILTERS",
     "RenderError",
+    "SUBSCRIPTION_TIMEOUT_SECONDS",
     "SUPERBOSS_RULE",
     "TIKTOK_RULE",
     "US_FAST_URL",

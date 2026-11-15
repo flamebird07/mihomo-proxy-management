@@ -458,6 +458,16 @@ nesessionmanager 会记 `Skip` 并丢弃它（2026-11-15 12:09:48 的第一次 s
 * `mpm-switch mihomo` **先要密码，再断网**：普通用户阶段只通过
   `osascript ... with administrator privileges` 弹密码框，不碰 Nextin。用户取消或弹窗
   失败时 Nextin 原样保持连接，命令直接返回非零。
+* 同一个 `osascript` 进程同时覆盖**密码输入**和**整个 root 阶段**，因此它以
+  `timeout=None` 启动：执行器**永不**杀授权进程，也就不可能留下孤儿 root。
+  2026-11-15 12:57 的失败正是执行器默认的 60 秒把密码框杀掉，而它背后的 root
+  子进程还在继续跑。用户随时可以在密码框点取消，`osascript` 返回非零，按普通失败
+  路径处理（此时什么都没动）。root 阶段内部每条命令仍各有自己的有界 deadline，
+  所以整跳不会卡死在某条外部命令上。不再维护 `PRIVILEGED_TIMEOUT_SECONDS` /
+  `ROOT_PHASE_WORST_CASE_SECONDS` 这类静态总和，也不再读
+  `MPM_PRIVILEGED_TIMEOUT_SECONDS`：静态总和无法跟上真实调用链（start、两次
+  stop/rollback、代理快照恢复、失败报告读回……），算错一次就是杀进程 + 孤儿 root。
+  测试断言 `run_privileged` 传 `timeout=None`，且其余执行器调用仍用默认 60 秒。
 * 密码框里执行的是带兜底的 shell 包装（`<cli> switch mihomo … --marker <tmp>;
   rc=$?; [ "$rc" -eq 5 ] || [ -f <tmp> ] || <cli> switch rollback …; exit $rc`）。
   marker 只在探测全部通过后由 Python 写入，所以 root 阶段崩溃、被 `SIGKILL`、或返回非零时，
@@ -467,10 +477,15 @@ nesessionmanager 会记 `Skip` 并丢弃它（2026-11-15 12:09:48 的第一次 s
   的 `refused before touching anything`）识别拒绝，不再执行自己的恢复逻辑。所有参数都经过
   `shlex.quote`，AppleScript 的反斜杠/双引号转义保留。
   **边界**：这条兜底只覆盖 *root Python 子进程* 的死亡（崩溃/`SIGKILL`/非零退出）。
-  如果 osascript、包装 shell 或整个授权进程组本身被杀，rollback 不会运行，机器可能
-  停留在中间状态。此时下一次 `mpm-switch nextin` 或 `mpm-switch status` 可以幂等修复：
-  两条命令都会重新检查 launchd 状态、disable 读回、端口 7890/9090 与 198.19/16 utun，
-  并据此停掉孤立 core 或恢复 Nextin。
+  本工具不再给 `osascript` 设超时，因此不会由它自己杀掉授权进程；但若超时仍被报告
+  （自定义 runner 返回 124，或执行器/外部因素抛 `TimeoutExpired`），root 子进程可能已经
+  跑完（marker 甚至已写入），也可能还在停止 Nextin、等稳定窗口、或马上 `bootstrap` mihomo。
+  只读检查（`core_may_be_running`、`launchctl print`、Nextin 状态）
+  都只是**快照**，无法证明 root 阶段已经结束，所以超时后**一律 fail closed**：用户阶段
+  不执行任何写操作（没有 `scutil --nc start/stop`、没有 `launchctl`、没有 `networksetup`），
+  只报告“特权阶段超时，状态未知”加上只读状态，退出码非零，并提示运行
+  `mpm-switch nextin` 恢复 Nextin（该命令自己走密码框做完整回退）。绝不在“看起来没运行”的
+  快照上启动 Nextin——那正是要避免的双栈竞态。
 * root 阶段第一步以**调用用户身份**断开 Nextin：
   `launchctl asuser <uid> sudo -u <user> scutil --nc stop <VPN>`（默认 `Nextin`，
   可用 `MPM_VPN_NAME` 覆盖；**不删除** VPN，也不改它的自动连接配置）。root 进程
@@ -590,6 +605,8 @@ mpm-switch mihomo --drill-fail
   `test_macos_probe.py`
   （HTTP 状态、fake-ip 经 `route -n get` + utun 差集、60 秒单调时钟 deadline、演练开关）、
   `test_macos_switch.py`（先密码后断网、取消不动 Nextin、异常恢复、shell 包装兜底回滚、
+  `osascript` 传 `timeout=None`（永不杀授权进程）而其余命令保留执行器默认 60 秒、
+  特权阶段被报告超时后一律 fail closed（零写操作、只报告只读状态、提示 `mpm-switch nextin`）、
   Always On VPN（On Demand）拒绝与放行及其提示文案、stop 完成条件（Connected 消失 →
   Disconnecting → 端口稍后释放 → 原 ProxyTunnel PID 退出）、端口始终不释放或 PID 始终不退出
   则 fail closed、稳定断开窗口（每次轮询都必须是 Disconnected）、启动后重连

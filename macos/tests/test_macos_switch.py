@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import shlex
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from mpm_common.errors import ExitCode
-from mpm_common.executor import FakeExecutor, Result
+from mpm_common.executor import Executor, FakeExecutor, Result
 from mpm_macos import conflict as conflict_mod
 from mpm_macos import lifecycle, probe, switch
 
@@ -212,6 +213,44 @@ def _marker_writer(marker: str, calls: list[str] | None = None):
     return runner
 
 
+#: Commands that change state.  A read-only report may run none of them.
+_WRITE_COMMAND_PREFIXES = (
+    "scutil --nc start",
+    "scutil --nc stop",
+    "launchctl bootstrap",
+    "launchctl bootout",
+    "launchctl kickstart",
+    "launchctl enable",
+    "launchctl disable",
+)
+
+
+def _all_commands(executor) -> list[str]:
+    """Everything the executor ran, from ``calls`` and from ``events``.
+
+    ``VpnExecutor`` records ``scutil``/``launchctl asuser`` in ``events``
+    instead of ``calls``, so both have to be inspected.
+    """
+    commands = [" ".join(call.argv) for call in executor.calls]
+    commands.extend(executor.events)
+    return commands
+
+
+def _write_commands(executor) -> list[str]:
+    """Commands that start/stop a VPN, (un)load a job or change the proxy."""
+    writes: list[str] = []
+    for command in _all_commands(executor):
+        parts = command.split()
+        if parts[:2] == ["launchctl", "asuser"] and len(parts) > 6:
+            parts = parts[6:]  # drop ``asuser <uid> sudo -u <user>``
+            command = " ".join(parts)
+        if any(command.startswith(prefix) for prefix in _WRITE_COMMAND_PREFIXES):
+            writes.append(command)
+        elif parts[:1] == ["networksetup"] and len(parts) > 1 and parts[1].startswith("-set"):
+            writes.append(command)
+    return writes
+
+
 # ---- user phase: password first ------------------------------------------
 
 
@@ -292,6 +331,246 @@ def test_user_phase_osascript_exception_reconnects_nextin_only_when_mihomo_down(
     assert up.executor.connected is False, "never create a second stack"
     assert any("may still be running" in warning for warning in report.warnings)
     assert any("mpm-switch nextin" in warning for warning in report.warnings)
+
+
+# ---- privileged hop: no timeout -------------------------------------------
+#
+# One ``osascript`` covers the password dialog *and* the whole root phase, so
+# it runs with ``timeout=None``: the executor must never kill the authorized
+# process.  A static sum of per-command deadlines cannot follow the real call
+# chain, and a wrong sum kills the dialog and leaves an orphan root behind
+# (2026-11-15 12:57).  Every other command keeps the executor's 60 s default.
+
+UNSET = object()
+
+
+class RecordingExecutor(FakeExecutor):
+    """FakeExecutor that records each call's argv and its ``timeout`` argument.
+
+    ``UNSET`` means the caller passed no ``timeout``, i.e. the executor's own
+    default (60 s) applies; ``None`` means an explicit "no deadline".
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.recorded: list[tuple[list[str], object]] = []
+
+    def run(self, argv, **kwargs):
+        self.recorded.append((list(argv), kwargs.get("timeout", UNSET)))
+        return super().run(argv, **kwargs)
+
+    def timeout_for(self, *prefix_tokens: str) -> object:
+        prefix = " ".join(prefix_tokens)
+        for argv, timeout in self.recorded:
+            joined = " ".join(argv)
+            if joined == prefix or joined.startswith(prefix + " "):
+                return timeout
+        return UNSET
+
+
+class TimeoutRecorder:
+    """Delegating wrapper that records the ``timeout`` of every executor call."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.recorded: list[tuple[list[str], object]] = []
+
+    def run(self, argv, **kwargs):
+        self.recorded.append((list(argv), kwargs.get("timeout", UNSET)))
+        return self.inner.run(argv, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+class TimingOutExecutor(FakeExecutor):
+    """Executor that raises ``subprocess.TimeoutExpired`` for ``osascript``."""
+
+    def run(self, argv, **kwargs):
+        if argv[:1] == ["osascript"]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return super().run(argv, **kwargs)
+
+
+def test_run_privileged_never_gives_osascript_a_deadline():
+    """The authorized process is never killed, so no orphan root can appear."""
+    executor = RecordingExecutor()
+
+    code = switch.run_privileged(executor, "/opt/mpm/bin/mpm-switch", "switch", "mihomo")
+
+    assert code == 0
+    assert executor.find("osascript") is not None
+    assert executor.timeout_for("osascript") is None, "timeout=None: never killed"
+
+
+def test_executor_default_deadline_is_unchanged():
+    """Only the dialog is unbounded; a wedged local command still times out."""
+    default = inspect.signature(Executor.run).parameters["timeout"].default
+    assert default == 60.0
+
+    executor = RecordingExecutor()
+    switch.vpn_is_connected(executor, VPN)
+    assert executor.timeout_for("scutil", "--nc", "list") is UNSET
+
+
+def test_executor_forwards_no_deadline_to_subprocess(monkeypatch):
+    """``timeout=None`` reaches ``subprocess.run`` unchanged ("no timeout")."""
+    seen: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["timeout"] = kwargs.get("timeout", UNSET)
+        return Completed()
+
+    monkeypatch.setattr("mpm_common.executor.subprocess.run", fake_run)
+    result = Executor().run(["osascript", "-e", ""], timeout=None)
+
+    assert result.returncode == 0
+    assert seen["timeout"] is None
+
+
+def test_switch_flow_only_unbounds_the_dialog(tmp_path):
+    """Every command the user phase runs keeps the executor's 60 s default."""
+    ctx = _ctx(tmp_path, connected=True)
+    recorder = TimeoutRecorder(ctx.executor)
+    ctx.executor = recorder
+    ctx.executor.set("osascript", (0, "", ""))
+    marker = tmp_path / "marker"
+    marker.write_text("ok\n", encoding="utf-8")
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        uid=501,
+        user="tester",
+        marker=str(marker),
+    )
+
+    assert report.status == "OK"
+    assert recorder.recorded, "the flow must actually run commands"
+    for argv, timeout in recorder.recorded:
+        if argv[:1] == ["osascript"]:
+            assert timeout is None, argv
+        else:
+            assert timeout is UNSET, (argv, timeout)
+
+
+def test_run_privileged_reports_a_timeout_defensively():
+    """"Killed" is not "cancelled": the root child may have kept running."""
+    reported = FakeExecutor()
+    reported.set("osascript", (switch.TIMEOUT_EXIT_CODE, "timeout", "Timed out"))
+    with pytest.raises(switch.PrivilegedTimeout):
+        switch.run_privileged(reported, "/cli", "switch", "mihomo")
+
+    raised = TimingOutExecutor()
+    with pytest.raises(switch.PrivilegedTimeout):
+        switch.run_privileged(raised, "/cli", "switch", "mihomo")
+
+
+def test_user_phase_timeout_never_starts_nextin_while_mihomo_may_run(tmp_path):
+    """A reported timeout may leave a running core behind: no second stack.
+
+    The root phase can finish (marker written) *before* the timeout is
+    reported, so the marker must not be read as the "refused, nothing
+    happened" verdict.
+    """
+    ctx = _ctx(tmp_path, connected=False, listeners=(7890,))
+    ctx.executor.set("osascript", (switch.TIMEOUT_EXIT_CODE, "timeout", "Timed out"))
+    marker = tmp_path / "marker"
+    marker.write_text("ok\n", encoding="utf-8")
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        uid=501,
+        user="tester",
+        marker=str(marker),
+    )
+
+    assert report.status == "FAILED"
+    assert report.exit_code not in (0, None)
+    assert ctx.executor.connected is False, "never create a second stack"
+    assert _write_commands(ctx.executor) == []
+    assert any("特权阶段超时，状态未知" in warning for warning in report.warnings), report.warnings
+    assert any("mpm-switch nextin" in warning for warning in report.warnings), report.warnings
+    assert not any("refused" in warning for warning in report.warnings), report.warnings
+    assert report.data["privileged_timeout"]["mihomo_may_run"] is True
+    assert not marker.exists(), "the stale marker is removed"
+
+
+def test_user_phase_timeout_with_loaded_launchd_job_does_not_start_nextin(tmp_path):
+    """A loaded job may restart at any moment: that is "may be running" too."""
+    ctx = _ctx(tmp_path, connected=False)
+    harness = LaunchdHarness(ctx.executor)
+    harness.loaded = True
+    harness.running = False
+    ctx.executor.set("osascript", (switch.TIMEOUT_EXIT_CODE, "timeout", "Timed out"))
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        uid=501,
+        user="tester",
+        marker=str(tmp_path / "marker"),
+    )
+
+    assert report.status == "FAILED"
+    assert ctx.executor.connected is False
+    assert _write_commands(ctx.executor) == []
+    assert report.data["privileged_timeout"]["launchd_loaded"] is True
+    assert any("may be running" in warning for warning in report.warnings)
+
+
+def test_user_phase_timeout_writes_nothing_even_when_mihomo_looks_down(tmp_path):
+    """Fail closed: a "looks down" snapshot is not proof the orphan has finished.
+
+    The root child may still be stopping Nextin, waiting out the stable window
+    or about to bootstrap mihomo, so the user phase must not start Nextin (nor
+    stop anything) on a read-only guess - it reports and points at
+    ``mpm-switch nextin``.
+    """
+    ctx = _ctx(tmp_path, connected=False)
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        privileged=lambda command: switch.TIMEOUT_EXIT_CODE,
+        uid=501,
+        user="tester",
+        marker=str(tmp_path / "marker"),
+    )
+
+    assert report.status == "FAILED"
+    assert report.exit_code == int(ExitCode.FAIL_CLOSED)
+    assert ctx.executor.connected is False, "a timeout must not touch Nextin"
+    assert _write_commands(ctx.executor) == [], _write_commands(ctx.executor)
+    assert not any("已自动切回" in message for message in report.messages)
+    assert any("特权阶段超时，状态未知" in warning for warning in report.warnings)
+    assert any("mpm-switch nextin" in warning for warning in report.warnings)
+    # read-only diagnostics are still reported
+    data = report.data["privileged_timeout"]
+    assert data["mihomo_may_run"] is False
+    assert data["wrote_nothing"] is True
+    assert data["nextin_connected"] is False
+
+
+def test_user_phase_timeout_with_nextin_still_connected_writes_nothing(tmp_path):
+    """An already connected Nextin is only *reported*, never re-started."""
+    ctx = _ctx(tmp_path, connected=True)
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        privileged=lambda command: switch.TIMEOUT_EXIT_CODE,
+        uid=501,
+        user="tester",
+        marker=str(tmp_path / "marker"),
+    )
+
+    assert report.status == "FAILED"
+    assert ctx.executor.connected is True
+    assert _write_commands(ctx.executor) == []
+    assert report.data["privileged_timeout"]["nextin_connected"] is True
 
 
 def test_vpn_name_passed_to_root_phase(tmp_path, monkeypatch):
