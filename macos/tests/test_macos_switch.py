@@ -199,7 +199,7 @@ def _ctx(
 
 def _root_ctx(tmp_path, **kwargs):
     ctx = _ctx(tmp_path, euid=0, **kwargs)
-    LaunchdHarness(ctx.executor)
+    LaunchdHarness.attached(ctx.executor)
     return ctx
 
 
@@ -932,6 +932,7 @@ def test_rollback_restores_proxy_snapshot(tmp_path, monkeypatch):
     executor = VpnExecutor(connected=False)
     ctx = make_context(tmp_path, executor=executor, geteuid=lambda: 0)
     harness = LaunchdHarness(ctx.executor)
+    harness.layout = ctx.layout
     prepare_install(ctx)
     assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
 

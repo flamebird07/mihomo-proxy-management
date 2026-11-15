@@ -5,6 +5,7 @@ no lifecycle code ever touches the host.  Paths follow the plan's system-level
 layout:
 
     /Library/LaunchDaemons/com.mihomo-proxy-management.core.plist
+    /Library/LaunchDaemons/com.mihomo-proxy-management.boot-switch.plist
     /usr/local/bin/mihomo-proxy-management
     /usr/local/libexec/mihomo-proxy-management/current/{mihomo,runner}
     /usr/local/share/mihomo-proxy-management/{python,templates,scripts}
@@ -23,9 +24,15 @@ from dataclasses import dataclass
 
 PROJECT = "mihomo-proxy-management"
 LABEL = f"com.{PROJECT}.core"
+#: Second system job: runs once at boot and hands the machine to mihomo through
+#: the same safe flow as ``mpm-switch mihomo``.  It is *not* the core job and
+#: must never be disabled at boot - but it must never restart either (no
+#: ``KeepAlive``), or a failed switch would flap the network.
+BOOT_LABEL = f"com.{PROJECT}.boot-switch"
 BINARY_NAME = "mihomo"
 RUNNER_NAME = "runner"
 PLIST_NAME = f"{LABEL}.plist"
+BOOT_PLIST_NAME = f"{BOOT_LABEL}.plist"
 
 SUPPORT_DIR_NAME = PROJECT
 RUN_DIR_NAME = PROJECT
@@ -45,6 +52,11 @@ class Layout:
     @property
     def plist(self) -> str:
         return os.path.join(self.plist_dir, PLIST_NAME)
+
+    @property
+    def boot_plist(self) -> str:
+        """The boot-switch job: the only LaunchDaemon that runs at boot."""
+        return os.path.join(self.plist_dir, BOOT_PLIST_NAME)
 
     # ---- executables / read-only data ---------------------------------
     @property
@@ -92,6 +104,10 @@ class Layout:
     @property
     def plist_template(self) -> str:
         return os.path.join(self.template_dir, PLIST_NAME + ".template")
+
+    @property
+    def boot_plist_template(self) -> str:
+        return os.path.join(self.template_dir, BOOT_PLIST_NAME + ".template")
 
     @property
     def config_template(self) -> str:
@@ -156,6 +172,32 @@ class Layout:
         return os.path.join(self.state_dir, "deployment.json")
 
     @property
+    def boot_hold(self) -> str:
+        """0600 hold stamp: a boot entry started while it exists exits at once.
+
+        ``install`` creates it (``O_EXCL``) *before* ``launchctl bootstrap`` -
+        ``RunAtLoad`` starts the boot entry right after the bootstrap, and
+        without the stamp that run would perform the whole network switch
+        while the operator watches.  Install removes the stamp only after the
+        entry acknowledged it (see :attr:`boot_hold_ack`), so the next entry
+        run (a real boot or a manual kickstart) performs the switch again.
+        """
+        return os.path.join(self.state_dir, "boot-switch.hold")
+
+    @property
+    def boot_hold_ack(self) -> str:
+        """0600 ack: the boot entry saw the hold stamp and exited harmlessly.
+
+        The entry writes it right before the zero-side-effect hold exit;
+        ``install`` waits for it (together with "job loaded and no longer
+        running") after the bootstrap and deletes it with the stamp.  Without
+        the ack, "loaded" alone cannot tell whether the ``RunAtLoad`` process
+        already ran, so deleting the stamp could race a later entry run into
+        a network switch.
+        """
+        return os.path.join(self.state_dir, "boot-switch.hold-ack")
+
+    @property
     def staging_dir(self) -> str:
         return os.path.join(self.state_dir, "staging")
 
@@ -170,6 +212,14 @@ class Layout:
     @property
     def log_err(self) -> str:
         return os.path.join(self.logs, "core.err.log")
+
+    @property
+    def log_boot_out(self) -> str:
+        return os.path.join(self.logs, "boot-switch.out.log")
+
+    @property
+    def log_boot_err(self) -> str:
+        return os.path.join(self.logs, "boot-switch.err.log")
 
     # ---- runtime ------------------------------------------------------
     @property
@@ -194,6 +244,7 @@ class Layout:
             self.support,
             self.run_dir,
             self.plist,
+            self.boot_plist,
         ]
 
     def to_target_path(self, path: str) -> str:
@@ -248,6 +299,8 @@ def managed_dirs(layout: Layout) -> list[tuple[str, int]]:
 
 __all__ = [
     "BINARY_NAME",
+    "BOOT_LABEL",
+    "BOOT_PLIST_NAME",
     "LABEL",
     "PLIST_NAME",
     "PROJECT",

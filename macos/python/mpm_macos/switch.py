@@ -1871,7 +1871,7 @@ def switch_to_nextin(
 # ---- mpm-switch entry point ----------------------------------------------
 
 
-def _build_context(argv_root: str | None = None) -> lifecycle.Context:
+def build_context(argv_root: str | None = None) -> lifecycle.Context:
     from . import preflight as preflight_mod
     from .paths import Layout
 
@@ -1923,7 +1923,7 @@ def main(
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    ctx = context_factory() if context_factory is not None else _build_context(args.root)
+    ctx = context_factory() if context_factory is not None else build_context(args.root)
     if stdout is not None:
         ctx.out = stdout
     if stderr is not None:

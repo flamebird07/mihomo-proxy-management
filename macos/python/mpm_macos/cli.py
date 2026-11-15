@@ -19,7 +19,7 @@ from mpm_common.errors import ExitCode, FailClosed, MpmError
 from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST, sanitize
 
-from . import __version__, lifecycle, preflight as preflight_mod, probe as probe_mod
+from . import __version__, boot as boot_mod, lifecycle, preflight as preflight_mod, probe as probe_mod
 from . import switch as switch_mod
 from .paths import Layout
 
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         nargs="?",
         default="status",
-        choices=("mihomo", "nextin", "status", "rollback"),
+        choices=("mihomo", "nextin", "status", "rollback", "boot"),
     )
     switch.add_argument("--user", help="invoking user (passed to the root phase)")
     switch.add_argument("--uid", type=int, help="invoking uid (passed to the root phase)")
@@ -174,7 +174,7 @@ def dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Repo
     needs_lock = args.command in MUTATING_COMMANDS
     if args.command == "switch":
         needs_lock = (
-            getattr(args, "action", "status") in ("mihomo", "nextin", "rollback")
+            getattr(args, "action", "status") in ("mihomo", "nextin", "rollback", "boot")
             and ctx.geteuid() == 0
         )
     if needs_lock:
@@ -220,6 +220,14 @@ def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Rep
                 ctx,
                 uid=getattr(args, "uid", None),
                 user=getattr(args, "user", None),
+                vpn_name=getattr(args, "vpn_name", None),
+            )
+        if action == "boot":
+            # The boot-switch LaunchDaemon's entry point, also usable for a
+            # manual `launchctl kickstart` acceptance run (no reboot needed).
+            return boot_mod.boot_switch(
+                ctx,
+                force_fail=drill,
                 vpn_name=getattr(args, "vpn_name", None),
             )
         return switch_mod.switch_to_nextin(

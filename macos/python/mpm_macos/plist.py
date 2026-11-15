@@ -5,6 +5,18 @@ skeleton), so the emitted document is always a valid property list.  The audit
 is the security boundary: it refuses a plist that could leak a secret, run a
 shell, add ``caffeinate`` or lose the crash-restart semantics.
 
+Two labels exist, with deliberately different rules:
+
+``com.mihomo-proxy-management.core`` (the mihomo runner)
+  ``KeepAlive = {SuccessfulExit: false}``, ``RunAtLoad``, ``ThrottleInterval``
+  5.  Boot behaviour is controlled by ``launchctl disable`` - see below.
+
+``com.mihomo-proxy-management.boot-switch`` (the boot entry)
+  ``RunAtLoad`` and **no** ``KeepAlive``: it runs once and exits.  A restart
+  policy here would re-run a failing switch every few seconds and flap the
+  network, so ``KeepAlive`` (in any form, ``SuccessfulExit: false`` included)
+  is rejected.
+
 ``WorkingDirectory`` and the runner's ``-d`` argument are mihomo's **home**
 (``Layout.support``), not this project's ``state/`` directory: the provider
 file and the geo databases live below the home, and mihomo rejects a provider
@@ -32,7 +44,7 @@ from xml.sax.saxutils import escape
 
 from mpm_common.errors import FailClosed
 
-from .paths import LABEL
+from .paths import BOOT_LABEL, LABEL
 
 PLACEHOLDERS = (
     "__LABEL__",
@@ -49,6 +61,11 @@ PLACEHOLDERS = (
 FORBIDDEN_TOKENS = ("caffeinate", "://", "secret", "token", "password")
 
 SHELL_NAMES = {"sh", "bash", "zsh", "dash", "/bin/sh", "/bin/bash", "/bin/zsh", "-c"}
+
+PYTHON_SUFFIXES = ("python3", "python3.11", "python3.12", "python3.13")
+
+#: Labels this project may render and audit.
+ALLOWED_LABELS = (LABEL, BOOT_LABEL)
 
 
 def _values(
@@ -90,7 +107,7 @@ def render(
     log_err: str,
 ) -> str:
     """Fill the template, validate it with plistlib and re-serialise it."""
-    if label != LABEL:
+    if label not in ALLOWED_LABELS:
         raise FailClosed(f"refusing to render a foreign launchd label: {label}")
     values = _values(
         label=label,
@@ -142,8 +159,55 @@ def _is_target_absolute(value: Any) -> bool:
 
 def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> dict[str, Any]:
     """Static audit of a parsed LaunchDaemon document."""
+    _require(label in ALLOWED_LABELS, f"label {label} is not ours")
     _require(isinstance(document, dict), "root is not a dictionary")
     _require(document.get("Label") == label, "Label must be the project label")
+    if label == BOOT_LABEL:
+        return _audit_boot(document, label=label)
+    return _audit_core(document, label=label, home_dir=home_dir)
+
+
+def _audit_program_arguments(document: Any) -> list[str]:
+    """Shared rules: an argv list, never a shell, no secret, a Python ``-m``."""
+    arguments = document.get("ProgramArguments")
+    _require(isinstance(arguments, list) and bool(arguments), "ProgramArguments missing")
+    _require(
+        all(isinstance(item, str) and item for item in arguments),
+        "ProgramArguments must be a list of non-empty strings",
+    )
+    joined = " ".join(arguments)
+    for token in FORBIDDEN_TOKENS:
+        _require(token not in joined.lower(), f"ProgramArguments must not contain '{token}'")
+    _require(
+        not any(item in SHELL_NAMES for item in arguments),
+        "ProgramArguments must not invoke a shell",
+    )
+    _require(
+        any(item.endswith(PYTHON_SUFFIXES) for item in arguments[:1]),
+        "ProgramArguments[0] must be a Python interpreter",
+    )
+    _require("-m" in arguments, "ProgramArguments must start the package with -m")
+    return list(arguments)
+
+
+def _audit_paths_and_environment(document: Any) -> str:
+    """Shared rules: absolute target paths, no secret in the environment."""
+    working = document.get("WorkingDirectory")
+    _require(_is_target_absolute(working), "WorkingDirectory must be absolute")
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        value = document.get(key)
+        _require(_is_target_absolute(value), f"{key} must be an absolute path")
+
+    environment = document.get("EnvironmentVariables", {})
+    _require(isinstance(environment, dict), "EnvironmentVariables must be a dictionary")
+    _require(
+        not any("secret" in str(key).lower() for key in environment),
+        "EnvironmentVariables must not carry a secret",
+    )
+    return str(working)
+
+
+def _audit_core(document: Any, *, label: str, home_dir: str | None) -> dict[str, Any]:
     # ``KeepAlive{SuccessfulExit: false}`` implies RunAtLoad, so RunAtLoad alone
     # cannot prevent a boot start.  The plist keeps ``RunAtLoad: true`` for the
     # crash-restart semantics; boot behaviour is controlled by the persistent
@@ -162,47 +226,55 @@ def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> 
         "ProcessType must be Interactive",
     )
 
-    arguments = document.get("ProgramArguments")
-    _require(isinstance(arguments, list) and bool(arguments), "ProgramArguments missing")
-    _require(
-        all(isinstance(item, str) and item for item in arguments),
-        "ProgramArguments must be a list of non-empty strings",
-    )
-    joined = " ".join(arguments)
-    for token in FORBIDDEN_TOKENS:
-        _require(token not in joined.lower(), f"ProgramArguments must not contain '{token}'")
-    _require(
-        not any(item in SHELL_NAMES for item in arguments),
-        "ProgramArguments must not invoke a shell",
-    )
-    _require(
-        any(item.endswith(("python3", "python3.11", "python3.12", "python3.13")) for item in arguments[:1]),
-        "ProgramArguments[0] must be a Python interpreter",
-    )
-    _require("-m" in arguments, "ProgramArguments must start the package with -m")
+    arguments = _audit_program_arguments(document)
     _require("mpm_macos.runner" in arguments, "ProgramArguments must point at mpm_macos.runner")
 
-    working = document.get("WorkingDirectory")
-    _require(_is_target_absolute(working), "WorkingDirectory must be absolute")
+    working = _audit_paths_and_environment(document)
     if home_dir is not None:
         _require(working == home_dir, "WorkingDirectory must be the mihomo home directory")
-
-    for key in ("StandardOutPath", "StandardErrorPath"):
-        value = document.get(key)
-        _require(_is_target_absolute(value), f"{key} must be an absolute path")
-
-    environment = document.get("EnvironmentVariables", {})
-    _require(isinstance(environment, dict), "EnvironmentVariables must be a dictionary")
-    _require(
-        not any("secret" in str(key).lower() for key in environment),
-        "EnvironmentVariables must not carry a secret",
-    )
 
     return {
         "label": document["Label"],
         "keep_alive": dict(document["KeepAlive"]),
         "throttle_interval": document["ThrottleInterval"],
-        "program_arguments": list(arguments),
+        "program_arguments": arguments,
+        "working_directory": working,
+    }
+
+
+def _audit_boot(document: Any, *, label: str) -> dict[str, Any]:
+    """The boot entry runs exactly once: no restart policy of any kind.
+
+    ``KeepAlive`` - and especially ``{SuccessfulExit: false}`` - would make
+    launchd re-run a failing switch every ``ThrottleInterval`` seconds, which
+    is a network flap at every boot.  The key must be absent or ``false``.
+    """
+    _require(
+        document.get("RunAtLoad") is True,
+        "RunAtLoad must be true (the boot entry runs once at load)",
+    )
+    keep_alive = document.get("KeepAlive")
+    _require(
+        keep_alive is None or keep_alive is False,
+        "the boot entry must not restart (KeepAlive absent or false)",
+    )
+    _require(
+        document.get("ProcessType") == "Interactive",
+        "ProcessType must be Interactive",
+    )
+
+    arguments = _audit_program_arguments(document)
+    _require(
+        "mpm_macos.boot" in arguments,
+        "ProgramArguments must point at mpm_macos.boot",
+    )
+
+    working = _audit_paths_and_environment(document)
+
+    return {
+        "label": document["Label"],
+        "keep_alive": keep_alive if keep_alive is not None else False,
+        "program_arguments": arguments,
         "working_directory": working,
     }
 
@@ -235,6 +307,7 @@ def audit_text(text: str, *, label: str = LABEL, home_dir: str | None = None) ->
 
 
 __all__ = [
+    "ALLOWED_LABELS",
     "FORBIDDEN_TOKENS",
     "PLACEHOLDERS",
     "audit",

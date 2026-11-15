@@ -77,7 +77,7 @@ from .network_proxy import (
     save_snapshot,
     snapshot_exists,
 )
-from .paths import LABEL, Layout, managed_dirs
+from .paths import BOOT_LABEL, LABEL, Layout, managed_dirs
 
 SUBCOMMANDS = (
     "preflight",
@@ -541,6 +541,9 @@ def _install_static(ctx: Context) -> list[str]:
 
     template_sources = {
         os.path.join(source, "templates", os.path.basename(layout.plist_template)): layout.plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.boot_plist_template)
+        ): layout.boot_plist_template,
         os.path.join(repo, "config", "config.yaml.template"): layout.config_template,
     }
     for src, dest in template_sources.items():
@@ -762,6 +765,167 @@ def _install_plist(ctx: Context) -> bool:
     return True
 
 
+def _install_boot_plist(ctx: Context) -> bool:
+    """Render the boot entry: same render+audit gate as the core plist.
+
+    The audit is the reason this cannot be hand-written: it rejects a
+    ``KeepAlive`` of any kind (a failing switch must not be retried every few
+    seconds), a shell, ``caffeinate`` and any secret/URL in the document.
+    """
+    layout = ctx.layout
+    target = layout.to_target_path
+    rendered = plist_mod.render_from_file(
+        layout.boot_plist_template,
+        label=BOOT_LABEL,
+        python=target(ctx.python),
+        package_dir=target(layout.share_python),
+        home_dir=target(layout.mihomo_home),
+        config=target(layout.config),
+        binary=target(layout.binary),
+        run_dir=target(layout.run_dir),
+        log_out=target(layout.log_boot_out),
+        log_err=target(layout.log_boot_err),
+    )
+    plist_mod.audit_text(rendered, label=BOOT_LABEL, home_dir=target(layout.mihomo_home))
+    if is_noop(layout.boot_plist, rendered, mode=0o644):
+        return False
+    write_atomic(layout.boot_plist, rendered, mode=0o644)
+    return True
+
+
+def _boot_launchd(ctx: Context) -> Launchd:
+    """The boot-switch job: the one LaunchDaemon that is enabled at boot."""
+    return Launchd(
+        ctx.executor,
+        plist=ctx.layout.boot_plist,
+        label=BOOT_LABEL,
+        sleeper=ctx.sleeper,
+    )
+
+
+# ---- boot-switch hold stamp -----------------------------------------------
+
+
+#: How long ``install`` waits for the boot entry to acknowledge the hold
+#: stamp (job loaded + 0600 ack file + entry no longer running).
+#: ``MPM_BOOT_ACK_DEADLINE_SECONDS`` overrides it.
+BOOT_ACK_DEADLINE_ENV = "MPM_BOOT_ACK_DEADLINE_SECONDS"
+BOOT_ACK_DEADLINE_DEFAULT = 30.0
+BOOT_ACK_DEADLINE_RANGE = (5.0, 300.0)
+BOOT_ACK_POLL_INTERVAL = 0.5
+
+
+def boot_ack_deadline_seconds(environ: dict[str, str] | None = None) -> float:
+    """Configured hold-ack wait budget, clamped to a sane range."""
+    values = environ if environ is not None else dict(os.environ)
+    raw = (values.get(BOOT_ACK_DEADLINE_ENV) or "").strip()
+    if not raw:
+        return BOOT_ACK_DEADLINE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return BOOT_ACK_DEADLINE_DEFAULT
+    low, high = BOOT_ACK_DEADLINE_RANGE
+    return min(high, max(low, value))
+
+
+def _ensure_boot_hold(ctx: Context) -> None:
+    """Make sure the 0600 hold stamp exists - create it, or take one over.
+
+    ``RunAtLoad`` makes ``launchctl bootstrap`` run the boot entry at once;
+    while this stamp exists the entry exits with zero side effects, which is
+    what makes registering the job during ``install --no-start`` safe.
+
+    A stamp kept by an earlier failed install (an unconfirmed bootout) must
+    never be deleted here, not even to recreate it at once: the old job may
+    still be loaded and its RunAtLoad entry may reach the stamp check inside
+    that delete-then-recreate window, and a run that finds no stamp performs
+    the whole network switch (Codex review boot5).  So the stamp is created
+    with ``O_EXCL`` when absent and simply taken over when present.
+    """
+    try:
+        descriptor = os.open(
+            ctx.layout.boot_hold, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+    except FileExistsError:
+        return
+    os.close(descriptor)
+    _own(ctx, ctx.layout.boot_hold)
+
+
+def _remove_boot_hold(ctx: Context) -> None:
+    try:
+        os.unlink(ctx.layout.boot_hold)
+    except FileNotFoundError:
+        pass
+
+
+def _remove_boot_ack(ctx: Context) -> None:
+    """Drop the ack file: a stale one must never satisfy this install's wait."""
+    try:
+        os.unlink(ctx.layout.boot_hold_ack)
+    except FileNotFoundError:
+        pass
+
+
+def _boot_acknowledged(ctx: Context, boot: Launchd) -> bool:
+    """Whether the boot entry has fully acknowledged the hold stamp.
+
+    All three must hold: the job is loaded, the RunAtLoad process is no
+    longer running, and the 0600 ack file the entry wrote on its hold exit
+    exists.  "Loaded" alone is not enough - the process may not have started
+    yet, and deleting the stamp then would let that run perform the switch.
+    """
+    state = boot.state()
+    return bool(state.loaded and not state.running) and os.path.isfile(
+        ctx.layout.boot_hold_ack
+    )
+
+
+def _wait_boot_acknowledged(ctx: Context, boot: Launchd, *, deadline: float) -> bool:
+    """Poll until the boot entry acknowledged the hold stamp or time runs out."""
+    limit = ctx.clock() + max(0.0, float(deadline))
+    while True:
+        try:
+            if _boot_acknowledged(ctx, boot):
+                return True
+        except Exception:  # noqa: BLE001 - an unreadable launchd state is "not yet"
+            pass
+        remaining = limit - ctx.clock()
+        if remaining <= 0:
+            return False
+        ctx.sleeper(min(BOOT_ACK_POLL_INTERVAL, remaining))
+
+
+def _confirmed_bootout(boot: Launchd) -> tuple[bool, str]:
+    """Boot the boot-switch job out and confirm the unload by reading back.
+
+    Returns ``(unloaded, reason)``.  ``unloaded`` is True only when the
+    bootout succeeded *and* a follow-up ``launchctl print`` reports the job
+    no longer loaded ("service not found").  A bootout exit code alone is
+    not proof (Codex review boot4), and neither is a print that cannot be
+    read at all (Codex review boot5): the caller must keep the hold stamp
+    whenever ``unloaded`` is False - a RunAtLoad entry may still be starting.
+    """
+    try:
+        boot.bootout()
+    except Exception as exc:  # noqa: BLE001 - reported to the operator
+        return False, _failure_reason(exc)
+    last: Exception | None = None
+    for _ in range(boot.attempts):
+        try:
+            if not boot.state().loaded:
+                return True, ""
+        except Exception as exc:  # noqa: BLE001 - an unreadable state is no proof
+            last = exc
+        boot.sleeper(boot.interval)
+    if last is not None:
+        return False, "the unload could not be confirmed: " + _failure_reason(last)
+    return False, (
+        "bootout returned but the job still reports loaded after every read-back"
+    )
+
+
 # ---- install --------------------------------------------------------------
 
 
@@ -851,6 +1015,10 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
         report.add("LaunchDaemon plist installed")
     else:
         report.add("LaunchDaemon plist unchanged")
+    if _install_boot_plist(ctx):
+        report.add("boot-switch LaunchDaemon plist installed")
+    else:
+        report.add("boot-switch LaunchDaemon plist unchanged")
 
     # KeepAlive{SuccessfulExit:false} implies RunAtLoad, so the plist alone
     # would start mihomo at every boot - exactly the 2026-11-14 outage.  The
@@ -863,6 +1031,127 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
             "leave a service that would start at boot"
         )
     report.add("LaunchDaemon disabled: it does not start at boot (use mpm-switch mihomo)")
+
+    # The boot-switch job is the *only* boot entry.  It is enabled (never
+    # disabled): boot must reach mihomo without a password dialog.  It is also
+    # registered (bootstrapped) in the *current* launchd domain, so
+    # ``launchctl kickstart system/<BOOT_LABEL>`` works right after the install
+    # (the non-reboot acceptance run) and a re-install replaces an already
+    # loaded definition instead of leaving launchd on the stale one.
+    #
+    # ``bootstrap`` with RunAtLoad=true would run the boot entry immediately -
+    # and that entry performs the whole network switch.  The 0600 hold stamp
+    # closes that hole, so the registration is safe for ``install --no-start``
+    # too.  The order matters and is tested:
+    #   1. make sure the stamp exists: create it with ``O_EXCL`` when absent,
+    #      take a stamp kept by an earlier failed install over when present -
+    #      it is never deleted and recreated, because the old job's RunAtLoad
+    #      entry may reach the stamp check inside that hold-less window and
+    #      perform the whole switch (Codex review boot5, 2026-11-15) - and
+    #      drop a stale ack (an interrupted earlier install's ack must never
+    #      satisfy this install's wait; only the hold protects, so removing
+    #      an ack cannot unprotect anything);
+    #   2. bootout a job still registered from an older definition and wait
+    #      for the unload to be confirmed by ``launchctl print``; the stamp
+    #      is in place for the whole time, so the old entry cannot switch;
+    #      after the confirmed unload the ack is dropped *again* - the old
+    #      entry may have written one (under the stamp's protection) between
+    #      the removal in (1) and its bootout, and a stale ack must not
+    #      satisfy the new definition's wait (Codex review boot6,
+    #      2026-11-15);
+    #   3. enable + bootstrap the new definition (RunAtLoad starts the entry);
+    #   4. wait for the full acknowledgement: job loaded, the entry process no
+    #      longer running, and the ack file present.  ``loaded`` alone is not
+    #      enough: RunAtLoad may not have started the process yet, and
+    #      removing the stamp in that window would let that run perform the
+    #      whole switch while ``install --no-start`` is still returning
+    #      (Codex review boot3, 2026-11-15);
+    #   5. on timeout: fail closed - bootout the job, and only when the
+    #      bootout succeeded *and* ``launchctl print`` confirms the job is no
+    #      longer loaded ("service not found") remove the stamp and the ack;
+    #      if the bootout fails, the job still reports loaded, or the print
+    #      cannot be read at all, a RunAtLoad entry may still be starting, so
+    #      the stamp (and the ack) are KEPT on disk - that entry then reads
+    #      the hold and exits with zero side effects instead of switching the
+    #      network behind a failed install (Codex reviews boot4 and boot5,
+    #      2026-11-15);
+    #   6. on success the hold and the ack are removed - the *next* entry run
+    #      (a real boot or a manual kickstart) performs the switch again.
+    # The stamp is only ever removed at the two proven-safe points (4) and
+    # (5): every other failure path keeps it (fail closed).  The ack is
+    # dropped at (1), after the confirmed unload in (2) - a stale one must
+    # never satisfy the wait of (4) - and at the same two proven-safe points.
+    # Install itself never kickstarts and never executes the switch.
+    boot = _boot_launchd(ctx)
+    _ensure_boot_hold(ctx)
+    _remove_boot_ack(ctx)
+    if boot.state().loaded:
+        # A re-install: the old definition may still be loaded and its
+        # RunAtLoad entry still starting.  Boot it out and wait for the
+        # confirmed unload under the stamp's protection before the new
+        # definition is registered (Codex review boot5, 2026-11-15).
+        unloaded, reason = _confirmed_bootout(boot)
+        if not unloaded:
+            raise FailClosed(
+                "a previous boot-switch job is still loaded and its unload is "
+                "not confirmed (" + reason + "); the hold stamp and the ack "
+                "are KEPT on disk so the still-starting entry reads the hold "
+                "and exits without switching the network - delete them only "
+                "after `launchctl print system/" + BOOT_LABEL + "` confirms "
+                "the job is unregistered (not loaded / service not found)"
+            )
+        # The old job is confirmed unloaded, so its RunAtLoad entry is dead -
+        # but it may have written an ack (under the hold's protection) in the
+        # window between the removal above and its bootout.  That stale ack
+        # must not survive into the new definition's wait: the wait would read
+        # "loaded, not running, ack present" while the new entry has not even
+        # spawned yet, remove the hold, and reopen the unprotected switch
+        # window (Codex review boot6, 2026-11-15).  The hold stamp itself
+        # stays in place.
+        _remove_boot_ack(ctx)
+    boot.enable()
+    if boot.is_disabled():
+        raise FailClosed(
+            "install finished but the boot-switch LaunchDaemon is still disabled; "
+            "the machine would boot with neither mihomo nor the boot entry"
+        )
+    boot.bootstrap()
+    deadline = boot_ack_deadline_seconds(ctx.environ)
+    if not _wait_boot_acknowledged(ctx, boot, deadline=deadline):
+        detail = (
+            "the boot-switch entry did not acknowledge the hold stamp within "
+            f"{deadline:g}s (loaded, but no ack or still running); failing "
+            "closed so no entry run can switch the network behind this install"
+        )
+        unloaded, reason = _confirmed_bootout(boot)
+        if not unloaded:
+            # A RunAtLoad entry may still be starting and has not read the
+            # hold stamp yet: removing the stamp now would let that run
+            # perform the whole switch.  Keep the stamp (and the ack) so
+            # the entry exits without side effects once it reaches the
+            # stamp check.
+            raise FailClosed(
+                detail
+                + "; " + reason
+                + "; the hold stamp and the ack are KEPT on disk so a "
+                "still-starting entry reads the hold and exits without "
+                "switching the network - delete them only after "
+                f"`launchctl print system/{BOOT_LABEL}` confirms the job "
+                "is unregistered (not loaded / service not found)"
+            )
+        _remove_boot_hold(ctx)
+        _remove_boot_ack(ctx)
+        raise FailClosed(
+            detail
+            + "; the job was booted out, so the hold stamp and the ack were "
+            "removed and no entry run can start"
+        )
+    _remove_boot_hold(ctx)
+    _remove_boot_ack(ctx)
+    report.add(
+        "boot-switch registered (loaded, not running, hold acknowledged): the "
+        "switch runs at boot or via `launchctl kickstart system/" + BOOT_LABEL + "`"
+    )
 
     if skip_start:
         report.status = "OK"
@@ -1633,6 +1922,20 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
     # not loaded.
     ctx.launchd().disable()
 
+    # The boot entry must go too: an enabled boot-switch whose plist was deleted
+    # would try to run a missing program at every boot.  Both steps are best
+    # effort here (uninstall must keep removing files even if launchd refuses)
+    # but they are reported.
+    boot = _boot_launchd(ctx)
+    try:
+        boot.bootout()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("boot-switch bootout failed: " + _failure_reason(exc))
+    try:
+        boot.disable()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("boot-switch disable failed: " + _failure_reason(exc))
+
     removed: list[str] = []
 
     def discard(path: str) -> None:
@@ -1642,6 +1945,7 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
             removed.append(path)
 
     discard(layout.plist)
+    discard(layout.boot_plist)
     discard(layout.cli_entry)
     discard(layout.switch_entry)
     discard(layout.libexec)

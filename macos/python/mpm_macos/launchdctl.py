@@ -1,8 +1,9 @@
 """Thin, strictly scoped ``launchctl`` adapter.
 
-Only the fixed label is ever addressed; every command is built as an argv list
-(never a shell string).  Parsing is pure so it can be tested with captured
-``launchctl print`` output on any OS.
+Only the project's own labels are ever addressed - the core job and the
+boot-switch job - and every command is built as an argv list (never a shell
+string).  Parsing is pure so it can be tested with captured ``launchctl
+print`` output on any OS.
 """
 
 from __future__ import annotations
@@ -16,9 +17,12 @@ from mpm_common.errors import FailClosed
 from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST
 
-from .paths import LABEL
+from .paths import BOOT_LABEL, LABEL
 
 DOMAIN = "system"
+
+#: The only labels this project may operate on.
+ALLOWED_LABELS = (LABEL, BOOT_LABEL)
 
 #: ``wait_running``/``wait_stopped`` poll ``WAIT_ATTEMPTS`` times every
 #: ``WAIT_INTERVAL`` seconds, i.e. at most ``WAIT_ATTEMPTS * WAIT_INTERVAL``
@@ -37,8 +41,8 @@ _DISABLED_ENTRY = re.compile(
 
 
 def validate_label(label: str) -> str:
-    """Only our own LaunchDaemon may be operated on."""
-    if label != LABEL:
+    """Only this project's own LaunchDaemons may be operated on."""
+    if label not in ALLOWED_LABELS:
         raise FailClosed(f"refusing to operate on a foreign launchd label: {label}")
     return label
 
@@ -252,6 +256,7 @@ class Launchd:
 
 
 __all__ = [
+    "ALLOWED_LABELS",
     "DOMAIN",
     "Launchd",
     "LaunchdState",

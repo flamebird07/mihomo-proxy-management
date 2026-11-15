@@ -30,7 +30,9 @@ pytestmark = pytest.mark.macos
 
 def _installed(tmp_path, **ctx_kwargs):
     ctx = make_context(tmp_path, **ctx_kwargs)
-    harness = LaunchdHarness(ctx.executor)
+    # make_context already wired a harness; reuse it so the assertions below
+    # read the state install actually produced.
+    harness = LaunchdHarness.attached(ctx.executor)
     prepare_install(ctx)
     report = lifecycle.install(ctx, quiet=True, skip_start=True)
     assert report.status == "OK", report.messages
@@ -493,13 +495,16 @@ def test_start_conflict_refuses_before_any_launchd_action(tmp_path):
     ctx.conflict_detector = lambda: ConflictReport(
         ok=False, reasons=["外部 VPN 已连接：Nextin"]
     )
+    # install already registered the boot-switch job, so compare against the
+    # pre-start count: the refusal must not bootstrap anything *new*.
+    bootstraps_before = ctx.executor.count("launchctl", "bootstrap")
 
     with pytest.raises(FailClosed) as excinfo:
         lifecycle.start(ctx, quiet=True)
 
     assert "Nextin" in str(excinfo.value)
     assert harness.loaded is False
-    assert ctx.executor.count("launchctl", "bootstrap") == 0
+    assert ctx.executor.count("launchctl", "bootstrap") == bootstraps_before
 
 
 # ---- start: explicit mixed mode only --------------------------------------

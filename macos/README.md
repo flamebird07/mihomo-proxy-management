@@ -25,10 +25,12 @@ macos/python/mpm_macos/
   conflict.py         外部 VPN/端口/默认路由/198.18 地址冲突检测（纯解析 + 注入执行器）
   probe.py            切换后的 60 秒 HTTP 探测（国内必通、国外至少一项）
   switch.py           mpm-switch：Nextin <-> mihomo，失败自动回滚到 Nextin
+  boot.py             开机入口（boot-switch LaunchDaemon）：等登录用户/默认路由 -> 复用 switch 的 root 流程
   lifecycle.py        install/configure/start/stop/restart/status/health/uninstall
   runner.py           持有 core 锁、启动前冲突检测、可选 caffeinate -i、信号转发、退出码映射
   cli.py              命令入口（无业务逻辑）
 macos/templates/com.mihomo-proxy-management.core.plist.template
+macos/templates/com.mihomo-proxy-management.boot-switch.plist.template
 macos/bin/mihomo-proxy-management      薄入口（安装时注入包路径）
 macos/bin/mpm-switch                   切换入口（安装到 /usr/local/bin/mpm-switch）
 macos/scripts/*.sh                     薄包装（真实逻辑在 Python）
@@ -53,6 +55,7 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 
 ```text
 /Library/LaunchDaemons/com.mihomo-proxy-management.core.plist
+/Library/LaunchDaemons/com.mihomo-proxy-management.boot-switch.plist
 /usr/local/bin/mihomo-proxy-management
 /usr/local/bin/mpm-switch
 /usr/local/libexec/mihomo-proxy-management/current/mihomo
@@ -68,6 +71,7 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 /Library/Application Support/mihomo-proxy-management/state/deployment.json  (0600)
 /Library/Application Support/mihomo-proxy-management/state/network-proxy-backup.json (0600)
 /Library/Application Support/mihomo-proxy-management/logs/{core.out.log,core.err.log}
+/Library/Application Support/mihomo-proxy-management/logs/{boot-switch.out.log,boot-switch.err.log}
 /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
 ```
 
@@ -156,14 +160,16 @@ plist 固定为：
 
 | 操作 | launchd 行为 |
 |---|---|
-| `install`（含 `--no-start`） | plist 写入后立即 `launchctl disable system/<label>`，并读回 `print-disabled` 确认；安装结束一定处于 disabled |
+| `install`（含 `--no-start`） | core plist 写入后立即 `launchctl disable system/<core>`，并读回 `print-disabled` 确认；同时写入 boot-switch plist，在 0600 hold stamp（`state/boot-switch.hold`）保护下把作业登记进当前 launchd domain：stamp 不存在则 `O_EXCL` 创建，上次失败 install 遗留的 stamp **接管而不删除**（删了再建会打开"无 hold"窗口，仍在启动的旧入口会在窗口内执行整个切换），并删除可能遗留的旧 ack（只有 hold 提供保护，删 ack 不会放开切换）→ 若旧定义仍 loaded，先 `bootout` 并等 `launchctl print` 读回确认已卸载（期间 hold 一直在）→ `enable`（读回确认**未** disabled）→ `bootstrap` 新定义 → poll 等待**完整确认**：作业已 loaded、RunAtLoad 进程已退出、0600 ack 文件（`state/boot-switch.hold-ack`）已出现 → 结束前删除 stamp 与 ack。hold 使 RunAtLoad 拉起的 boot 入口写 ack 后零副作用立即退出，注册因此安全；只有 "loaded" 而无 ack 时（进程尚未跑完）绝不删 stamp。确认超时（`MPM_BOOT_ACK_DEADLINE_SECONDS`，默认 30s）则 fail closed：`bootout` boot-switch，**仅当 print 读回确认作业已卸载**（未 loaded / service not found）才删除 stamp/ack；bootout 失败、作业仍 reported loaded、或 print 无法读回时，stamp（与 ack）**保留**在磁盘上，仍在启动的入口会读到 hold 零副作用退出。其余任何失败同样保留 stamp：只有完整 ack 或确认卸载这两个已证实安全的时点才删除。`install` **从不** kickstart、也不执行切换（切换只发生在开机入口或随后的手动 kickstart） |
 | `start` | 先 `enable`（否则 disabled 的服务无法 bootstrap）→ `bootstrap`/`kickstart` → 运行、健康、TUN 验证全部通过后**立即再次 `disable`** |
-| 成功 start 之后 | 已加载的作业继续运行；本机本次开机内崩溃仍由 KeepAlive 拉起；**下次开机不会加载** |
-| `stop` | `bootout` + `disable` |
-| `uninstall` | `stop`（已含 disable）后再显式 `disable` |
+| 成功 start 之后 | 已加载的作业继续运行；本机本次开机内崩溃仍由 KeepAlive 拉起；**下次开机不会加载 core**（开机走 boot-switch） |
+| `stop` | `bootout` + `disable`（只针对 core；boot-switch 保持 enabled） |
+| `uninstall` | `stop`（已含 core disable）后再显式 `disable` core，然后 `bootout` + `disable` boot-switch 并删除两个 plist |
 
 `disable` 只影响后续加载，不会杀掉正在运行的作业，所以“启动成功后立即 disable”既能
-保留崩溃拉起，又能保证重启后由 Nextin 接管。`plist.audit` 不再强制
+保留崩溃拉起，又能保证下次开机不会直接加载 core——重启后的接管只通过 boot-switch
+的安全流程发生（先等登录用户与默认路由、Always On VPN（On Demand）预检、失败回滚到
+Nextin）。`plist.audit` 不再强制
 `RunAtLoad=true`（允许 `true`/`false`），但仍强制
 `KeepAlive = {SuccessfulExit: false}`、`ThrottleInterval=5`、无 shell、无 `caffeinate`、
 无秘密/URL。
@@ -202,6 +208,99 @@ runner 的退出码语义不变：
 `SuccessfulExit` 的语义以 `launchd.plist(5)` 为准：键存在且为 `false` 时，
 “进程以 0 退出”被视为成功而**不**重启；非 0 退出（包括 runner 自身被 `SIGKILL`）
 被视为失败，`ThrottleInterval` 秒后重新拉起。
+
+### 3.1 开机策略：core 仍 disabled，开机入口走与 `mpm-switch mihomo` 相同的安全流程
+
+core（`com.mihomo-proxy-management.core`）**永远不在开机时启用**。它的 plist 有
+`RunAtLoad=true` 与 `KeepAlive{SuccessfulExit:false}`，一旦 `enable`，launchd 会在开机时
+直接拉起 mihomo runner，**绕过**冲突预检，和 Nextin 抢 7890/TUN——这正是 2026-11-14
+事故的形态。`install`/`start`/`stop` 对 core 的 `disable` 行为保持不变。
+
+开机默认走 mihomo 由**第二个** system LaunchDaemon 完成：
+`com.mihomo-proxy-management.boot-switch`（`BOOT_LABEL`，与 core 的 `LABEL` 分开）：
+
+```xml
+<key>RunAtLoad</key><true/>
+<!-- 没有 KeepAlive：只运行一次 -->
+<key>ProcessType</key><string>Interactive</string>
+```
+
+* `ProgramArguments` 是安装后的 Python + `-m mpm_macos.boot`，**不含** secret、订阅 URL、
+  token；标准输出/错误写到 `logs/boot-switch.{out,err}.log`；
+* **没有 `KeepAlive`**（尤其没有 `SuccessfulExit:false`）：切换失败只记录失败并退出，
+  不会每 5 秒重试一次把网络来回切；
+* plist 走与 core 相同的 render+audit 防线：`plist.audit` 对 boot label 额外要求
+  `RunAtLoad=true`、`KeepAlive` 缺失或为 `false`、入口必须是 `mpm_macos.boot`，并且仍然
+  禁止 shell、`caffeinate`、URL 与任何 secret/token；
+* `install` 写 plist 后，在 0600 hold stamp（`state/boot-switch.hold`）保护下把作业
+  登记进当前 launchd domain：stamp 不存在则 `O_EXCL` 创建，上次失败 install 保留的
+  stamp 直接接管、**不删除**（删除再重建会打开"无 hold"窗口，让仍在启动的旧入口执行
+  整个切换，Codex review boot5），并删除可能遗留的旧 ack（只有 hold 提供保护）；
+  若旧定义仍 loaded，先 `bootout` 并等 `launchctl print` 读回确认已卸载（期间 hold
+  一直在），确认卸载后**再次删除 ack**——旧入口可能在本次 install 第一次删 ack 之后、
+  被 bootout 之前（在 hold 保护下）写过 ack，该旧 ack 绝不能留在磁盘上满足新定义的
+  等待（hold stamp 本身保留，Codex review boot6）→ `enable`（读回确认**未** disabled）
+  → `bootstrap` 新定义 →
+  poll 等待完整确认（作业 loaded + RunAtLoad 进程已退出 + 0600 ack 文件
+  `state/boot-switch.hold-ack` 已出现）→ 结束前删除 stamp 与 ack。RunAtLoad 会在
+  `bootstrap` 后拉起本入口，hold stamp 使它写 ack 后**零副作用立即退出**，因此
+  `install --no-start` 也不会执行切换；只有 "loaded" 不算数——进程可能尚未跑到
+  stamp 检查，此时删 stamp 会让这次运行执行整个切换（Codex review boot3）。确认
+  超时（`MPM_BOOT_ACK_DEADLINE_SECONDS`，默认 30s，夹在 `[5, 300]`）则 fail closed：
+  `bootout` boot-switch，且**仅当 print 读回确认作业已卸载**（未 loaded /
+  service not found）才删除 stamp/ack；bootout 失败、作业仍 reported loaded、或
+  print 无法读回时，stamp（与 ack）保留，仍在启动的入口会读到 hold 零副作用退出
+  （Codex review boot4/boot5）。其余任何失败同样保留 stamp——只有完整 ack 或
+  确认卸载后才删除。
+  install 结束时作业处于“已 loaded、未运行”，随后
+  `launchctl kickstart system/com.mihomo-proxy-management.boot-switch` 即可非重启验收。
+  重新安装会先 bootout 旧定义、等读回确认卸载，再用新定义登记（不会继续运行旧定义）。
+  `uninstall` 对它 `bootout` + `disable` 并删除 plist。
+
+开机入口 `mpm_macos.boot` 的顺序（第 0 步与前三步全部只读/零副作用）：
+
+0. **hold stamp**：`state/boot-switch.hold`（0600）存在时，先写 0600 ack 文件
+   `state/boot-switch.hold-ack`（证明这次 RunAtLoad 已看到 hold），然后立即成功退出，
+   什么都不做。这是 `install` 注册作业时对 RunAtLoad 拉起的保护（见上）；install 等
+   到 ack 后把 stamp 与 ack 一并删除，正常开机与手动 kickstart 不会看到它们；
+1. **等控制台登录用户**（默认 180 秒，`MPM_BOOT_CONSOLE_DEADLINE_SECONDS`，夹在
+   `[10, 900]`）：`stat -f '%Su %u' /dev/console` 的所有者是 `root`/`_mbsetupuser` 时说明
+   还在登录窗口。超时 → **什么都不做**（不启动 mihomo、也不启动 Nextin），报告
+   `console user not ready`；
+2. **等默认路由**（默认 180 秒，`MPM_BOOT_NETWORK_DEADLINE_SECONDS`，同样夹在 `[10, 900]`）：
+   没有默认路由时启动 TUN 只会得到一个连不上订阅的 mihomo。超时同样零副作用退出；
+3. 若 mihomo 已在运行且 Nextin 未连接 → **幂等成功**，不重启 core（避免无故断网）；
+4. 否则以该控制台用户的 uid/user 调用与 `mpm-switch mihomo` **完全相同**的 root 阶段
+   （`switch.switch_to_mihomo_root`，不复制实现）：Always On VPN（On Demand）预检
+   （`TRUE` 或读不到 → 拒绝且零副作用）→ 以用户身份断开 Nextin → 等 Disconnected +
+   原 PID 退出 + 端口释放 → 3–5 秒稳定窗口 → 冲突检测 → `start`（成功后仍 `disable` core）
+   → 启动后复检 Nextin → deadline 健康检查 → 60 秒探测 → 任何失败回滚到 Nextin
+   （只 `scutil --nc start`，**不改** Always On VPN）。
+
+**Always On VPN（On Demand）必须保持关闭**：它是 `scutil` 的 `OnDemandEnabled : TRUE`。
+该标志为 `TRUE`（或读不到）时，开机入口**拒绝**启动 mihomo（只报告原因），因为系统会在
+`scutil --nc stop` 之后约 1.3 秒把 Nextin 连回来，mihomo 与 Nextin 会同时抢路由。
+本项目在任何路径上都**不会**打开或修改它——不写 plist、不调用快捷指令、不做 UI 脚本。
+
+全程不弹 `osascript` 密码框：LaunchDaemon 已经是 root，入口直接执行 root 阶段。
+
+**真实重启未验**：本次改动只用 host-free 单测与手动触发入口（
+`sudo /usr/local/bin/mihomo-proxy-management switch boot` 或
+`sudo launchctl kickstart -k system/com.mihomo-proxy-management.boot-switch`）做非重启验收，
+**没有真的重启过机器**。安装（含 `--no-start`）已把 boot-switch 登记进当前 launchd
+domain（已 loaded、未运行），所以装完即可直接 `kickstart`，无需重启。重启后的行为
+（登录窗口等待、默认路由等待、开机自动切换）需要在
+维护窗口里由网管实际重启确认。
+
+非重启验收（失败回退演练，探测被强制判失败）：
+
+```sh
+sudo MPM_PROBE_FORCE_FAIL=1 /usr/local/bin/mihomo-proxy-management switch boot
+# 或
+sudo /usr/local/bin/mihomo-proxy-management switch boot --drill-fail
+```
+
+预期：报告 FAILED，机器回到 Nextin 已连接、core 已 stop + disable 的状态。
 
 ## 4. 过滤表达式与生产顺序对照表
 
@@ -531,9 +630,11 @@ nesessionmanager 会记 `Skip` 并丢弃它（2026-11-15 12:09:48 的第一次 s
   core）时不会连接 Nextin，并提示先处理孤立 core 再运行 `mpm-switch nextin` 或手动处理。
   `mpm-switch nextin` 与 `mpm-switch status` 都是幂等的：重复运行会重新验证并修复
   上一次切换留下的中间状态（如 wrapper 兜底未执行的残留）。
-* **开机默认不自启**：`install` 结束、`start` 成功后、`stop` 之后都处于
-  `launchctl disable system/<label>`。重启后是 Nextin 接管；需要 mihomo 时再执行
-  `mpm-switch mihomo`。
+* **开机默认走 mihomo，失败回退 Nextin**：core 在 `install` 结束、`start` 成功后、
+  `stop` 之后都处于 `launchctl disable system/<core>`，**开机不会加载 core**；开机由
+  `com.mihomo-proxy-management.boot-switch` 这个一次性入口接管（见 3.1）。它等到控制台
+  登录用户与默认路由就绪后，走与 `mpm-switch mihomo` 相同的安全流程；失败则回退到 Nextin。
+  需要手动切换时仍用 `mpm-switch mihomo` / `mpm-switch nextin`。
 * 演练回滚（不会真的断网，因为探测被强制判失败）：
 
 ```sh
@@ -555,8 +656,11 @@ mpm-switch mihomo --drill-fail
 | 安装程序到 `/usr/local`（`/usr/local/bin`、`/usr/local/libexec`、`/usr/local/share`） | 是 | 是 |
 | 创建 `/Library/Application Support/...` 状态目录 | 是 | 是 |
 | 写入 `state/subscription.env`（0600） | 是 | 是 |
-| 安装 `/Library/LaunchDaemons/...plist` | 是 | 是 |
-| `launchctl disable system/<label>`（安装结束即执行，开机不自启） | 是 | 是 |
+| 安装 `/Library/LaunchDaemons/...core.plist` | 是 | 是 |
+| `launchctl disable system/<core>`（安装结束即执行，core 开机不自启） | 是 | 是 |
+| 安装 `/Library/LaunchDaemons/...boot-switch.plist` 并 `enable`（开机入口，一次性运行） | 是 | 是 |
+| 非重启验收：`switch boot` / `launchctl kickstart -k system/<boot-switch>`（含 `--drill-fail`） | 是 | 是 |
+| 真实重启验收（登录后自动走 mihomo、失败回退 Nextin）——**本次未做** | 是 | 是 |
 | `mpm-switch mihomo`（弹密码框，自动断开 Nextin、启动并探测） | 是（执行命令即确认） | 是（osascript 弹窗） |
 | `mpm-switch nextin`（停 mihomo 并连接 Nextin） | 是（执行命令即确认） | 是（osascript 弹窗） |
 | 首次启动并验证 TUN/utun | 是 | 是 |
@@ -611,6 +715,14 @@ mpm-switch mihomo --drill-fail
   Disconnecting → 端口稍后释放 → 原 ProxyTunnel PID 退出）、端口始终不释放或 PID 始终不退出
   则 fail closed、稳定断开窗口（每次轮询都必须是 Disconnected）、启动后重连
   回退、首次 start 被忽略后重发、双向切换、回滚恢复代理快照）；
+* `test_macos_boot.py`（开机入口，全部注入 clock/sleeper/executor，不真实 sleep、不调真机
+  `launchctl`）：控制台用户未就绪超时零副作用、默认路由一直不就绪不启动任何东西、网络先失败
+  后就绪仍继续切换、Nextin 残留/端口延迟释放时先等 teardown 再 start、探测/健康失败回退
+  Nextin（core stop + disable）、`OnDemandEnabled : TRUE` 拒绝且不 start、已在 mihomo 且
+  Nextin 断开时幂等成功（不 bootout/bounce）、`install --no-start` 下 core disabled 且
+  boot-switch enabled（读回）且不 kickstart、`start` 成功后 core 仍 disabled、
+  `uninstall` 处理 boot-switch、boot plist 审计（无 forbidden token、无
+  `SuccessfulExit:false` 的 `KeepAlive`、入口必须是 `mpm_macos.boot`）；
 * 健康门的总 deadline 单独测在 `tests/test_controller_health_deadline.py`
   （healthcheck 超时算“已触发”、轮询到 alive 即通过、deadline 到期无 alive 的准确信息、
   controller 真不可达、存活未知、provider 不可见、`/providers/proxies` 正常但 `/proxies`

@@ -84,6 +84,7 @@ def test_install_acquires_the_lock_once_and_releases_it(tmp_path):
     flock = FakeFlock()
     ctx = _context(tmp_path, flock)
     harness = LaunchdHarness(ctx.executor)
+    harness.layout = ctx.layout
     network = FakeNetworkSetup()
     ctx.executor.set("networksetup", network)
     ctx.controller_factory = lambda _secret: FakeController()
@@ -102,7 +103,7 @@ def test_install_acquires_the_lock_once_and_releases_it(tmp_path):
 def test_restart_holds_the_lock_across_stop_and_start(tmp_path):
     flock = FakeFlock()
     ctx = _context(tmp_path, flock)
-    LaunchdHarness(ctx.executor)
+    LaunchdHarness(ctx.executor).layout = ctx.layout
     ctx.executor.set("networksetup", FakeNetworkSetup())
     ctx.controller_factory = lambda _secret: FakeController()
     ctx.tun_observer = _sequence(

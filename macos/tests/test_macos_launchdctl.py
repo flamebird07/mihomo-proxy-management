@@ -7,6 +7,7 @@ import pytest
 from mpm_common.errors import FailClosed
 from mpm_common.executor import FakeExecutor
 from mpm_macos import launchdctl
+from mpm_macos.paths import BOOT_LABEL
 
 from macos_test_support import LaunchdHarness
 
@@ -151,6 +152,20 @@ def test_wait_running_times_out_without_touching_the_host():
 def test_foreign_label_is_refused():
     with pytest.raises(FailClosed):
         launchdctl.Launchd(FakeExecutor(), plist=PLIST, label="com.example.other")
+
+
+def test_the_boot_switch_label_is_the_only_other_allowed_label():
+    """The boot entry is ours too - and still the only second label."""
+    service = launchdctl.Launchd(
+        FakeExecutor(), plist="/Library/LaunchDaemons/boot-switch.plist", label=BOOT_LABEL
+    )
+
+    assert service.service_target == f"system/{BOOT_LABEL}"
+    assert launchdctl.validate_label(BOOT_LABEL) == BOOT_LABEL
+    with pytest.raises(FailClosed):
+        launchdctl.validate_label("com.mihomo-proxy-management.boot")
+    with pytest.raises(FailClosed):
+        launchdctl.Launchd(FakeExecutor(), plist=PLIST, label="com.example.boot-switch")
 
 
 def test_bootstrap_failure_is_reported(monkeypatch):

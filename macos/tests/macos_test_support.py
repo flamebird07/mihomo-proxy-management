@@ -32,6 +32,9 @@ from mpm_macos.paths import Layout
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_TEMPLATE = ROOT / "config" / "config.yaml.template"
 PLIST_TEMPLATE = ROOT / "macos" / "templates" / "com.mihomo-proxy-management.core.plist.template"
+BOOT_PLIST_TEMPLATE = (
+    ROOT / "macos" / "templates" / "com.mihomo-proxy-management.boot-switch.plist.template"
+)
 
 ALL_COMMANDS = (
     "launchctl",
@@ -171,18 +174,56 @@ class FakeFlock:
         self.held = True
 
 
+CORE_LABEL = "com.mihomo-proxy-management.core"
+BOOT_LABEL = "com.mihomo-proxy-management.boot-switch"
+
+
+def _target_label(argv) -> str:
+    """Label addressed by ``system/<label>`` (``bootstrap`` passes a plist path)."""
+    target = str(argv[-1]) if argv else ""
+    if target.startswith("system/"):
+        return target.split("/", 1)[1]
+    if BOOT_LABEL in target:
+        return BOOT_LABEL
+    return CORE_LABEL
+
+
 class LaunchdHarness:
-    """Stateful ``launchctl`` responses wired into a FakeExecutor."""
+    """Stateful ``launchctl`` responses wired into a FakeExecutor.
+
+    Two labels exist, so the persistent-disable state is kept per label:
+    ``disabled`` is the core job (what the safety rules are about) and
+    ``boot_disabled`` the boot entry.  Load/run state is tracked separately for
+    each one as well - the boot entry runs once and is normally not loaded.
+    """
 
     def __init__(self, executor: FakeExecutor) -> None:
         self.executor = executor
+        executor.launchd_harness = self
         self.loaded = False
         self.running = False
-        self.disabled = True
         self.pid: int | None = None
+        self.boot_loaded = False
+        self.boot_running = False
+        #: per-label ``launchctl disable`` override; the core starts disabled
+        #: (install disables it) and the boot entry starts enabled.
+        self.disabled_labels: dict[str, bool] = {CORE_LABEL: True, BOOT_LABEL: False}
         #: bootstrap/kickstart calls that load the job but leave it stopped,
         #: so ``wait_running`` times out (a start failure without a crash).
         self.start_failures = 0
+        #: The context's real ``Layout``, needed by the simulated RunAtLoad
+        #: boot-entry process to check the hold stamp and write the ack file.
+        #: Tests that build a harness by hand and then run ``install`` must
+        #: set it (``harness.layout = ctx.layout``).
+        self.layout: Layout | None = None
+        #: How many more ``launchctl print`` observations the simulated boot
+        #: entry stays "up but not yet at the stamp check" - the async race
+        #: Codex review boot3 flagged (loaded, process not done yet).
+        self.boot_entry_delay = 0
+        #: Whether the simulated entry writes the ack when it reads the stamp.
+        self.boot_entry_acks = True
+        #: How many times the simulated entry completed a run.
+        self.boot_entry_runs = 0
         executor.set("launchctl print", self._print)
         executor.set("launchctl print-disabled", self._print_disabled)
         executor.set("launchctl bootstrap", self._bootstrap)
@@ -191,25 +232,95 @@ class LaunchdHarness:
         executor.set("launchctl enable", self._enable)
         executor.set("launchctl disable", self._disable)
 
+    @classmethod
+    def attached(cls, executor: FakeExecutor) -> "LaunchdHarness":
+        """Return the harness already wired to ``executor``, attaching one if absent.
+
+        ``make_context`` attaches a harness automatically; ``attached`` lets a
+        helper or test reuse that instance instead of resetting its state.
+        """
+        existing = getattr(executor, "launchd_harness", None)
+        if existing is not None:
+            return existing
+        return cls(executor)
+
+    @property
+    def disabled(self) -> bool:
+        """The core job's persistent disable override."""
+        return self.disabled_labels[CORE_LABEL]
+
+    @disabled.setter
+    def disabled(self, value: bool) -> None:
+        self.disabled_labels[CORE_LABEL] = value
+
+    @property
+    def boot_disabled(self) -> bool:
+        return self.disabled_labels[BOOT_LABEL]
+
+    @boot_disabled.setter
+    def boot_disabled(self, value: bool) -> None:
+        self.disabled_labels[BOOT_LABEL] = value
+
     def _print(self, argv):
+        if _target_label(argv) == BOOT_LABEL:
+            if not self.boot_loaded:
+                return (113, "", f'Could not find service "{BOOT_LABEL}"')
+            if self.boot_running:
+                # time passes between two launchctl observations: advance the
+                # simulated RunAtLoad process before reporting its state
+                self._run_boot_entry()
+            state = "running" if self.boot_running else "not running"
+            return (0, f"state = {state}\n\tlast exit code = 0\n", "")
         if not self.loaded:
             return (113, "", 'Could not find service "com.mihomo-proxy-management.core"')
         if self.running:
             return (0, f"state = running\n\tpid = {self.pid or 4242}\n", "")
         return (0, "state = not running\n\tlast exit code = 0\n", "")
 
+    def _run_boot_entry(self) -> None:
+        """Advance the simulated RunAtLoad boot-entry process one observation.
+
+        While ``boot_entry_delay`` is positive the process is up but has not
+        reached the hold-stamp check yet (nothing is acked).  Once it gets
+        there, it reads the *real* stamp file, writes the *real* 0600 ack
+        file (if ``boot_entry_acks``) and exits - exactly what
+        ``mpm_macos.boot`` does on the hold exit.
+        """
+        if self.boot_entry_delay > 0:
+            self.boot_entry_delay -= 1
+            return
+        self.boot_entry_runs += 1
+        if (
+            self.boot_entry_acks
+            and self.layout is not None
+            and os.path.isfile(self.layout.boot_hold)
+        ):
+            try:
+                descriptor = os.open(
+                    self.layout.boot_hold_ack,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.close(descriptor)
+            except FileExistsError:
+                pass
+        # the entry has no KeepAlive: it exits after this single run
+        self.boot_running = False
+
     def _print_disabled(self, argv):
-        entry = (
-            '\t"com.mihomo-proxy-management.core" => disabled\n' if self.disabled else ""
+        entries = "".join(
+            f'\t"{label}" => disabled\n'
+            for label, value in self.disabled_labels.items()
+            if value
         )
-        return (0, "disabled services = {\n" + entry + "}\n", "")
+        return (0, "disabled services = {\n" + entries + "}\n", "")
 
     def _enable(self, argv):
-        self.disabled = False
+        self.disabled_labels[_target_label(argv)] = False
         return (0, "", "")
 
     def _disable(self, argv):
-        self.disabled = True
+        self.disabled_labels[_target_label(argv)] = True
         return (0, "", "")
 
     def _start(self) -> None:
@@ -222,17 +333,31 @@ class LaunchdHarness:
         self.running = True
         self.pid = 4242
 
+    def _start_boot(self) -> None:
+        self.boot_loaded = True
+        self.boot_running = True
+
     def _bootstrap(self, argv):
+        if _target_label(argv) == BOOT_LABEL:
+            self._start_boot()
+            return (0, "", "")
         self._start()
         return (0, "", "")
 
     def _bootout(self, argv):
+        if _target_label(argv) == BOOT_LABEL:
+            self.boot_loaded = False
+            self.boot_running = False
+            return (0, "", "")
         self.loaded = False
         self.running = False
         self.pid = None
         return (0, "", "")
 
     def _kickstart(self, argv):
+        if _target_label(argv) == BOOT_LABEL:
+            self._start_boot()
+            return (0, "", "")
         self._start()
         self.pid = 4243 if self.running else None
         return (0, "", "")
@@ -364,14 +489,18 @@ def make_context(root, *, environ=None, **overrides) -> lifecycle.Context:
     # A fake clock paired with the sleeper: deadline loops (stable disconnect
     # window, health gate, probe) advance instantly and never really sleep.
     clock = overrides.pop("clock", None) or FakeClock()
-    # install verifies the persistent disable override; a bare FakeExecutor
-    # must answer ``print-disabled`` or every install test would fail closed.
-    executor.set(
-        "launchctl print-disabled",
-        (0, 'disabled services = {\n\t"com.mihomo-proxy-management.core" => disabled\n}\n', ""),
-    )
+    # install talks to launchd (it disables the core, then bootstraps the
+    # boot-switch entry and waits for it to acknowledge the hold stamp); a
+    # bare FakeExecutor would answer every print with "not found" and every
+    # install test would fail closed.  The harness is stateful per executor
+    # and ``attached`` reuses an existing one, so helpers that wire their own
+    # harness still read the state install actually produced.  The layout
+    # lets the simulated boot entry read the real stamp and write the real
+    # ack file.
+    layout = Layout(str(root))
+    LaunchdHarness.attached(executor).layout = layout
     values = {
-        "layout": Layout(str(root)),
+        "layout": layout,
         "facts": darwin_facts(),
         "executor": executor,
         "out": io.StringIO(),
