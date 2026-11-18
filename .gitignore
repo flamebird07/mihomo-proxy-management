@@ -11,6 +11,11 @@
 **/*.env
 !**/*.env.example
 **/controller.secret
+runtime/xigua-ippool/
+**/xigua-ippool.yaml
+**/xigua-ippool.staging.yaml
+**/ippool.json
+**/collector.lock
 
 # Rendered mihomo configs contain the controller secret + provider URLs.
 **/config.yaml
@@ -49,6 +54,10 @@ linux/**/__pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+
+# Pipeline runtime logs / single-instance locks (node_provider / node_ops).
+/logs/
+/nul
 
 # =====================================================================
 # Editor / OS droppings (cross-platform, incl. Windows)

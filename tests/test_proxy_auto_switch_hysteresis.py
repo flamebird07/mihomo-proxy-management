@@ -23,7 +23,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, os.pardir, "scripts", "proxy-auto-switch.py")
+SCRIPTS = os.path.abspath(os.path.join(HERE, os.pardir, "scripts"))
+SCRIPT = os.path.join(SCRIPTS, "proxy-auto-switch.py")
+
+# The script imports its sibling policy modules by bare name; make the file
+# collectable on its own, not only after another test inserted scripts/.
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
 
 spec = importlib.util.spec_from_file_location("proxy_auto_switch", SCRIPT)
 pas = importlib.util.module_from_spec(spec)
@@ -74,13 +80,15 @@ def gstate(current=US1, since_min=240, cand=None, cand_streak=0, since_raw=_DEFA
     }
 
 
+# US/SG candidates need STABLE_ROUNDS (10) consecutive alive rounds before they
+# may be pinned to, so the "stable" baseline histories carry 10 samples.
 ALIVE_EVERYWHERE = {
-    US1: [1500, 1500, 1500],
-    US2: [1000, 1010, 990],
-    US3: [2000, 2000, 2000],
-    SG1: [800, 800, 800],
-    SG2: [1400, 1400, 1400],
-    JP1: [700, 700, 700],
+    US1: [1500] * 10,
+    US2: [700] * 10,
+    US3: [2000] * 10,
+    SG1: [800] * 10,
+    SG2: [1400] * 10,
+    JP1: [700] * 10,
 }
 
 
@@ -117,7 +125,7 @@ DECISION_CASES = [
         dict(cand=US2, cand_streak=1, since_min=30), None, "hold_dwell",
     ),
     (
-        "pct 门槛优先于 ms 门槛(3000ms 档需 750ms)",
+        "pct 门槛优先于 ms 门槛(3000ms 档需 1500ms)",
         "GPT", US1, MEMBERS,
         with_overrides(**{US1: [3000, 3000, 3000], US2: [2400, 2400, 2400],
                           US3: [2800, 2800, 2800]}),
@@ -156,7 +164,7 @@ DECISION_CASES = [
     (
         "强制切换仍守 A/B/C 档位优先级(US 慢也先选 US)",
         "GPT", US1, MEMBERS,
-        with_overrides(**{US1: [1500, None, None], US2: [1900, 1900, 1900],
+        with_overrides(**{US1: [1500, None, None], US2: [1900] * 10,
                           US3: [None, None, None]}),
         dict(), US2, "switch_dead",
     ),
@@ -173,9 +181,15 @@ DECISION_CASES = [
         dict(current=SG1), None, "hold_cand_unstable",
     ),
     (
-        "升档：US 连续 2 轮存活 -> 立即升",
+        "升档：US 连续 2 轮存活仍不足 10 轮 -> 不动",
         "GPT", SG1, [US1, SG1, JP1],
         with_overrides(**{SG1: [800, 800, 800], US1: [1510, 1500, 1500]}),
+        dict(current=SG1), None, "hold_cand_unstable",
+    ),
+    (
+        "升档：US 连续 10 轮存活 -> 立即升",
+        "GPT", SG1, [US1, SG1, JP1],
+        with_overrides(**{SG1: [800, 800, 800], US1: [1500] * 10}),
         dict(current=SG1), US1, "switch_upgrade",
     ),
     (
@@ -200,7 +214,7 @@ DECISION_CASES = [
     (
         "MUSE：同档 US 换优仍按门槛",
         "MUSE", US1, [US1, US2],
-        with_overrides(**{US1: [1500, 1500, 1500], US2: [1000, 1010, 990]}),
+        with_overrides(**{US1: [2000] * 10, US2: [1000] * 10}),
         dict(cand=US2, cand_streak=1), US2, "switch_margin",
     ),
     (
@@ -210,16 +224,16 @@ DECISION_CASES = [
         dict(), None, "hold_muse_frozen",
     ),
     (
-        "MUSE：current 不在 members 且只剩 SG/其他 -> 强制恢复选最优",
+        "MUSE：current 不在 members 且组内无存活 US -> 无目标可切",
         "MUSE", "MUSE-AUTO", [US1, SG1, JP1],
         with_overrides(**{US1: [1500, None, None]}),
-        dict(current="MUSE-AUTO"), SG1, "switch_missing",
+        dict(current="MUSE-AUTO"), None, "hold_no_alive_member",
     ),
     (
-        "MUSE：current 为 null 且只剩 SG -> 强制恢复选最优",
+        "MUSE：current 为 null 且只剩 SG（US 档外）-> 无目标可切",
         "MUSE", None, [US1, SG1, JP1],
         with_overrides(**{US1: [1500, None, None], JP1: [None, None, None]}),
-        dict(current=None), SG1, "switch_missing",
+        dict(current=None), None, "hold_no_alive_member",
     ),
     (
         "MUSE：current 为 null 且组内全无存活 -> 无目标可切",
@@ -228,29 +242,29 @@ DECISION_CASES = [
         dict(current=None), None, "hold_no_alive_member",
     ),
     (
-        "MUSE：活在 SG 档、组内有更快 SG -> 一律不动",
+        "MUSE：活在 SG 档（US 档外）、组内 US 全挂 -> 无目标可切",
         "MUSE", SG1, [US1, SG1, SG2, JP1],
         with_overrides(**{US1: [1500, None, None], SG1: [1400, 1400, 1400],
                           SG2: [800, 800, 800]}),
-        dict(current=SG1, cand=SG2, cand_streak=5), None, "hold_muse_frozen",
+        dict(current=SG1, cand=SG2, cand_streak=5), None, "hold_no_alive_member",
     ),
     (
-        "MUSE：活在 SG 档、US 连续 2 轮存活 -> 仍允许升档回 US",
+        "MUSE：current 在组外(SG)、US 稳定存活 -> 强制恢复回 US",
         "MUSE", SG1, [US1, SG1, SG2],
-        with_overrides(**{SG1: [800, 800, 800], US1: [1510, 1500, 1500]}),
-        dict(current=SG1), US1, "switch_upgrade",
+        with_overrides(**{SG1: [800, 800, 800], US1: [1500] * 10}),
+        dict(current=SG1), US1, "switch_missing",
     ),
     (
-        "MUSE：current 是组外的 US 而组内只有 SG/其他 -> 强制切最优",
+        "MUSE：current 是组外的 US 而组内只有 SG/其他 -> 无目标可切",
         "MUSE", US1, [SG1, JP1],
         with_overrides(),
-        dict(), SG1, "switch_missing",
+        dict(), None, "hold_no_alive_member",
     ),
     (
-        "MUSE：已在其他档且只剩 SG -> 不升不降",
+        "MUSE：已在其他档且组内 US 全挂 -> 无目标可切",
         "MUSE", JP1, [JP1, SG1, US1],
         with_overrides(**{US1: [1500, None, None], JP1: [700, 700, 700]}),
-        dict(current=JP1), None, "hold_ok",
+        dict(current=JP1), None, "hold_no_alive_member",
     ),
     (
         "全探测失败 -> 冻结",
@@ -315,7 +329,7 @@ class DecideGroupTests(unittest.TestCase):
 
     def test_no_history_first_round_never_switches_for_margin(self):
         """A migrated state has no node history: only forced switches may fire."""
-        stats = node_stats({US1: [1500], US2: [900]})
+        stats = node_stats({US1: [1500], US2: [700]})
         det = {}
         target, reason = pas.decide_group(
             "GPT", US1, [US1, US2], stats, gstate(since_min=600), NOW, PARAMS, det,
@@ -324,9 +338,46 @@ class DecideGroupTests(unittest.TestCase):
         self.assertEqual(reason, "hold_cand_unstable")
 
     def test_need_margin_uses_max_of_ms_and_pct(self):
-        self.assertEqual(pas.need_margin_ms(1000, PARAMS), 300)
-        self.assertEqual(pas.need_margin_ms(3000, PARAMS), 750)
+        self.assertEqual(pas.need_margin_ms(1000, PARAMS), 500)
+        self.assertEqual(pas.need_margin_ms(3000, PARAMS), 1500)
         self.assertIsNone(pas.need_margin_ms(None, PARAMS))
+
+    def test_same_tier_candidate_needs_ten_alive_rounds(self):
+        """The stability gate replaces the old 2-of-3 alive_within rule."""
+        nine = node_stats(with_overrides(**{US2: [700] * 9}))
+        det = {}
+        target, reason = pas.decide_group(
+            "GPT", US1, MEMBERS, nine, gstate(cand=US2, cand_streak=5), NOW, PARAMS, det)
+        self.assertIsNone(target)
+        self.assertEqual(reason, "hold_cand_unstable")
+
+        ten = node_stats(with_overrides())
+        det = {}
+        target, reason = pas.decide_group(
+            "GPT", US1, MEMBERS, ten, gstate(cand=US2, cand_streak=1), NOW, PARAMS, det)
+        self.assertEqual((target, reason), (US2, "switch_margin"))
+
+    def test_fallback_dead_current_is_left_to_the_kernel(self):
+        stats = node_stats(with_overrides(**{US1: [1500, None, None]}))
+        det = {}
+        target, reason = pas.decide_group(
+            "GPT", US1, MEMBERS, stats, gstate(), NOW, PARAMS, det, engine="fallback")
+        self.assertIsNone(target)
+        self.assertEqual(reason, "hold_dead_delegate_fallback")
+        # On a selector the script still rescues the dead current node.
+        det = {}
+        target, reason = pas.decide_group(
+            "GPT", US1, MEMBERS, stats, gstate(), NOW, PARAMS, det, engine="selector")
+        self.assertEqual((target, reason), (US2, "switch_dead"))
+
+    def test_muse_members_are_us_only(self):
+        """SG/JP members are filtered out of MUSE before any decision."""
+        stats = node_stats(with_overrides(**{US1: [1500, None, None]}))
+        det = {}
+        target, reason = pas.decide_group(
+            "MUSE", None, [US1, SG1, JP1], stats, gstate(current=None), NOW, PARAMS, det)
+        self.assertIsNone(target)
+        self.assertEqual(reason, "hold_no_alive_member")
 
 
 class SmoothingTests(unittest.TestCase):
@@ -528,7 +579,7 @@ class MigrateStateTests(unittest.TestCase):
     def test_unknown_since_is_not_a_full_dwell(self):
         """A missing/unparseable `since` must hold, only forced switches may cut."""
         stats = node_stats(with_overrides(**{US1: [3000, 3000, 3000],
-                                             US2: [1000, 1000, 1000]}))
+                                             US2: [1000] * 10}))
         for bad in ("", "garbage", None, 12345, [ISO(NOW)]):
             with self.subTest(since=bad):
                 det = {}
@@ -543,12 +594,12 @@ class MigrateStateTests(unittest.TestCase):
 class NodeHistoryTests(unittest.TestCase):
     def test_one_sample_per_round_and_cap(self):
         nodes = {}
-        for i in range(10):
+        for i in range(14):
             when = NOW + dt.timedelta(minutes=i)
             nodes = pas.update_nodes(nodes, {US1: 1000 + i}, ISO(when), when)
         samples = nodes[US1]["samples"]
         self.assertEqual(len(samples), pas.SAMPLE_KEEP)
-        self.assertEqual([ms for _ts, ms in samples][-2:], [1008, 1009])
+        self.assertEqual([ms for _ts, ms in samples][-2:], [1012, 1013])
 
     def test_retry_replaces_same_round_sample(self):
         ts = ISO(NOW)
@@ -680,6 +731,8 @@ class MainHarness(unittest.TestCase):
         with patch.object(pas, "api_json", self.fake_api_json), \
                 patch.object(pas, "request_delay", probe), \
                 patch.object(pas.time, "sleep", lambda _s: None), \
+                patch.object(pas.named_mutex_lock, "named_mutex_lock_factory",
+                             pas.gpt_switch_entry.serial_lock_factory), \
                 contextlib.redirect_stdout(stdout):
             code = pas.main(args)
         return code, stdout.getvalue()
@@ -697,13 +750,11 @@ class LegacyModeTests(MainHarness):
         groups = {g: self.PROXIES[g] for g in pas.SWITCH_GROUPS}
         expected = pas.plan_switches("A", groups, self.DELAYS,
                                      {US1, US2, US3}, {SG1}, {US1, US2, US3, SG1, JP1})
-        code, out = self.run_main()
+        code, out = self.run_main(decision_mode="legacy")
         self.assertEqual(code, 0)
-        self.assertEqual(self.puts, [
-            (g, target) for g, target in expected.items()
-            if target and target != self.PROXIES[g]["now"]
-        ])
-        self.assertEqual(sorted(self.puts), [("GPT", US3), ("US-FAST", US3)])
+        # GPT is owned by the unified entry and never PUT by the legacy plan;
+        # MUSE is already on its fastest US member, so only US-FAST moves.
+        self.assertEqual(self.puts, [("US-FAST", US3)])
         state = self.read_state()
         self.assertEqual(
             sorted(state),
@@ -711,14 +762,15 @@ class LegacyModeTests(MainHarness):
              "selected", "updated"],
         )
         self.assertNotIn("version", state)
-        self.assertEqual(state["planned"], {g: (expected[g] or None) for g in pas.SWITCH_GROUPS})
-        self.assertIn("PLAN\tGPT\t%s\t->\t%s\tdelay=1200" % (US1, US3), out)
+        self.assertEqual(state["planned"], {"GPT": None, "MUSE": US1, "US-FAST": US3})
+        self.assertIn("PLAN\tGPT\tunchanged\tnow=%s" % US1, out)
         self.assertIn("PLAN\tMUSE\talready\t%s" % US1, out)
+        self.assertIn("PLAN\tUS-FAST\t%s\t->\t%s\tdelay=1200" % (US2, US3), out)
         self.assertIn("RESULT\tmode=A\talive_us=3\talive_sg=1\talive_any=5", out)
         self.assertFalse(os.path.exists(self.paths["rounds"]))
 
-    def test_default_cli_is_legacy(self):
-        self.assertEqual(pas.parse_args([]).decision_mode, "legacy")
+    def test_default_cli_is_hysteresis(self):
+        self.assertEqual(pas.parse_args([]).decision_mode, "hysteresis")
         self.assertEqual(pas.parse_args(["--legacy-fastest"]).decision_mode, "legacy")
         self.assertEqual(pas.parse_args(["--decision-mode", "hysteresis",
                                          "--legacy-fastest"]).decision_mode, "legacy")
@@ -728,14 +780,14 @@ class LegacyModeTests(MainHarness):
         self.assertEqual(
             (args.switch_margin_ms, args.switch_margin_pct, args.switch_streak,
              args.min_dwell_min, args.retry_current),
-            (300, 25, 2, 90, 2),
+            (300, 50, 2, 60, 2),
         )
         self.assertEqual(args.rounds_jsonl, pas.DEFAULT_ROUNDS_JSONL)
 
     def test_legacy_fastest_alias_runs_old_behaviour(self):
         code, _out = self.run_main(["--legacy-fastest"])
         self.assertEqual(code, 0)
-        self.assertEqual(sorted(self.puts), [("GPT", US3), ("US-FAST", US3)])
+        self.assertEqual(self.puts, [("US-FAST", US3)])
         self.assertNotIn("version", self.read_state())
 
 
@@ -743,7 +795,7 @@ class ShadowModeTests(MainHarness):
     def test_shadow_executes_legacy_but_records_new_decision(self):
         code, _out = self.run_main(decision_mode="shadow")
         self.assertEqual(code, 0)
-        self.assertEqual(sorted(self.puts), [("GPT", US3), ("US-FAST", US3)])
+        self.assertEqual(self.puts, [("US-FAST", US3)])
         rows = self.read_rounds()
         self.assertEqual(len(rows), 3)
         self.assertEqual({row["group"] for row in rows}, set(pas.SWITCH_GROUPS))
@@ -752,13 +804,14 @@ class ShadowModeTests(MainHarness):
             self.assertIn(row["decision"], {"hold", "switch", "freeze"})
         state = self.read_state()
         self.assertEqual(state["version"], pas.STATE_VERSION)
-        # Execution followed the legacy plan (fastest US), MUSE untouched.
-        self.assertEqual(state["planned"], {"GPT": US3, "MUSE": US1, "US-FAST": US3})
+        # Execution followed the legacy plan (fastest US) minus GPT, MUSE untouched.
+        self.assertEqual(state["planned"], {"GPT": None, "MUSE": US1, "US-FAST": US3})
         self.assertEqual(state["selected"], {"GPT": US1, "MUSE": US1, "US-FAST": US2})
         self.assertIn(US1, state["nodes"])
-        # The new decision was only recorded: 300ms of gain is inside the margin.
-        self.assertEqual(state["decisions"]["GPT"], {"target": None, "reason": "hold_margin"})
-        self.assertEqual(rows[0]["executed"], US3)
+        # GPT is decided by the unified entry: a healthy current node holds.
+        self.assertEqual(state["decisions"]["GPT"],
+                         {"target": None, "reason": "hold_current_healthy"})
+        self.assertEqual(rows[0]["executed"], None)
 
     def test_hysteresis_dry_run_writes_nothing(self):
         code, out = self.run_main(["--dry-run"], decision_mode="hysteresis")
@@ -777,7 +830,9 @@ class ShadowModeTests(MainHarness):
             delays[name] = None
         code, out = self.run_main(["--dry-run"], decision_mode="hysteresis", delays=delays)
         self.assertEqual(code, 0)
-        self.assertIn("DRY-RUN\tGPT\t->\t%s" % SG1, out)
+        # GPT stays with the unified entry (no stable candidate yet -> no move);
+        # US-FAST drops to the alive SG member, MUSE freezes on its US-only tier.
+        self.assertNotIn("DRY-RUN\tGPT", out)
         self.assertIn("DRY-RUN\tUS-FAST\t->\t%s" % SG1, out)
         self.assertNotIn("DRY-RUN\tMUSE", out)
         self.assertFalse(os.path.exists(self.paths["state"]))
@@ -854,7 +909,9 @@ class CurrentRetryTests(MainHarness):
         delays[US1] = None
         code, _out = self.run_main(decision_mode="hysteresis", delays=delays)
         self.assertEqual(code, 0)
-        self.assertEqual(self.puts, [("GPT", US3)])
+        # GPT holds via the unified entry (no stable same-region candidate yet),
+        # US-FAST current US2 is still alive, MUSE freezes on its US-only tier.
+        self.assertEqual(self.puts, [])
         rows = {row["group"]: row for row in self.read_rounds()}
         self.assertEqual(rows["MUSE"]["reason"], "hold_muse_frozen")
         self.assertIn("muse_frozen_dead", self.log_text())
@@ -872,10 +929,12 @@ class CurrentRetryTests(MainHarness):
 
         code, _out = self.run_main(decision_mode="legacy", delays=delays, probe=probe)
         self.assertEqual(code, 0)
-        self.assertEqual(hits["n"], 1)
+        # The legacy main path never reprobes dead currents (no retry-current log);
+        # the unified GPT entry owns its own current-node retry independently.
+        self.assertGreaterEqual(hits["n"], 1)
         self.assertNotIn("retry-current", self.log_text())
-        # Legacy mode C-branch: MUSE stays, GPT/US-FAST take the fastest US.
-        self.assertEqual(sorted(self.puts), [("GPT", US3), ("US-FAST", US3)])
+        # Legacy mode A: MUSE stays, US-FAST takes the fastest US; GPT never moves.
+        self.assertEqual(self.puts, [("US-FAST", US3)])
 
 
 class RetryReclassifiesRoundTests(MainHarness):
@@ -907,7 +966,7 @@ class RetryReclassifiesRoundTests(MainHarness):
         self.assertEqual(rows["GPT"]["alive_any"], 1)
         self.assertEqual(rows["GPT"]["mode"], "A")
         # The current US node is alive after the retry, so nothing is forced.
-        self.assertEqual(rows["GPT"]["reason"], "hold_ok")
+        self.assertEqual(rows["GPT"]["reason"], "hold_current_healthy")
         self.assertEqual(rows["MUSE"]["reason"], "hold_ok")
         self.assertEqual(self.puts, [("US-FAST", US1)])
 
@@ -956,17 +1015,18 @@ class MuseFrozenModeTests(MainHarness):
         }
         code, _out = self.run_main(decision_mode="hysteresis", delays=delays, state=state)
         self.assertEqual(code, 0)
-        # margin/streak/dwell would all allow the switch: MUSE still must not move.
+        # MUSE is US-only: SG1 is not even a managed member, and with every US
+        # member dead there is no target, so MUSE cannot move regardless of margin.
         rows = {row["group"]: row for row in self.read_rounds()}
-        self.assertEqual(rows["MUSE"]["reason"], "hold_muse_frozen")
+        self.assertEqual(rows["MUSE"]["reason"], "hold_no_alive_member")
         self.assertNotIn(("MUSE", SG2), self.puts)
-        self.assertEqual(self.puts, [("GPT", SG1), ("US-FAST", SG1)])
+        self.assertEqual(self.puts, [("US-FAST", SG1)])
         written = self.read_state()
         # The stale same-tier candidate is cleared: frozen MUSE cannot bank it.
         self.assertIsNone(written["groups"]["MUSE"]["cand"])
         self.assertEqual(written["groups"]["MUSE"]["cand_streak"], 0)
 
-    def test_muse_missing_current_recovers_to_best_available(self):
+    def test_muse_missing_current_with_no_alive_us_member_holds(self):
         leaf = {"type": "ss", "history": []}
         self.PROXIES = {
             **MainHarness.PROXIES,
@@ -977,55 +1037,62 @@ class MuseFrozenModeTests(MainHarness):
         code, _out = self.run_main(decision_mode="hysteresis", delays=delays)
         self.assertEqual(code, 0)
         rows = {row["group"]: row for row in self.read_rounds()}
-        self.assertEqual(rows["MUSE"]["reason"], "switch_missing")
-        self.assertIn(("MUSE", SG1), self.puts)
+        # MUSE only accepts US peers; the lone alive SG member is not a target.
+        self.assertEqual(rows["MUSE"]["reason"], "hold_no_alive_member")
+        self.assertNotIn(("MUSE", SG1), self.puts)
 
 
 class GroupStateAlignmentTests(MainHarness):
-    """Review item 4: reconcile with the controller before deciding."""
+    """Review item 4: reconcile with the controller before deciding.
+
+    GPT is decided by the unified entry, so the streak/dwell reconciliation is
+    exercised on US-FAST, which still runs decide_group.
+    """
 
     def test_external_manual_switch_resets_streak_and_dwell(self):
-        self.PROXIES = {**MainHarness.PROXIES,
-                        "GPT": {"type": "selector", "now": US2,
-                                "all": [US1, US2, US3, SG1, JP1, "DIRECT"]}}
         delays = {US1: 1500, US2: 2000, US3: 900, SG1: 1900, JP1: 1800}
-        wide = real_iso(120)
         since = real_iso(200)
+        us3_hist = [[real_iso(10 - i), 900] for i in range(10)]
         state = {
             "version": 2, "mode": "A",
-            "groups": {"GPT": {"current": US1, "since": since, "cand": US3,
-                               "cand_streak": 5, "switch_ts_24h": []}},
-            "nodes": {US1: {"samples": [[wide, 1500], [since, 1500]]},
-                      US2: {"samples": [[wide, 2000], [since, 2000]]},
-                      US3: {"samples": [[wide, 900], [since, 900]]}},
+            "groups": {"US-FAST": {"current": US1, "since": since, "cand": US3,
+                                   "cand_streak": 5, "switch_ts_24h": []}},
+            "nodes": {US1: {"samples": [[real_iso(120), 1500], [since, 1500]]},
+                      US2: {"samples": [[real_iso(120), 2000], [since, 2000]]},
+                      US3: {"samples": us3_hist}},
         }
         code, _out = self.run_main(decision_mode="hysteresis", delays=delays, state=state)
         self.assertEqual(code, 0)
         rows = {row["group"]: row for row in self.read_rounds()}
-        # The stale streak of 5 may not be inherited by a node nobody chose.
-        self.assertEqual(rows["GPT"]["reason"], "hold_streak")
-        self.assertEqual(rows["GPT"]["cand_streak"], 1)
-        self.assertEqual(rows["GPT"]["dwell_min"], 0)
-        self.assertNotIn("GPT", [group for group, _n in self.puts])
+        # The controller runs US2, not the state's US1: the stale streak of 5 may
+        # not be inherited, and dwell restarts from the external switch.
+        self.assertEqual(rows["US-FAST"]["reason"], "hold_streak")
+        self.assertEqual(rows["US-FAST"]["cand_streak"], 1)
+        self.assertEqual(rows["US-FAST"]["dwell_min"], 0)
+        self.assertNotIn("US-FAST", [group for group, _n in self.puts])
         written = self.read_state()
-        self.assertEqual(written["groups"]["GPT"]["current"], US2)
-        self.assertEqual(written["groups"]["GPT"]["cand_streak"], 1)
+        self.assertEqual(written["groups"]["US-FAST"]["current"], US2)
+        self.assertEqual(written["groups"]["US-FAST"]["cand_streak"], 1)
 
     def test_unparseable_since_blocks_margin_switch(self):
+        self.PROXIES = {**MainHarness.PROXIES,
+                        "US-FAST": {"type": "selector", "now": US1,
+                                    "all": [US1, US2, US3, SG1]}}
         delays = {US1: 2000, US2: 900, US3: 1500, SG1: 1900, JP1: 1800}
-        wide = real_iso(120)
+        us2_hist = [[real_iso(10 - i), 900] for i in range(10)]
         state = {
             "version": 2, "mode": "A",
-            "groups": {"GPT": {"current": US1, "since": "not-a-timestamp", "cand": US2,
-                               "cand_streak": 5, "switch_ts_24h": "nope"}},
-            "nodes": {US1: {"samples": [[wide, 2000], [ISO(NOW), 2000]]},
-                      US2: {"samples": [[wide, 900], [ISO(NOW), 900]]}},
+            "groups": {"US-FAST": {"current": US1, "since": "not-a-timestamp",
+                                   "cand": US2, "cand_streak": 5,
+                                   "switch_ts_24h": "nope"}},
+            "nodes": {US1: {"samples": [[real_iso(120), 2000], [real_iso(0), 2000]]},
+                      US2: {"samples": us2_hist}},
         }
         code, _out = self.run_main(decision_mode="hysteresis", delays=delays, state=state)
         self.assertEqual(code, 0)
         rows = {row["group"]: row for row in self.read_rounds()}
-        self.assertEqual(rows["GPT"]["reason"], "hold_dwell")
-        self.assertNotIn("GPT", [group for group, _n in self.puts])
+        self.assertEqual(rows["US-FAST"]["reason"], "hold_dwell")
+        self.assertNotIn("US-FAST", [group for group, _n in self.puts])
 
 
 class CorruptStateMainTests(MainHarness):
@@ -1080,12 +1147,16 @@ class CorruptStateMainTests(MainHarness):
             self.assertEqual(sorted(os.listdir(tmp)), ["state.json"])
 
 class LegacyOracleTests(unittest.TestCase):
-    """Review item 5: the legacy path must behave like the pre-debounce script.
+    """Review item 5: the legacy MUSE/US-FAST path must behave like the
+    pre-debounce script.
 
     The oracle is the committed version of the script (`git show HEAD:...`).
-    Both versions run against the same stub controller and the same probe
-    results; PUT order, PLAN/RESULT/NOW stdout, the written state (minus
-    `updated`) and the alert decision must match exactly.
+    GPT is excluded from the comparison: CY-GUS-DEV1 moved GPT to the unified
+    entry, so the legacy plan can never move it again. Mode C also changed
+    (JP whitelist only) and is covered separately, not by oracle equivalence.
+    Both versions run against the same stub controller and probe results; PUT
+    order, PLAN/RESULT/NOW stdout, the written state (minus `updated` and GPT)
+    and the alert decision must match exactly for modes A/B.
     """
 
     @classmethod
@@ -1173,6 +1244,10 @@ class LegacyOracleTests(unittest.TestCase):
         ]
         if scenario["dry_run"]:
             argv.append("--dry-run")
+        if module is pas:
+            # The new default is hysteresis; force the legacy rollback path and
+            # use the offline lock so the GPT entry never contends with production.
+            argv.append("--legacy-fastest")
 
         stdout = io.StringIO()
         patches = [patch.object(module, "api_json", fake_api_json),
@@ -1181,6 +1256,10 @@ class LegacyOracleTests(unittest.TestCase):
         if getattr(module, "time", None) is not None:
             # The pre-debounce script has no retry sleep to stub out.
             patches.append(patch.object(module.time, "sleep", lambda _s: None))
+        if module is pas:
+            patches.append(patch.object(
+                module.named_mutex_lock, "named_mutex_lock_factory",
+                module.gpt_switch_entry.serial_lock_factory))
         with contextlib.ExitStack() as stack:
             for item in patches:
                 stack.enter_context(item)
@@ -1189,16 +1268,36 @@ class LegacyOracleTests(unittest.TestCase):
 
     def normalize(self, result):
         code, out, puts, paths = result
-        lines = [self.TS_RE.sub("<ts>", line) for line in out.splitlines()
-                 if line.startswith(("PLAN", "RESULT", "NOW", "ERROR", "DRY-RUN"))]
+        lines = []
+        for line in out.splitlines():
+            if not line.startswith(("PLAN", "RESULT", "NOW", "ERROR", "DRY-RUN")):
+                continue
+            if "\tGPT\t" in line:
+                continue
+            line = self.TS_RE.sub("<ts>", line)
+            if " | " in line:
+                line = " | ".join(p for p in line.split(" | ")
+                                  if not p.startswith("GPT="))
+            lines.append(line)
+        puts = [(g, n) for g, n in puts if g != "GPT"]
         state = None
         if os.path.exists(paths["state"]):
             state = json.loads(Path(paths["state"]).read_text(encoding="utf-8"))
             state.pop("updated", None)
+            for key in ("selected", "planned"):
+                if isinstance(state.get(key), dict):
+                    state[key].pop("GPT", None)
         alerts = []
         if os.path.exists(paths["alert"]):
             with open(paths["alert"], encoding="utf-8") as handle:
-                alerts = [self.TS_RE.sub("<ts>", line.rstrip("\n")) for line in handle]
+                for line in handle:
+                    line = self.TS_RE.sub("<ts>", line.rstrip("\n"))
+                    if "\t" in line:
+                        stamp, body = line.split("\t", 1)
+                        body = " | ".join(p for p in body.split(" | ")
+                                          if not p.startswith("GPT="))
+                        line = stamp + "\t" + body
+                    alerts.append(line)
         rounds = os.path.exists(paths.get("rounds", os.path.join(":", "none")))
         return {"code": code, "stdout": lines, "puts": puts, "state": state,
                 "alerts": alerts}
@@ -1234,8 +1333,6 @@ class LegacyOracleTests(unittest.TestCase):
             "mode B 但上一轮 state 类型全错": self.scenario(
                 delays=us_dead, state='{"mode": 7, "alerted_mode": [], "updated": '
                                       '"2026-11-01T12:00:00+08:00"}'),
-            "mode C 只剩日本": self.scenario(delays=sg_dead),
-            "mode C dry-run": self.scenario(delays=sg_dead, dry_run=True),
             "mode A 但 GPT PUT 失败": self.scenario(put_fail={"GPT"}),
             "mode B dry-run": self.scenario(delays=us_dead, dry_run=True),
             "controller 不可达": self.scenario(controller_down=True),
@@ -1252,6 +1349,57 @@ class LegacyOracleTests(unittest.TestCase):
                     self.assertEqual(got["code"], 0)
                     if not case["dry_run"]:
                         self.assertIsNotNone(got["state"])
+
+    def test_legacy_plan_never_moves_gpt(self):
+        """CY-GUS-DEV1: GPT is owned by the unified entry in every mode."""
+        if self.oracle is None:
+            self.skipTest("git HEAD script unavailable")
+        for mode in ("legacy", "shadow", "hysteresis"):
+            with self.subTest(mode=mode):
+                paths = self.sandbox()
+                puts = []
+
+                def fake_api_json(method, url, body=None, token=None, timeout=15):
+                    if method == "PUT":
+                        puts.append((url.rsplit("/", 1)[-1], (body or {}).get("name")))
+                        return {}
+                    return {"proxies": copy.deepcopy(self.PROXIES)}
+
+                argv = ["--controller", "http://127.0.0.1:9",
+                        "--state-file", paths["state"], "--log-file", paths["log"],
+                        "--alert-log", paths["alert"], "--alert-target", paths["target"],
+                        "--env-file", paths["env"], "--secret-env", paths["secret"],
+                        "--decision-mode", mode]
+                with patch.object(pas, "api_json", fake_api_json), \
+                        patch.object(pas, "request_delay",
+                                     lambda api, name, *a, **k: self.ALL_DELAYS.get(name)), \
+                        patch.object(pas.time, "sleep", lambda _s: None), \
+                        patch.object(pas.named_mutex_lock, "named_mutex_lock_factory",
+                                     pas.gpt_switch_entry.serial_lock_factory), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = pas.main(argv)
+                self.assertEqual(code, 0)
+                self.assertNotIn("GPT", [g for g, _n in puts])
+
+    def test_mode_c_drops_to_whitelist_japan_only(self):
+        """Mode C no longer takes any-region fastest: only the JP whitelist node."""
+        if self.oracle is None:
+            self.skipTest("git HEAD script unavailable")
+        sg_dead = {**self.ALL_DELAYS, US1: None, US2: None, US3: None, SG1: None}
+        # A generic Japan name is TIER_OTHER: US-FAST must stay put.
+        got = self.normalize(self.run_once(pas, self.sandbox(),
+                                           self.scenario(delays=sg_dead)))
+        self.assertEqual(got["puts"], [])
+        # With the whitelisted Japan node alive and a member, US-FAST drops to it.
+        jp_white = next(iter(pas.JP_TIER_NODES))
+        proxies = {**self.PROXIES,
+                   "US-FAST": {"type": "selector", "now": US2,
+                               "all": [US1, US2, US3, SG1, jp_white]},
+                   jp_white: {"type": "ss", "history": []}}
+        delays = {**sg_dead, jp_white: 800}
+        got = self.normalize(self.run_once(pas, self.sandbox(),
+                                           self.scenario(delays=delays, proxies=proxies)))
+        self.assertEqual(got["puts"], [("US-FAST", jp_white)])
 
     def test_legacy_reads_state_after_switching(self):
         """The alert decision uses the state as it is after the switches."""
@@ -1355,9 +1503,18 @@ class LegacyRegressionHelpersTests(unittest.TestCase):
         plan = pas.plan_switches("B", groups, MainHarness.DELAYS, set(), {SG1}, {SG1})
         self.assertIsNone(plan["MUSE"])
         self.assertEqual(plan["GPT"], SG1)
-        plan = pas.plan_switches("C", groups, MainHarness.DELAYS, set(), set(), {JP1})
+        # Mode C drops GPT/US-FAST to the whitelisted Japan node only; a generic
+        # Japan name is TIER_OTHER and is excluded by the per-group tier filter.
+        jp_white = next(iter(pas.JP_TIER_NODES))
+        groups = {g: {**MainHarness.PROXIES[g],
+                      "all": [*MainHarness.PROXIES[g]["all"], jp_white]}
+                  for g in pas.SWITCH_GROUPS}
+        plan = pas.plan_switches("C", groups, {jp_white: 800}, set(), set(), {jp_white})
         self.assertIsNone(plan["MUSE"])
-        self.assertEqual(plan["GPT"], JP1)
+        self.assertEqual(plan["GPT"], jp_white)
+        self.assertEqual(plan["US-FAST"], jp_white)
+        plan = pas.plan_switches("C", groups, MainHarness.DELAYS, set(), set(), {JP1})
+        self.assertIsNone(plan["GPT"])
 
 
 if __name__ == "__main__":

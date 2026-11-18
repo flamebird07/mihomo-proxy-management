@@ -394,7 +394,9 @@ class NinjaAndBatExitTests(unittest.TestCase):
         completed = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command", expression], capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("Access is denied", completed.stdout + completed.stderr)
+        # PowerShell wraps error text at the console width; collapse whitespace.
+        output = " ".join((completed.stdout + completed.stderr).split())
+        self.assertIn("Access is denied", output)
 
     @windows_only
     def test_bat_any_stage_failure_makes_final_nonzero(self):
