@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
 """Proxy auto-failover for mihomo select groups GPT / MUSE / US-FAST.
 
-Runs after sync-feishu-bitable.py in the half-hour pipeline. Measures Grok
+Runs after sync-feishu-bitable.py in the half-hour pipeline. Measures ChatGPT
 trace delay via the live controller, classifies US vs SG from node names
 (same heuristics as sync-feishu-bitable.py), then applies:
 
   A  >=1 US alive  -> GPT, MUSE, US-FAST each to fastest US in that group's all
   B  no US, SG ok  -> GPT + US-FAST to fastest SG; MUSE unchanged
-  C  US+SG dead    -> GPT + US-FAST to any-region fastest alive; MUSE unchanged
-                     (GPT also falls back so ChatGPT stays reachable)
+  C  US+SG dead    -> GPT + US-FAST drop to the whitelisted Japan node; MUSE
+                     unchanged (still US only)
+
+Candidate regions are hard-limited per group (GPT/US-FAST: US then SG then JP;
+MUSE: US only), so no other region is ever used. GPT/MUSE/US-FAST are Fallback groups,
+which the kernel re-selects every interval from the first alive member of the
+list; measured on v1.19.28 a PUT here is a real pin: it holds while the node
+passes its health check and is dropped on the first failed check, after which
+the kernel takes over. A dead current node is therefore left to the kernel
+(decide_group holds it instead of grab-cutting), and the script only re-pins to
+a same-tier member that is clearly better -- best <= current*0.5 sustained over
+two consecutive rounds.
+
+Stability gate: a US/SG node only becomes a pin target after STABLE_ROUNDS (10)
+consecutive alive rounds, counted from the `samples` history already kept in the
+state file. While 日本06-×1 heads the GPT/US-FAST list this keeps a single
+fake-alive US/SG sample from handing the group back and forth.
 
 State file debounce: same mode does not re-alert. Alerts prefer Feishu IM when
 FEISHU_RECEIVE_ID / FEISHU_CHAT_ID is set; otherwise append alert log.
 
 --decision-mode picks the behaviour:
-  legacy     fastest-node plan above, no thresholds (default; --legacy-fastest
-             is an alias). State stays version 1, no rounds JSONL is written.
+  legacy     fastest-node plan above, no thresholds (--legacy-fastest is an
+             alias). State stays version 1, no rounds JSONL is written.
   shadow     legacy plan is executed, the thresholded decision is only recorded
              (log + rounds JSONL) so it can be compared for a shadow period.
-  hysteresis the thresholded decision of decide_group() is executed: smoothed
-             medians, margin + candidate streak + dwell, forced switch when the
-             current node is dead or absent, freeze on an all-dead probe round.
+  hysteresis (default) the thresholded decision of decide_group() is executed:
+             smoothed medians, margin + candidate streak + dwell, tier
+             promotion/demotion, freeze on an all-dead probe round.
 
 Secrets (FEISHU_APP_SECRET, tokens, URLs) are never printed or logged.
 """
@@ -43,8 +58,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# CY-GUS-DEV1: the unified GPT policy modules sit beside this script in
+# production and in ../src in the offline bundle. MUSE/US-FAST keep the local
+# decide_group path below; GPT is decided and executed only by this entry.
+_HERE = Path(__file__).resolve().parent
+if not (_HERE / "gpt_switch_entry.py").exists():
+    sys.path.insert(0, str(_HERE.parent / "src"))
+import gpt_switch_entry
+import named_mutex_lock
+from gpt_stability_policy import NodeSnapshot, PolicyConfig
+
 DEFAULT_CONTROLLER = "http://127.0.0.1:9090"
-DEFAULT_TARGET = "https://grok.com/cdn-cgi/trace"
+DEFAULT_TARGET = "https://chatgpt.com/robots.txt"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
 DEFAULT_STATE_FILE = r"C:\mihomo\state\proxy-failover-state.json"
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\proxy-failover.log"
@@ -54,12 +79,18 @@ DEFAULT_ROUNDS_JSONL = r"C:\mihomo\logs\proxy-failover-rounds.jsonl"
 SWITCH_GROUPS = ("GPT", "MUSE", "US-FAST")
 SKIP_MEMBERS = {"DIRECT", "REJECT", "COMPATIBLE", "PASS", "GLOBAL"}
 STATE_VERSION = 2
-SAMPLE_KEEP = 6
+SAMPLE_KEEP = 12
 SAMPLE_SMOOTH_MAX = 5
 SAMPLE_MAX_AGE_H = 6
 NODE_PRUNE_AGE_H = 24
 RETRY_DELAY_S = 2.0
-TIER_US, TIER_SG, TIER_OTHER = 3, 2, 1
+TIER_US, TIER_SG, TIER_JP, TIER_OTHER = 3, 2, 1, 0
+# Rounds a US/SG node must be alive back to back (10 rounds at the ~30min task
+# cadence) before it may be pinned to; a single sample is the fake-alive pattern
+# that made `now` flip.
+STABLE_ROUNDS = 10
+# Third-tier pool for GPT/US-FAST, limited to the node measured alive 2026-11-03.
+JP_TIER_NODES = {"日本06-×1"}
 MISSING_SMOOTHED = 10 ** 12
 
 SG_PATTERN = re.compile(r"新加坡|狮城|獅城|singapore|🇸🇬|\bSGP?\b", re.IGNORECASE)
@@ -69,6 +100,23 @@ US_PATTERN = re.compile(
     r"virginia|ohio|california|圣何塞|洛杉矶|西雅图|达拉斯|芝加哥|纽约|硅谷|凤凰城",
     re.IGNORECASE,
 )
+JP_PATTERN = re.compile(r"日本|japan|🇯🇵|tokyo|东京|東京", re.IGNORECASE)
+
+
+def policy_region(name: str) -> str | None:
+    """Region for the unified GPT policy.
+
+    Japan is a normal region here, not the single-node whitelist that
+    decide_group used: the unified 10-round gate applies to every region, and
+    the source-3 bridge name gets no two-round exemption (unknown -> no move).
+    """
+    if SG_PATTERN.search(name):
+        return "SG"
+    if US_PATTERN.search(name):
+        return "US"
+    if name in JP_TIER_NODES or JP_PATTERN.search(name):
+        return "JP"
+    return None
 
 
 class Logger:
@@ -140,7 +188,29 @@ def read_env_file(path: str) -> dict[str, str]:
     return values
 
 
+def source3_bridge_region() -> str | None:
+    """Use fresh measured egress and the independent two-round admission gate."""
+    try:
+        state = json.loads(Path(r"C:\mihomo\source3-compatible\last-result.json").read_text(encoding="utf-8"))
+        age = time.time() * 1000 - state["sync_ms"]
+        if (not 0 <= age <= 20 * 60 * 1000 or not state.get("readback_verified")
+                or state.get("selected") not in state.get("candidates", [])
+                or state.get("selected_streak", 0) < 2):
+            return None
+        return {"美国": "US", "新加坡": "SG", "日本": "JP"}.get(state.get("selected_region"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def candidate_stable(name, stats):
+    if name == "源3独立GPT":
+        return source3_bridge_region() is not None
+    return consecutive_alive(stats, STABLE_ROUNDS)
+
+
 def region_of(name: str) -> str | None:
+    if name == "源3独立GPT":
+        return source3_bridge_region()
     if SG_PATTERN.search(name):
         return "SG"
     if US_PATTERN.search(name):
@@ -164,7 +234,7 @@ def api_json(method: str, url: str, body: dict | None = None, token: str | None 
 
 def request_delay(api: str, name: str, target: str, timeout_ms: int,
                   token: str | None = None) -> int | None:
-    query = urllib.parse.urlencode({"url": target, "timeout": str(timeout_ms)})
+    query = urllib.parse.urlencode({"url": target, "timeout": str(timeout_ms), "expected": "200"})
     endpoint = f"{api}/proxies/{urllib.parse.quote(name, safe='')}/delay?{query}"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     request = urllib.request.Request(endpoint, headers=headers)
@@ -172,7 +242,14 @@ def request_delay(api: str, name: str, target: str, timeout_ms: int,
         with urllib.request.urlopen(request, timeout=(timeout_ms / 1000) + 5) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
         value = int(payload.get("delay") or 0)
-        return value if value > 0 else None
+        # Mihomo can return a positive delay even when expected-status failed.
+        # Its fallback decision uses the per-URL state, not the global alive bit.
+        state_request = urllib.request.Request(
+            f"{api}/proxies/{urllib.parse.quote(name, safe='')}", headers=headers)
+        with urllib.request.urlopen(state_request, timeout=5) as response:
+            state = json.loads(response.read().decode("utf-8", "replace"))
+        health = (state.get("extra") or {}).get(target) or {}
+        return value if value > 0 and health.get("alive") is True else None
     except Exception:
         return None
 
@@ -218,37 +295,45 @@ def decide_mode(alive_us: list[str], alive_sg: list[str]) -> str:
     return "C"
 
 
+def allowed_tiers(group: str) -> set[int]:
+    """US->SG->JP for GPT/US-FAST, US only for MUSE; no other region is ever used."""
+    return {TIER_US} if group == "MUSE" else {TIER_US, TIER_SG, TIER_JP}
+
+
 def plan_switches(mode: str, groups: dict[str, dict], delays: dict[str, int | None],
                   alive_us: set[str], alive_sg: set[str],
                   alive_any: set[str]) -> dict[str, str | None]:
     """Return desired node per group. None means leave unchanged."""
     plan: dict[str, str | None] = {g: None for g in SWITCH_GROUPS}
 
+    def pool_for(group: str, alive: set[str]) -> list[str]:
+        entry = groups.get(group) or {}
+        if (entry.get("type") or "").lower() not in {"selector", "fallback"}:
+            return []
+        members = set(entry.get("all") or [])
+        allowed = allowed_tiers(group)
+        return [n for n in alive if n in members and tier_of(n) in allowed]
+
     def us_pick(group: str) -> str | None:
-        members = set(groups.get(group, {}).get("all") or [])
-        return pick_fastest([n for n in alive_us if n in members], delays)
+        return pick_fastest(pool_for(group, alive_us), delays)
 
     def sg_pick(group: str) -> str | None:
-        members = set(groups.get(group, {}).get("all") or [])
-        return pick_fastest([n for n in alive_sg if n in members], delays)
-
-    def any_pick(group: str) -> str | None:
-        members = set(groups.get(group, {}).get("all") or [])
-        return pick_fastest([n for n in alive_any if n in members], delays)
+        return pick_fastest(pool_for(group, alive_sg), delays)
 
     if mode == "A":
         for g in SWITCH_GROUPS:
             plan[g] = us_pick(g)
     elif mode == "B":
-        # MUSE unchanged on US outage so muse.ai (routed via MUSE) stays put.
+        # MUSE never leaves the US tier, so it stays put on a US outage.
         plan["GPT"] = sg_pick("GPT")
         plan["US-FAST"] = sg_pick("US-FAST")
         plan["MUSE"] = None
     else:
-        # Mode C: also switch GPT to any-region fastest so ChatGPT stays up.
-        plan["GPT"] = any_pick("GPT")
-        plan["US-FAST"] = any_pick("US-FAST")
-        plan["MUSE"] = None
+        # Mode C: US+SG are both down. GPT/US-FAST drop to the Japan tier
+        # (pool_for already excludes HK/TW and every other region); MUSE never
+        # leaves the US tier, so it stays put and the alert fires.
+        for g in SWITCH_GROUPS:
+            plan[g] = None if g == "MUSE" else pick_fastest(pool_for(g, alive_any), delays)
     return plan
 
 
@@ -257,9 +342,9 @@ class SwitchParams:
     """Thresholds for the hysteresis decision (design section 2)."""
 
     switch_margin_ms: int = 300
-    switch_margin_pct: int = 25
+    switch_margin_pct: int = 50
     switch_streak: int = 2
-    min_dwell_min: int = 90
+    min_dwell_min: int = 60
     retry_current: int = 2
 
 
@@ -339,6 +424,8 @@ def tier_of(name: Any) -> int:
         return TIER_US
     if region == "SG":
         return TIER_SG
+    if region == "JP" or (isinstance(name, str) and name in JP_TIER_NODES):
+        return TIER_JP
     return TIER_OTHER
 
 
@@ -386,12 +473,6 @@ def smoothed_of(name: Any, node_stats: dict, now: dt.datetime | None = None) -> 
     return value
 
 
-def alive_within(node: Any, rounds: int = 3, need: int = 2) -> bool:
-    """>= `need` of the last `rounds` recorded rounds alive (design 2.3 b)."""
-    recent = node_samples(node)[-rounds:]
-    return sum(1 for _ts, ms in recent if _is_ms(ms)) >= need
-
-
 def consecutive_alive(node: Any, rounds: int = 2) -> bool:
     recent = node_samples(node)[-rounds:]
     return len(recent) == rounds and all(_is_ms(ms) for _ts, ms in recent)
@@ -434,15 +515,20 @@ def next_candidate_state(group_state: dict, proposed: str | None) -> tuple[str |
 
 def decide_group(group: str, current: str | None, members: Any, node_stats: dict,
                  group_state: dict, now: dt.datetime, params: SwitchParams,
-                 details: dict | None = None) -> tuple[str | None, str]:
+                 details: dict | None = None,
+                 engine: str = "selector") -> tuple[str | None, str]:
     """Pure per-group decision (design 3.1). No network, no state mutation.
 
     `node_stats[name]` carries this round's `delay`/`alive_round` plus the shared
     sample history; `group_state` carries this group's current/since/cand streak.
-    `details` is filled with the round-record fields of design 4.3.
+    `details` is filled with the round-record fields of design 4.3. `engine` is
+    the controller-reported group type: on a fallback group a dead current node
+    is left to the kernel, on a selector the script still has to rescue it.
     """
     det = details if details is not None else {}
     members = set(m or "" for m in (members or []))
+    allowed = allowed_tiers(group)
+    members = {n for n in members if tier_of(n) in allowed}
     node_stats = as_dict(node_stats)
     gs = as_dict(group_state)
     cur_node = as_dict(node_stats.get(current)) if current else {}
@@ -488,6 +574,10 @@ def decide_group(group: str, current: str | None, members: Any, node_stats: dict
     cur_tier = tier_of(current) if cur_valid else 0
 
     if not cur_alive:
+        if engine == "fallback" and cur_valid:
+            # Dead-but-known node on a fallback group: the kernel health check
+            # owns the failover, the script does not grab-cut it.
+            return hold("hold_dead_delegate_fallback")
         # Design 3.3/3.4: a dead MUSE only accepts a US peer, while a missing or
         # null MUSE is a forced recovery and takes the best tier available.
         if cur_valid and group == "MUSE":
@@ -499,9 +589,15 @@ def decide_group(group: str, current: str | None, members: Any, node_stats: dict
                 det["muse_frozen_dead"] = True
                 return hold("hold_muse_frozen")
             return hold("hold_no_alive_member")
-        # A/B/C semantics survive the forced path: only the best tier available.
-        top = max(tier_of(n) for n in pool)
-        pool = {n for n in pool if tier_of(n) == top}
+        # A/B/C semantics survive the forced path: only the best tier available,
+        # and a US/SG node joins that tier only after STABLE_ROUNDS alive rounds.
+        staged = {n for n in pool
+                  if tier_of(n) <= TIER_JP
+                  or candidate_stable(n, node_stats.get(n))}
+        if not staged:
+            staged = pool
+        top = max(tier_of(n) for n in staged)
+        pool = {n for n in staged if tier_of(n) == top}
         target = pick_best(pool, node_stats, now)
         note(target)
         target_tier = tier_of(target)
@@ -516,10 +612,17 @@ def decide_group(group: str, current: str | None, members: Any, node_stats: dict
     if higher:
         top = max(tier_of(n) for n in higher)
         higher = {n for n in higher if tier_of(n) == top}
-        target = pick_best(higher, node_stats, now)
-        note(target)
-        if not consecutive_alive(node_stats.get(target), 2):
+        # Pinning away from the Japan node needs a US/SG member that has been
+        # alive STABLE_ROUNDS rounds running, so one fake-alive sample cannot
+        # drag GPT/US-FAST back onto a dead path.
+        stable = {n for n in higher
+                  if tier_of(n) <= TIER_JP
+                  or candidate_stable(n, node_stats.get(n))}
+        if not stable:
+            note(pick_best(higher, node_stats, now))
             return hold("hold_cand_unstable")
+        target = pick_best(stable, node_stats, now)
+        note(target)
         return go(target, "switch_upgrade")
 
     same = {n for n in alive if tier_of(n) == cur_tier}
@@ -540,7 +643,7 @@ def decide_group(group: str, current: str | None, members: Any, node_stats: dict
         return hold("hold_margin")
 
     det["cand"], det["cand_streak"] = next_candidate_state(gs, best)
-    if not alive_within(node_stats.get(best), 3, 2):
+    if not candidate_stable(best, node_stats.get(best)):
         return hold("hold_cand_unstable")
     if det["cand_streak"] < params.switch_streak:
         return hold("hold_streak")
@@ -829,7 +932,7 @@ def build_alert_text(mode: str, prev_mode: str | None, selected: dict[str, str |
     elif mode == "B":
         head = "【代理告警】美国全挂，已切新加坡"
     elif mode == "C":
-        head = "【代理告警】美国+新加坡全挂，已切任意最快"
+        head = "【代理告警】美国+新加坡全挂，GPT/US-FAST 降到日本档，MUSE 不动"
     else:
         head = f"【代理告警】状态 {mode}"
     parts = [
@@ -858,18 +961,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--secret-env", default=r"C:\mihomo-proxy-management\config\subscription.env",
                         help="Optional file with controller SECRET")
     parser.add_argument("--decision-mode", choices=("legacy", "shadow", "hysteresis"),
-                        default="legacy",
-                        help="legacy: old fastest-node behaviour (default); "
+                        default="hysteresis",
+                        help="legacy: old fastest-node behaviour; "
                              "shadow: execute legacy, record new decision only; "
-                             "hysteresis: execute the thresholded decision")
+                             "hysteresis: execute the thresholded decision (default)")
     parser.add_argument("--legacy-fastest", dest="decision_mode", action="store_const",
                         const="legacy", help="Alias for --decision-mode legacy (rollback)")
     parser.add_argument("--rounds-jsonl", default=DEFAULT_ROUNDS_JSONL,
                         help="Per-round per-group decision record (not written on --dry-run)")
     parser.add_argument("--switch-margin-ms", type=int, default=300)
-    parser.add_argument("--switch-margin-pct", type=int, default=25)
+    parser.add_argument("--switch-margin-pct", type=int, default=50)
     parser.add_argument("--switch-streak", type=int, default=2)
-    parser.add_argument("--min-dwell-min", type=int, default=90)
+    parser.add_argument("--min-dwell-min", type=int, default=60)
     parser.add_argument("--retry-current", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -894,6 +997,108 @@ def collect_candidates(proxies: dict[str, dict], groups: dict[str, dict]) -> lis
             # Unknown / missing meta: still try delay (API returns null if not a proxy)
             names.add(member)
     return sorted(names)
+
+
+class GptEntryController:
+    """Adapts this round's probe results to the GPT entry protocol.
+
+    The first ``probe`` serves the already measured round (no second sweep);
+    ``fresh=True`` is the entry's current-node retry and measures again.
+    """
+
+    def __init__(self, api: str, token: str | None, delays: dict[str, int | None],
+                 round_ts: str, target: str, timeout_ms: int, dry_run: bool,
+                 log: Logger) -> None:
+        self.api = api
+        self.token = token
+        self.delays = dict(delays)
+        self.round_ts = round_ts
+        self.target = target
+        self.timeout_ms = timeout_ms
+        self.dry_run = dry_run
+        self.log = log
+        self._pretend: str | None = None
+
+    def read_group(self, group: str):
+        payload = api_json("GET", f"{self.api}/proxies", token=self.token, timeout=8)
+        entry = (payload.get("proxies") or {}).get(group) or {}
+        return gpt_switch_entry.GroupView(
+            current=entry.get("now"),
+            engine=(entry.get("type") or "").lower(),
+            members=tuple(entry.get("all") or ()),
+        )
+
+    def probe(self, names, fresh: bool = False):
+        nodes = []
+        for name in names:
+            if fresh:
+                ms = request_delay(self.api, name, self.target, self.timeout_ms, self.token)
+                self.delays[name] = ms
+            else:
+                ms = self.delays.get(name)
+            nodes.append(NodeSnapshot(
+                name=name,
+                region=policy_region(name),
+                alive=ms is not None,
+                delay_ms=ms,
+                measured_at=self.round_ts,
+                readback_ok=True,
+                source="round",
+            ))
+        return gpt_switch_entry.ProbeRound(nodes=tuple(nodes), round_ok=True)
+
+    def put(self, group: str, name: str) -> None:
+        if self.dry_run:
+            self.log.info(f"dry-run would switch group={group} -> {name}")
+            self._pretend = name
+            return
+        api_json("PUT", f"{self.api}/proxies/{urllib.parse.quote(group, safe='')}",
+                 body={"name": name}, token=self.token, timeout=8)
+
+    def selected(self, group: str) -> str | None:
+        if self._pretend is not None:
+            return self._pretend
+        payload = api_json("GET", f"{self.api}/proxies", token=self.token, timeout=8)
+        return ((payload.get("proxies") or {}).get(group) or {}).get("now")
+
+
+class _MemoryStore:
+    """Dry-run store: keeps the round in memory so --dry-run writes nothing."""
+
+    def __init__(self) -> None:
+        self.payload: dict = {}
+
+    def load(self) -> dict:
+        return self.payload
+
+    def save(self, payload: dict) -> None:
+        self.payload = payload
+
+
+def _run_gpt_entry(args, api: str, token: str | None, delays: dict[str, int | None],
+                   round_ts: str, log: Logger):
+    """Run the only GPT execution path; never lets an exception abort the round."""
+    controller = GptEntryController(
+        api, token, delays, round_ts, args.target, args.timeout_ms, args.dry_run, log)
+    if args.dry_run:
+        store = _MemoryStore()
+    else:
+        store = gpt_switch_entry.JsonStore(
+            str(Path(args.state_file).with_name("gpt-stability-policy.json")))
+    try:
+        result = gpt_switch_entry.run_once(
+            "GPT", controller, store, dt.datetime.now,
+            named_mutex_lock.named_mutex_lock_factory, PolicyConfig())
+    except Exception as exc:
+        log.error(f"gpt-entry failed class={type(exc).__name__.lower()}")
+        return gpt_switch_entry.EntryResult(
+            "GPT", "unknown", "unknown", None, None, "entry_failed", False, None)
+    log.info(
+        f"gpt-entry result={result.result} action={result.action} "
+        f"reason={result.reason} current={result.current} target={result.target} "
+        f"put={result.put} readback={result.readback}"
+    )
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -937,6 +1142,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR\tmissing_group\t{g}")
             return 1
         groups[g] = entry
+        gtype = (entry.get("type") or "").lower()
+        if gtype not in {"selector", "fallback"}:
+            log.info(f"skip fallback group={g} type={entry.get('type')} "
+                     "(not Selector/Fallback)")
 
     candidates = collect_candidates(proxies, groups)
     log.info(f"candidates={len(candidates)}")
@@ -976,6 +1185,11 @@ def main(argv: list[str] | None = None) -> int:
             )
     delays_round = probe
 
+    # CY-GUS-DEV1: GPT is decided and executed only by the unified entry. It
+    # runs for every decision-mode, so the legacy/shadow fastest-node plan can
+    # never move GPT again. MUSE/US-FAST keep the code below unchanged.
+    gpt_entry = _run_gpt_entry(args, api, token, delays_round, round_ts, log)
+
     alive_us = [n for n, d in probe.items() if d and region_of(n) == "US"]
     alive_sg = [n for n, d in probe.items() if d and region_of(n) == "SG"]
     alive_any = [n for n, d in probe.items() if d]
@@ -1002,11 +1216,33 @@ def main(argv: list[str] | None = None) -> int:
         group_states = migrate_state(
             prev, {g: groups[g].get("now") for g in SWITCH_GROUPS}, now
         )["groups"]
-        for g in SWITCH_GROUPS:
+        decisions["GPT"] = {
+            "decision": gpt_entry.action,
+            "reason": gpt_entry.reason,
+            "current": gpt_entry.current,
+            "target": gpt_entry.target,
+            "cur_ms": None,
+            "cur_smooth": None,
+            "best": gpt_entry.target,
+            "best_ms": None,
+            "best_smooth": None,
+            "need_margin_ms": None,
+            "cand": None,
+            "cand_streak": 0,
+            "dwell_min": None,
+        }
+        for g in ("MUSE", "US-FAST"):
+            engine = (groups[g].get("type") or "").lower()
+            if engine not in {"selector", "fallback"}:
+                det = {"decision": "skip", "reason": "skip_unmanaged_type",
+                       "current": groups[g].get("now"), "target": None}
+                decisions[g] = det
+                log.info(f"skip fallback group={g} type={groups[g].get('type')}")
+                continue
             det: dict[str, Any] = {}
             target, reason = decide_group(
                 g, groups[g].get("now"), group_leaf_members(proxies, g),
-                node_stats, group_states[g], now, params, det,
+                node_stats, group_states[g], now, params, det, engine=engine,
             )
             det["target"] = target
             det["reason"] = reason
@@ -1023,9 +1259,12 @@ def main(argv: list[str] | None = None) -> int:
                 log.warn(f"muse_frozen_dead group=MUSE current={det.get('current')}")
 
     if is_legacy or args.decision_mode == "shadow":
-        executed = plan
+        executed = dict(plan)
     else:
         executed = {g: decisions[g]["target"] for g in SWITCH_GROUPS}
+    # GPT was already handled by the entry above: never PUT it again here, and
+    # never let the legacy/shadow fastest-node plan touch it.
+    executed["GPT"] = None
     shown_delays = delays_round
 
     applied: dict[str, str | None] = {}

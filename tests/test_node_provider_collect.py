@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.abspath(os.path.join(HERE, os.pardir, "scripts"))
@@ -38,7 +39,7 @@ URI_ONE = "trojan://pw@2.2.2.2:443#sg-01\n"
 def fetcher_map(mapping):
     def fetch(url, ua, timeout):
         if url not in mapping:
-            raise SubscriptionError("boom", "network")
+            raise SubscriptionError("boom", "http")
         return mapping[url]
     return fetch
 
@@ -149,7 +150,7 @@ class SubscriptionChannelTests(unittest.TestCase):
         def fetch(url, ua, timeout):
             if url == ENV["SUBSCRIPTION_URL_1"]:
                 return YAML_ONE
-            raise SubscriptionError("HTTP error 403 (URL redacted)", "network")
+            raise SubscriptionError("HTTP error 403 (URL redacted)", "http")
         result = collect.collect(ENV, fetcher=fetch)
         self.assertEqual(result.collected, 1)
         self.assertEqual(len(result.failed), 2)
@@ -158,6 +159,52 @@ class SubscriptionChannelTests(unittest.TestCase):
         result = collect.collect(ENV, fetcher=fetcher_map({}))
         self.assertEqual(result.collected, 0)
         self.assertEqual(len(result.failed), 3)
+
+    def test_transient_network_error_retried_then_succeeds(self):
+        calls = []
+
+        def fetch(url, ua, timeout):
+            calls.append(url)
+            if url == ENV["SUBSCRIPTION_URL_1"]:
+                if len([c for c in calls if c == url]) <= 2:
+                    raise SubscriptionError("network error (URL redacted)", "network")
+                return YAML_ONE
+            raise SubscriptionError("HTTP error 403 (URL redacted)", "http")
+
+        with patch.object(collect.time, "sleep") as sleep:
+            result = collect.collect(ENV, fetcher=fetch)
+        self.assertEqual(result.collected, 1)
+        self.assertEqual(len([c for c in calls if c == ENV["SUBSCRIPTION_URL_1"]]), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("subscription:飞兔", result.per_channel)
+
+    def test_persistent_network_error_fails_after_bounded_retries(self):
+        calls = []
+
+        def fetch(url, ua, timeout):
+            calls.append(url)
+            raise SubscriptionError("network error (URL redacted)", "network")
+
+        with patch.object(collect.time, "sleep"):
+            result = collect.collect(ENV, fetcher=fetch)
+        self.assertEqual(result.collected, 0)
+        self.assertEqual(len(calls), 3 * (collect.SUBSCRIPTION_RETRIES + 1))
+        self.assertEqual(len(result.failed), 3)
+
+    def test_http_error_is_not_retried(self):
+        calls = []
+
+        def fetch(url, ua, timeout):
+            calls.append(url)
+            if url == ENV["SUBSCRIPTION_URL_1"]:
+                return YAML_ONE
+            raise SubscriptionError("HTTP error 403 (URL redacted)", "http")
+
+        with patch.object(collect.time, "sleep") as sleep:
+            result = collect.collect(ENV, fetcher=fetch)
+        self.assertEqual(result.collected, 1)
+        self.assertEqual(len(calls), 3)
+        sleep.assert_not_called()
 
 
 class AppChannelTests(unittest.TestCase):

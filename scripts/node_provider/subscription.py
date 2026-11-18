@@ -816,7 +816,7 @@ def fetch_subscription(url: str, user_agent: str, timeout: int = 30,
         raise SubscriptionError(
             f"HTTP error {exc.code if isinstance(exc.code, int) else 'unknown'} "
             "(URL redacted)",
-            "network",
+            "http",
         ) from None
     except urllib.error.URLError as exc:
         raise SubscriptionError(

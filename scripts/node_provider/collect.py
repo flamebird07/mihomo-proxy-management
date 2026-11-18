@@ -100,6 +100,9 @@ def _merge(items: Iterable[CollectedNode]) -> tuple[List[CollectedNode], int]:
     return merged, duplicates
 
 
+SUBSCRIPTION_RETRIES = 2
+
+
 def _collect_subscription(env_values: Dict[str, str], timeout: int,
                           fetcher: Callable[[str, str, int], str],
                           warn: Callable[[str], None],
@@ -114,7 +117,16 @@ def _collect_subscription(env_values: Dict[str, str], timeout: int,
             continue
         result.attempted += 1
         try:
-            content = fetcher(info["url"], info["ua"], timeout)
+            content = None
+            for attempt in range(SUBSCRIPTION_RETRIES + 1):
+                try:
+                    content = fetcher(info["url"], info["ua"], timeout)
+                    break
+                except SubscriptionError as exc:
+                    if exc.kind != "network" or attempt >= SUBSCRIPTION_RETRIES:
+                        raise
+                    warn(f"source={source} retry={attempt + 1} class=network")
+                    time.sleep(1 + attempt)
             if not content or not content.strip():
                 raise SubscriptionError("empty body", "empty")
             parsed = dedupe_nodes(convert_content(content, warn=warn))

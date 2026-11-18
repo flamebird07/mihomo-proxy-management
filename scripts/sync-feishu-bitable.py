@@ -486,13 +486,30 @@ class SyncError(Exception):
 # with no stale-unlink race. The lock FILE is metadata only (pid/ts/token) and
 # is written after the mutex is held, so stale metadata is simply overwritten.
 #
+# Scope: hold this mutex only around Feishu list/create/delete (and matching
+# schema ensure/update). Main-sync speed tests, page probes, and independent
+# source1/source3 measurements must run unlocked so the PT10M Ninja task is
+# not blocked for the ~10 minute main speed test.
+#
 # POSIX: the lock file itself is the mutex (O_CREAT|O_EXCL) plus stale-pid
 # takeover, as before.
 
 SYNC_MUTEX_NAME = r"Local\mihomo-feishu-bitable-sync"
 
+
+def writer_mutex_name() -> str:
+    """Main sync, ninja-only, and standalone source1 share one named mutex."""
+    return SYNC_MUTEX_NAME
+
+
+# Bounded wait for the write-section mutex only. Speed tests and independent
+# probes run outside the lock, so contention is another writer's
+# list/create/delete. 90s stays well under the Ninja task limit PT8M.
+WRITER_LOCK_WAIT_MS = 90_000
+
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 ERROR_ACCESS_DENIED = 5
+ERROR_INVALID_PARAMETER = 87
 ERROR_ALREADY_EXISTS = 183
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED = 0x00000080
@@ -513,6 +530,24 @@ def _kernel32() -> Any:
         k32.OpenProcess.restype = wintypes.HANDLE
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         k32.CloseHandle.restype = wintypes.BOOL
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        k32.FILETIME = FILETIME
+        k32.GetCurrentProcess.argtypes = []
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+        ]
+        k32.GetProcessTimes.restype = wintypes.BOOL
         k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         k32.CreateMutexW.restype = wintypes.HANDLE
         k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
@@ -612,14 +647,19 @@ class SyncLock:
             self.log.warn(f"lock metadata write failed path={self.path}")
 
     # -- acquire ---------------------------------------------------------
-    def acquire(self) -> "SyncLock":
+    def acquire(self, timeout_ms: int = 0) -> "SyncLock":
+        """Acquire the mutex. timeout_ms=0 is the historical zero-wait poll."""
+        self.timeout_ms = max(0, int(timeout_ms))
         self._ensure_dir()
         if sys.platform == "win32":
             self._acquire_mutex()
         else:
             self._acquire_file()
         self.held = True
-        self.log.info(f"lock acquired path={self.path} pid={self.pid}")
+        self.log.info(
+            f"lock acquired path={self.path} pid={self.pid} "
+            f"timeout_ms={self.timeout_ms}"
+        )
         return self
 
     def _acquire_mutex(self) -> None:
@@ -634,8 +674,10 @@ class SyncLock:
 
         if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
             # Another instance owns (or owned) the mutex. bInitialOwner is
-            # ignored for an existing object, so poll for ownership.
-            rc = k32.WaitForSingleObject(handle, 0)
+            # ignored for an existing object, so wait up to timeout_ms
+            # (0 = historical immediate lock_busy).
+            timeout_ms = int(getattr(self, "timeout_ms", 0) or 0)
+            rc = k32.WaitForSingleObject(handle, timeout_ms)
             if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
                 k32.CloseHandle(handle)
                 reason = "mutex_timeout" if rc == WAIT_TIMEOUT else f"mutex_wait_failed rc={rc}"
@@ -643,6 +685,10 @@ class SyncLock:
                 raise SyncError("lock_busy", reason)
             if rc == WAIT_ABANDONED:
                 self.log.warn(f"lock takeover path={self.path} reason=abandoned_mutex")
+            elif timeout_ms:
+                self.log.info(
+                    f"lock waited path={self.path} timeout_ms={timeout_ms}"
+                )
 
         self.mutex = int(handle)
         old_pid, old_ts, _old_token = _read_lock_meta(self.path)
@@ -751,51 +797,172 @@ def release_sync_lock(lock: SyncLock | None, log: "Logger") -> None:
     lock.release()
 
 
+@contextlib.contextmanager
+def hold_writer_lock(log: "Logger", path: str = DEFAULT_LOCK_FILE, *,
+                     mutex_name: str = SYNC_MUTEX_NAME,
+                     timeout_ms: int = WRITER_LOCK_WAIT_MS):
+    """Hold the shared writer mutex only around Feishu list/create/delete.
+
+    Speed tests and independent-source probes must run outside this context.
+    The default wait is WRITER_LOCK_WAIT_MS (90s), well under the Ninja
+    scheduled-task limit PT8M.
+    """
+    try:
+        lock = SyncLock(path, log, mutex_name=mutex_name)
+    except TypeError:
+        # Test stubs may only accept (path, log).
+        lock = SyncLock(path, log)
+    try:
+        lock.acquire(timeout_ms=timeout_ms)
+    except TypeError:
+        lock.acquire()
+    try:
+        yield lock
+    finally:
+        release_sync_lock(lock, log)
+
+
 # ---------------------------------------------------------------------------
 # Corpse cleanup (temp isolated instances only — production 6440/7890/9090
 # and every live mihomo process must NEVER be touched by this path)
 # ---------------------------------------------------------------------------
 
 CORPSE_DIR_PREFIX = "mihomo-feishu-"
+CORPSE_OWNER_FILENAME = "owner.json"
+# FILETIME (100-ns ticks since 1601-01-01 UTC) minus Unix epoch.
+_FILETIME_UNIX_EPOCH = 11_644_473_600
 
 
-def _kill_corpse_processes(log: "Logger") -> int:
-    """Terminate stray processes whose command line references a mihomo-feishu- temp dir."""
-    killed = 0
+def _filetime_to_unix(filetime: Any) -> float:
+    ticks = (int(filetime.dwHighDateTime) << 32) | int(filetime.dwLowDateTime)
+    return ticks / 10_000_000 - _FILETIME_UNIX_EPOCH
+
+
+def _unix_from_process_handle(k32: Any, handle: Any) -> float | None:
+    import ctypes
+
+    creation = k32.FILETIME()
+    exit_time = k32.FILETIME()
+    kernel_time = k32.FILETIME()
+    user_time = k32.FILETIME()
+    if not k32.GetProcessTimes(
+        handle,
+        ctypes.byref(creation),
+        ctypes.byref(exit_time),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        return None
+    return _filetime_to_unix(creation)
+
+
+def current_process_create_time() -> float | None:
+    """Unix timestamp of this process's creation, or None if unreadable."""
+    if sys.platform != "win32":
+        return None
+    k32 = _kernel32()
+    return _unix_from_process_handle(k32, k32.GetCurrentProcess())
+
+
+def query_owner_process(pid: int) -> tuple[str, float | None]:
+    """Identify a pid for owner.json checks.
+
+    Returns ``(status, create_time_or_none)``:
+      opened        — handle opened and create time read
+      missing       — pid does not exist (proven)
+      undetermined  — cannot prove either way (fail-closed)
+    """
+    if pid <= 0:
+        return "undetermined", None
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "missing", None
+        except OSError:
+            return "undetermined", None
+        return "undetermined", None
+    import ctypes
+
+    k32 = _kernel32()
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        err = ctypes.get_last_error()
+        if err == ERROR_INVALID_PARAMETER:
+            return "missing", None
+        return "undetermined", None
     try:
-        if os.name == "nt":
-            ps = (
-                "Get-CimInstance Win32_Process | "
-                "Where-Object { $_.ProcessId -ne $PID -and $_.Name -match 'mihomo' -and "
-                "$_.CommandLine -match 'mihomo-feishu-' } | "
-                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }"
-            )
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                capture_output=True, text=True, timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            for line in (out.stdout or "").splitlines():
-                if line.strip().isdigit():
-                    killed += 1
-        else:
-            out = subprocess.run(
-                ["sh", "-c", "ps -eo pid=,args= | grep 'mihomo-feishu-' | grep -v grep"],
-                capture_output=True, text=True, timeout=20,
-            )
-            for line in (out.stdout or "").splitlines():
-                parts = line.strip().split(None, 1)
-                if not parts or not parts[0].isdigit():
-                    continue
-                pid = int(parts[0])
-                try:
-                    os.kill(pid, 15)
-                    killed += 1
-                except OSError:
-                    pass
-    except Exception as exc:
-        log.warn(f"cleanup corpses procs_failed class={type(exc).__name__}")
-    return killed
+        created = _unix_from_process_handle(k32, handle)
+        if created is None:
+            return "undetermined", None
+        return "opened", created
+    finally:
+        k32.CloseHandle(handle)
+
+
+def write_temp_dir_owner(directory: Path, log: "Logger | None" = None) -> None:
+    """Persist creator pid + process create time as owner.json."""
+    payload = {
+        "pid": os.getpid(),
+        "create_time": current_process_create_time(),
+    }
+    path = Path(directory) / CORPSE_OWNER_FILENAME
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        if log is not None:
+            log.warn(f"temp owner.json write failed class=oserror name={Path(directory).name}")
+
+
+def _create_times_match(left: float, right: float) -> bool:
+    return abs(float(left) - float(right)) < 0.01
+
+
+def classify_temp_dir_owner(directory: Path) -> str:
+    """Classify a mihomo-feishu-* temp dir's owner.json.
+
+    dead            — owner.json readable and owner proven not alive
+                      (pid gone, or same pid with a different create time)
+    alive           — same pid still running with matching create time
+    missing_owner   — no owner.json
+    unreadable      — present but not parseable / fields invalid
+    undetermined    — pid/create time could not be queried (fail-closed)
+    """
+    path = Path(directory) / CORPSE_OWNER_FILENAME
+    try:
+        present = path.is_file()
+    except OSError:
+        return "undetermined"
+    if not present:
+        return "missing_owner"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return "unreadable"
+    if not isinstance(data, dict):
+        return "unreadable"
+    raw_pid = data.get("pid")
+    raw_create = data.get("create_time")
+    if raw_pid is None or raw_create is None:
+        return "unreadable"
+    if isinstance(raw_pid, bool) or isinstance(raw_create, bool):
+        return "unreadable"
+    try:
+        pid = int(raw_pid)
+        create_time = float(raw_create)
+    except (TypeError, ValueError):
+        return "unreadable"
+    if pid <= 0:
+        return "unreadable"
+    status, live_create = query_owner_process(pid)
+    if status == "missing":
+        return "dead"
+    if status != "opened" or live_create is None:
+        return "undetermined"
+    if _create_times_match(live_create, create_time):
+        return "alive"
+    return "dead"
+
 
 
 def find_stale_corpse_dirs(
@@ -831,21 +998,44 @@ def cleanup_temp_corpses(
     temp_roots: list[str] | None = None,
     max_age_s: float = 1800.0,
 ) -> tuple[int, int]:
-    """Best-effort: kill stray temp-instance processes, then drop stale temp dirs.
+    """Remove stale mihomo-feishu-* temp directories; never kill processes.
 
-    Only targets anything named `mihomo-feishu-*`; production ports 6440/7890/9090
-    and production processes are out of scope by construction.
+    Option B (B5): delete the command-line process-kill sweep.
+    After B2 narrowed the writer lock to Feishu writes, two overlapping
+    main-sync speedtests can each own a live isolated kernel whose
+    command line contains ``mihomo-feishu-``. The old
+    ``_kill_corpse_processes`` matched only that substring and could
+    terminate a sibling sync's fresh kernel.
+
+    Isolated-core lifetime is owned exclusively by the ``test_isolated``
+    Popen object (``finally: terminate()/kill()``). This helper never
+    inspects or signals processes. The first returned count (historical
+    ``procs_killed``) is always 0.
+
+    B6: directory mtime is not a heartbeat. A directory is deleted only
+    when it is older than *max_age_s* AND owner.json proves the creator
+    is gone (pid missing, or same pid with a different process-create
+    time). Missing, unreadable, or undecidable owner.json is fail-closed:
+    the directory is skipped and a reason is logged.
+
+    Only directory names starting with ``mihomo-feishu-`` are considered;
+    production ports 6440/7890/9090 and production processes stay out
+    of scope by construction.
     """
-    killed = _kill_corpse_processes(log)
     roots = temp_roots or [tempfile.gettempdir()]
     dirs_removed = 0
     for path in find_stale_corpse_dirs(roots, max_age_s=max_age_s):
+        verdict = classify_temp_dir_owner(path)
+        if verdict != "dead":
+            log.info(f"cleanup skip name={path.name} reason={verdict}")
+            continue
         try:
             shutil.rmtree(path, ignore_errors=False)
             dirs_removed += 1
+            log.info(f"cleanup remove name={path.name} reason=owner_dead")
         except OSError:
-            pass
-    return killed, dirs_removed
+            log.warn(f"cleanup remove failed name={path.name} class=oserror")
+    return 0, dirs_removed
 
 
 
@@ -2537,6 +2727,7 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         raise SyncError("core_missing")
     mixed, controller = pick_ports(mixed_port, controller_port)
     runtime = Path(tempfile.mkdtemp(prefix="mihomo-feishu-"))
+    write_temp_dir_owner(runtime, log)
     api = f"http://127.0.0.1:{controller}"
     # mode=rule required: global ignores MATCH,TEST; mixed would follow GLOBAL.
     config = {
@@ -2928,29 +3119,314 @@ def build_region_records(pool: list[tuple[dict, str]], delays: dict[str, int | N
 # Table write (one batch per run)
 # ---------------------------------------------------------------------------
 
-def replace_records(client: FeishuClient, table_id: str, records: list[dict],
-                    log: Logger, *, preserve_ninja: bool = False) -> int:
-    """Create new rows first, then delete old ones — never leave the table empty.
+INDEPENDENT_PATH_LABELS = frozenset({
+    "Ninja Desktop",
+    "源3独立兼容内核",
+    "源1独立Mihomo",
+})
+MAIN_PATH_LABELS = frozenset({"", "订阅 Mihomo"})
+DEFAULT_INDEPENDENT_STALE_MINUTES = 60
+INDEPENDENT_STALE_MINUTES_ENV = "FEISHU_INDEPENDENT_STALE_MINUTES"
+# Feishu FT_DATE_TIME numeric values are epoch milliseconds (13+ digits).
+_MS_NUMERIC_MIN = 10 ** 12
 
-    An empty *records* payload with existing rows is refused so a bad run cannot
-    wipe production tables.
+
+def independent_stale_minutes(raw: str | None = None) -> int:
+    text = (str(DEFAULT_INDEPENDENT_STALE_MINUTES)
+            if raw is None else str(raw).strip())
+    if raw is None:
+        text = os.environ.get(
+            INDEPENDENT_STALE_MINUTES_ENV,
+            str(DEFAULT_INDEPENDENT_STALE_MINUTES),
+        ).strip()
+    try:
+        value = int(text)
+        if value <= 0:
+            raise ValueError("stale minutes must be positive")
+        return value
+    except (TypeError, ValueError):
+        return DEFAULT_INDEPENDENT_STALE_MINUTES
+
+
+def path_label(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def path_display(label: str) -> str:
+    return label if label else "(empty)"
+
+
+def is_independent_path(label: str) -> bool:
+    return label in INDEPENDENT_PATH_LABELS
+
+
+def is_main_path(label: str) -> bool:
+    return label in MAIN_PATH_LABELS
+
+
+def _shanghai_tz() -> dt.tzinfo:
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Asia/Shanghai")
+    except Exception:
+        return dt.timezone(dt.timedelta(hours=8))
+
+
+def _parse_sync_datetime_text(text: str) -> int | None:
+    """Parse a datetime string to epoch-ms.
+
+    Text with an explicit offset (Z or +/-HH:MM) is used as-is. Naive text in a
+    documented legacy format is interpreted as Asia/Shanghai. No extra +8h is
+    applied after conversion — datetime.timestamp() already yields UTC epoch.
+    """
+    candidate = text.strip()
+    has_explicit_offset = False
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+        has_explicit_offset = True
+    elif re.search(r"[+-]\d{2}:\d{2}$", candidate):
+        has_explicit_offset = True
+    elif re.search(r"[+-]\d{4}$", candidate):
+        candidate = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", candidate)
+        has_explicit_offset = True
+    aware_formats = (
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y/%m/%d %H:%M:%S%z",
+        "%Y/%m/%d %H:%M%z",
+    )
+    naive_formats = (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+    )
+    if has_explicit_offset:
+        for fmt in aware_formats:
+            try:
+                moment = dt.datetime.strptime(candidate, fmt)
+                return int(moment.timestamp() * 1000)
+            except ValueError:
+                continue
+        return None
+    for fmt in naive_formats:
+        try:
+            moment = dt.datetime.strptime(candidate, fmt)
+            moment = moment.replace(tzinfo=_shanghai_tz())
+            return int(moment.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_sync_ms(value: Any, *, now_ms: int) -> tuple[int | None, str | None]:
+    """Return (epoch_ms, keep_reason).
+
+    keep_reason is set when the value must not be used to delete a row:
+    empty / unreadable / future / ambiguous. Numeric Feishu FT_DATE_TIME values
+    are compared directly with time.time()*1000 (no UTC+8 shift).
+    """
+    if value is None:
+        return None, "empty"
+    if isinstance(value, bool):
+        return None, "ambiguous"
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None, "unreadable"
+        if number != number or number in (float("inf"), float("-inf")):
+            return None, "unreadable"
+        return _classify_numeric_sync_ms(number, now_ms)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, "empty"
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            try:
+                number = float(text)
+            except ValueError:
+                return None, "unreadable"
+            return _classify_numeric_sync_ms(number, now_ms)
+        parsed = _parse_sync_datetime_text(text)
+        if parsed is None:
+            return None, "unreadable"
+        if parsed > now_ms:
+            return None, "future"
+        return parsed, None
+    return None, "unreadable"
+
+
+def _classify_numeric_sync_ms(number: float, now_ms: int) -> tuple[int | None, str | None]:
+    if number <= 0:
+        return None, "unreadable"
+    # 13+ digit millisecond timestamps. 10-digit second-like values are ambiguous.
+    if number < _MS_NUMERIC_MIN:
+        return None, "ambiguous"
+    ms = int(number)
+    if ms > now_ms:
+        return None, "future"
+    return ms, None
+
+
+def summarize_delete_plan(plan: list[dict]) -> list[dict]:
+    """Aggregate counts by 测速路径 + reason; never include node names or ids."""
+    counts: dict[tuple[str, str], int] = {}
+    for item in plan:
+        key = (path_display(item.get("path") or ""), item.get("reason") or "")
+        counts[key] = counts.get(key, 0) + 1
+    return [{"path": path, "reason": reason, "count": count}
+            for (path, reason), count in sorted(counts.items())]
+
+
+def log_delete_plan(log: Logger, plan: list[dict], *, phase: str) -> None:
+    summary = summarize_delete_plan(plan)
+    if not summary:
+        log.info(f"records delete {phase} count=0")
+        return
+    for item in summary:
+        log.info(
+            f"records delete {phase} path={item['path']} "
+            f"reason={item['reason']} count={item['count']}"
+        )
+
+
+def plan_table_deletions(existing: list[dict], records: list[dict], *,
+                         preserve_ninja: bool,
+                         table_key: str | None,
+                         now_ms: int,
+                         stale_minutes: int,
+                         log: Logger | None = None) -> list[dict]:
+    """Plan deletions by 测速路径 ownership. Items have record_id/path/reason only."""
+    plan: list[dict] = []
+    threshold_ms = int(stale_minutes) * 60 * 1000
+    for row in existing:
+        rid = row.get("record_id")
+        if not rid:
+            continue
+        fields = row.get("fields") or {}
+        label = path_label(fields.get("测速路径"))
+        item = {"record_id": rid, "path": label, "reason": ""}
+        if is_independent_path(label):
+            if not preserve_ninja:
+                item["reason"] = "replaced_by_new_payload"
+                if records:
+                    plan.append(item)
+                continue
+            parsed, warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
+            if warning:
+                if log is not None:
+                    log.warn(
+                        f"records stale skipped path={path_display(label)} "
+                        f"reason=sync_time_{warning}"
+                    )
+                continue
+            if parsed is None:
+                if log is not None:
+                    log.warn(
+                        f"records stale skipped path={path_display(label)} "
+                        f"reason=sync_time_unreadable"
+                    )
+                continue
+            if (now_ms - parsed) > threshold_ms:
+                item["reason"] = "stale_independent"
+                plan.append(item)
+            continue
+        if preserve_ninja and not is_main_path(label):
+            if log is not None:
+                log.warn(
+                    f"records keep unrecognized path={path_display(label)} "
+                    f"reason=unrecognized_path"
+                )
+            continue
+        if not records:
+            if preserve_ninja and table_key == "gpt_regions" and is_main_path(label):
+                item["reason"] = "empty_regions_clear_main"
+                plan.append(item)
+            continue
+        item["reason"] = "replaced_by_new_payload"
+        plan.append(item)
+    return plan
+
+
+def replace_records(client: FeishuClient, table_id: str, records: list[dict],
+                    log: Logger, *, preserve_ninja: bool = False,
+                    table_key: str | None = None,
+                    stale_minutes: int | None = None,
+                    now_ms: int | None = None,
+                    dry_run: bool = False) -> int:
+    """Create new rows first, then delete only the planned old ids.
+
+    An empty *records* payload:
+      * table2 / other: keep main-path rows (keep_old); independently delete
+        only stale independent-path rows when preserve_ninja is set.
+      * table3 (gpt_regions) after a tested regions=0 run: delete main-path
+        old rows only — never write a node-like placeholder.
+    Independent-path freshness uses 同步时间 vs time.time()*1000 (no +8).
+    Failed or zero-row creation performs no deletion.
     """
     existing = client.list_records(table_id)
-    if preserve_ninja:
-        existing = [row for row in existing
-                    if row.get("fields", {}).get("测速路径") not in ("Ninja Desktop", "源3独立兼容内核", "源1独立Mihomo")]
-    ids = [r.get("record_id") for r in existing if r.get("record_id")]
+    if stale_minutes is None:
+        stale_minutes = independent_stale_minutes()
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    plan = plan_table_deletions(
+        existing, records,
+        preserve_ninja=preserve_ninja,
+        table_key=table_key,
+        now_ms=now_ms,
+        stale_minutes=stale_minutes,
+        log=log,
+    )
+    log_delete_plan(log, plan, phase="dry-run")
+    ids = [item["record_id"] for item in plan]
+
     if not records:
+        main_kept = [
+            row for row in existing
+            if row.get("record_id")
+            and is_main_path(path_label((row.get("fields") or {}).get("测速路径")))
+        ]
+        if preserve_ninja:
+            if table_key != "gpt_regions" and main_kept:
+                log.warn(
+                    f"records replace refused empty_payload keep_old={len(main_kept)}"
+                )
+        else:
+            leftover = [row.get("record_id") for row in existing if row.get("record_id")]
+            if leftover and not ids:
+                log.warn(f"records replace refused empty_payload keep_old={len(leftover)}")
+                return 0
+        if dry_run:
+            log.info("records created=0 dry-run=yes")
+            return 0
         if ids:
-            log.warn(f"records replace refused empty_payload keep_old={len(ids)}")
+            deleted = client.batch_delete(table_id, ids)
+            log.info(f"records deleted={deleted} phase=empty_payload_plan")
+            log_delete_plan(log, plan, phase="applied")
             return 0
         log.info("records created=0")
         return 0
+
+    if dry_run:
+        log.info(f"records dry-run created={len(records)} delete_plan={len(ids)}")
+        return 0
+
     created = client.batch_create(table_id, records)
     log.info(f"records created={created}")
-    if ids:
+    if ids and created > 0:
         deleted = client.batch_delete(table_id, ids)
         log.info(f"records deleted={deleted}")
+        log_delete_plan(log, plan, phase="applied")
+    elif ids:
+        log.warn("records delete skipped reason=create_returned_zero")
     return created
 
 
@@ -3088,49 +3564,50 @@ def sync_ninja_nodes(client: FeishuClient, table_id: str, log: Logger) -> None:
     after_selected = {name: node.get("now") for name, node in after.items() if "节点选择" in name}
     log.info(f"Ninja selection unchanged={selected == after_selected} tested={len(names)}")
     spec = next(spec for spec in TABLE_SPECS if spec["key"] == "nodes")
-    ensure_fields(client, table_id, spec["fields"], log)
-    existing = client.list_records(table_id)
-    updates = [{"record_id": row["record_id"], "fields": {"测速路径": "订阅 Mihomo"}}
-               for row in existing if not row.get("fields", {}).get("测速路径")]
-    prefix = f"/bitable/v1/apps/{client.app_token}/tables/{table_id}/records"
-    for start in range(0, len(updates), 100):
-        client.call("POST", prefix + "/batch_update", body={"records": updates[start:start + 100]})
-    stamp = int(time.time() * 1000)
-    geo_times = {name: stamp for name, region in regions.items() if region != "未知"}
-    for row in existing:
-        fields = row.get("fields", {})
-        name = fields.get("节点名")
-        previous_region = fields.get("实际地区")
-        previous_time = fields.get("地区检测时间")
-        if (fields.get("测速路径") == "Ninja Desktop" and name in names
-                and name not in geo_times and previous_region and previous_region != "未知"
-                and isinstance(previous_time, (int, float)) and 0 < previous_time <= stamp):
-            regions[name] = previous_region
-            geo_times[name] = previous_time
-    records = build_node_records(
-        [({"name": name, "type": before[name]["type"]}, "CoffeeCloud") for name in names],
-        delays, DEFAULT_TARGET, stamp, regions,
-    )
-    for record in records:
-        record["fields"]["测速路径"] = "Ninja Desktop"
-        name = record["fields"]["节点名"]
-        if name in geo_times:
-            record["fields"]["地区检测时间"] = geo_times[name]
-    client.batch_create(table_id, records)
-    old_ids = [row["record_id"] for row in existing
-               if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
-    if old_ids:
-        client.batch_delete(table_id, old_ids)
-    saved = [row["fields"] for row in client.list_records(table_id)
-             if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
-    if ({row.get("节点名") for row in saved} != set(names)
-            or len(saved) != len(names)
-            or any(row.get("同步时间") != stamp or row.get("测速目标") != DEFAULT_TARGET
-                   or row.get("实际地区") != regions.get(row["节点名"], "未知")
-                   or row.get("地区检测时间") != geo_times.get(row["节点名"])
-                   or bool(row.get("存活")) != bool(delays[row["节点名"]]) for row in saved)):
-        raise SyncError("ninja_readback_mismatch")
-    log.info(f"Ninja Feishu readback nodes={len(saved)} alive={sum(bool(row.get('存活')) for row in saved)}")
+    with hold_writer_lock(log):
+        ensure_fields(client, table_id, spec["fields"], log)
+        existing = client.list_records(table_id)
+        updates = [{"record_id": row["record_id"], "fields": {"测速路径": "订阅 Mihomo"}}
+                   for row in existing if not row.get("fields", {}).get("测速路径")]
+        prefix = f"/bitable/v1/apps/{client.app_token}/tables/{table_id}/records"
+        for start in range(0, len(updates), 100):
+            client.call("POST", prefix + "/batch_update", body={"records": updates[start:start + 100]})
+        stamp = int(time.time() * 1000)
+        geo_times = {name: stamp for name, region in regions.items() if region != "未知"}
+        for row in existing:
+            fields = row.get("fields", {})
+            name = fields.get("节点名")
+            previous_region = fields.get("实际地区")
+            previous_time = fields.get("地区检测时间")
+            if (fields.get("测速路径") == "Ninja Desktop" and name in names
+                    and name not in geo_times and previous_region and previous_region != "未知"
+                    and isinstance(previous_time, (int, float)) and 0 < previous_time <= stamp):
+                regions[name] = previous_region
+                geo_times[name] = previous_time
+        records = build_node_records(
+            [({"name": name, "type": before[name]["type"]}, "CoffeeCloud") for name in names],
+            delays, DEFAULT_TARGET, stamp, regions,
+        )
+        for record in records:
+            record["fields"]["测速路径"] = "Ninja Desktop"
+            name = record["fields"]["节点名"]
+            if name in geo_times:
+                record["fields"]["地区检测时间"] = geo_times[name]
+        client.batch_create(table_id, records)
+        old_ids = [row["record_id"] for row in existing
+                   if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
+        if old_ids:
+            client.batch_delete(table_id, old_ids)
+        saved = [row["fields"] for row in client.list_records(table_id)
+                 if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
+        if ({row.get("节点名") for row in saved} != set(names)
+                or len(saved) != len(names)
+                or any(row.get("同步时间") != stamp or row.get("测速目标") != DEFAULT_TARGET
+                       or row.get("实际地区") != regions.get(row["节点名"], "未知")
+                       or row.get("地区检测时间") != geo_times.get(row["节点名"])
+                       or bool(row.get("存活")) != bool(delays[row["节点名"]]) for row in saved)):
+            raise SyncError("ninja_readback_mismatch")
+        log.info(f"Ninja Feishu readback nodes={len(saved)} alive={sum(bool(row.get('存活')) for row in saved)}")
 
 
 # Tables this script may replace, in write order.
@@ -3256,23 +3733,15 @@ def main(argv: list[str] | None = None) -> int:
     region_rows = 0
     error = ""
     sync_ms = int(time.time() * 1000)
-    if args.ninja_only:
-        lock = SyncLock(args.lock_file, log, mutex_name=SYNC_MUTEX_NAME + ".Ninja")
-    else:
-        lock = SyncLock(args.lock_file, log)
-
+    # Writer mutex is taken only around Feishu writes (hold_writer_lock).
+    # Do not acquire it here: that used to cover the 10+ minute speed test
+    # and made every :08 Ninja round lock_busy. writer_mutex_name() remains
+    # the shared name for main, ninja-only, and standalone source1.
     try:
-        try:
-            lock.acquire()
-        except SyncError as exc:
-            error = exc.kind
-            log.error(f"sync failed class={exc.kind} detail={exc.detail}")
-            print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
-            return recorder.finish(1, "lock_busy" if exc.kind == "lock_busy" else "error",
-                                   exc.detail or exc.kind)
-
         if not args.ninja_only:
             try:
+                # Directory-only: never kill processes by command line.
+                # Isolated kernels are reaped by test_isolated's Popen finally.
                 procs_killed, dirs_removed = cleanup_temp_corpses(log)
                 log.info(f"cleanup corpses procs={procs_killed} dirs={dirs_removed}")
             except Exception as exc:  # never fatal: cleanup is best-effort
@@ -3313,7 +3782,8 @@ def main(argv: list[str] | None = None) -> int:
             if not tables:
                 log.warn("dry run without state file; table ids unknown")
         else:
-            tables = ensure_tables(client, args.state_file, args.keep_placeholder, log)
+            with hold_writer_lock(log, args.lock_file):
+                tables = ensure_tables(client, args.state_file, args.keep_placeholder, log)
         if args.ensure_tables:
             print_summary(tables, str(Path(__file__).resolve()), [], 0, 0, "")
             log.info("ensure-tables done")
@@ -3420,7 +3890,8 @@ def main(argv: list[str] | None = None) -> int:
             early_source_records = build_source_records(results, sync_ms)
             for record in early_source_records:
                 record["fields"].pop("存活数", None)
-            count = replace_records(client, source_table_id, early_source_records, log)
+            with hold_writer_lock(log, args.lock_file):
+                count = replace_records(client, source_table_id, early_source_records, log)
             log.info(f"table sources rows={count} phase=subscription_fetched")
 
         # --- pool + speed test ------------------------------------------
@@ -3449,7 +3920,8 @@ def main(argv: list[str] | None = None) -> int:
             backfill_source_delays(measured_delays)
             records = build_source_records(results, sync_ms)
             try:
-                count = replace_records(client, source_table_id, records, log)
+                with hold_writer_lock(log, args.lock_file):
+                    count = replace_records(client, source_table_id, records, log)
             except SyncError as exc:
                 log.warn(f"table sources early measured write failed class={exc.kind}")
                 return
@@ -3666,19 +4138,22 @@ def main(argv: list[str] | None = None) -> int:
                 "table write skip keys=sources "
                 "reason=speedtest_write_mode (表1 owned by the sync entrypoint)"
             )
-        for key, records in write_keys:
-            table_id = (tables.get(key) or {}).get("table_id")
-            if not table_id:
-                raise SyncError("api_error", f"missing_table_id:{key}")
-            if key == "nodes":
-                published_ms = int(time.time() * 1000)
-                for record in records:
-                    record["fields"]["同步时间"] = published_ms
-            if key in ("nodes", "gpt_regions"):
-                count = replace_records(client, table_id, records, log, preserve_ninja=True)
-            else:
-                count = replace_records(client, table_id, records, log)
-            log.info(f"table {key} rows={count}")
+        with hold_writer_lock(log, args.lock_file):
+            for key, records in write_keys:
+                table_id = (tables.get(key) or {}).get("table_id")
+                if not table_id:
+                    raise SyncError("api_error", f"missing_table_id:{key}")
+                if key == "nodes":
+                    published_ms = int(time.time() * 1000)
+                    for record in records:
+                        record["fields"]["同步时间"] = published_ms
+                if key in ("nodes", "gpt_regions"):
+                    count = replace_records(
+                        client, table_id, records, log,
+                        preserve_ninja=True, table_key=key)
+                else:
+                    count = replace_records(client, table_id, records, log, table_key=key)
+                log.info(f"table {key} rows={count}")
 
         if next_gpt_history is not None:
             save_gpt_history(args.gpt_history_file, next_gpt_history, log)
@@ -3690,11 +4165,15 @@ def main(argv: list[str] | None = None) -> int:
     except SyncError as exc:
         error = exc.kind
         log.error(f"sync failed class={exc.kind} detail={exc.detail}")
+        print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
+        if exc.kind == "lock_busy":
+            return recorder.finish(1, "lock_busy", exc.detail or exc.kind)
+        return recorder.finish(1, "error", exc.kind)
     except Exception as exc:  # pragma: no cover - defensive
         error = type(exc).__name__.lower()
-        log.error(f"sync failed class={error}")
-    finally:
-        release_sync_lock(lock, log)
+        winerror = getattr(exc, "winerror", None)
+        extra = f" winerror={winerror}" if winerror is not None else ""
+        log.error(f"sync failed class={error}{extra}")
 
     print_summary(tables, str(Path(__file__).resolve()), results, node_rows, region_rows, error)
     return recorder.finish(1, "error", error or "unknown")
