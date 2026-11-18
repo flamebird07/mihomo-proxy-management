@@ -1150,20 +1150,25 @@ class LegacyOracleTests(unittest.TestCase):
     """Review item 5: the legacy MUSE/US-FAST path must behave like the
     pre-debounce script.
 
-    The oracle is the committed version of the script (`git show HEAD:...`).
-    GPT is excluded from the comparison: CY-GUS-DEV1 moved GPT to the unified
-    entry, so the legacy plan can never move it again. Mode C also changed
-    (JP whitelist only) and is covered separately, not by oracle equivalence.
-    Both versions run against the same stub controller and probe results; PUT
-    order, PLAN/RESULT/NOW stdout, the written state (minus `updated` and GPT)
-    and the alert decision must match exactly for modes A/B.
+    The oracle is the script as committed BEFORE the CY-GUS-DEV1 GPT rewrite
+    (pinned to ORACLE_REF, not HEAD: once the rewrite is committed, HEAD no
+    longer holds the old behaviour). GPT is excluded from the comparison: the
+    unified entry owns it, so the legacy plan can never move it again. Mode C
+    also changed (JP whitelist only) and is covered separately. Both versions
+    run against the same stub controller and probe results; PUT order,
+    PLAN/RESULT/NOW stdout, the written state (minus `updated` and GPT) and the
+    alert decision must match exactly for modes A/B.
     """
+
+    # Last commit whose proxy-auto-switch.py predates the unified GPT entry.
+    ORACLE_REF = "37f3473b41acf64185d41b916cb00f2aa632c147"
 
     @classmethod
     def setUpClass(cls):
         root = os.path.abspath(os.path.join(HERE, os.pardir))
         proc = subprocess.run(
-            ["git", "-C", root, "show", "HEAD:scripts/proxy-auto-switch.py"],
+            ["git", "-C", root, "show",
+             f"{cls.ORACLE_REF}:scripts/proxy-auto-switch.py"],
             capture_output=True,
         )
         if proc.returncode != 0:
