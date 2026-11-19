@@ -30,6 +30,12 @@ MIXED_PORT = 7890
 CONTROLLER_PORT = 9090
 DNS_PORT = 1053
 PROVIDER_NAME = "subscription"
+#: The valid-node file provider built by the node pipeline from the Feishu
+#: 「有效节点」 table (upstream run-node-pipeline port).  Presence-gated:
+#: mihomo rejects a file provider whose file is missing, so the renderer
+#: includes it exactly when ``providers/node-valid.yaml`` exists.
+VALID_PROVIDER_NAME = "node-valid"
+VALID_PROVIDER_PATH = "./providers/node-valid.yaml"
 
 MODES = ("tun", "mixed")
 
@@ -144,6 +150,7 @@ def render(
     mode: str = "tun",
     provider_path: str = "./providers/subscription.yaml",
     source1_supplement_path: str | None = None,
+    valid_nodes: bool = False,
 ) -> str:
     """Return the full ``config.yaml`` text for ``mode``."""
     if mode not in MODES:
@@ -224,7 +231,19 @@ def render(
             dns.pop(key, None)
         profile["store-fake-ip"] = False
 
-    _apply_proxy_groups(document)
+    if valid_nodes:
+        providers[VALID_PROVIDER_NAME] = {
+            "type": "file",
+            "path": VALID_PROVIDER_PATH,
+            "health-check": {
+                "enable": True,
+                "url": US_FAST_URL,
+                "interval": PROVIDER_HEALTHCHECK_INTERVAL,
+                "timeout": 5000,
+                "lazy": True,
+            },
+        }
+    _apply_proxy_groups(document, valid_nodes=valid_nodes)
     if source1_supplement_path:
         providers["source1-local"] = {
             "type": "file",
@@ -237,7 +256,7 @@ def render(
     _apply_rules(document)
 
     text = yaml.safe_dump(document, allow_unicode=True, sort_keys=False, width=120)
-    audit(text, mode=mode, secret=secret)
+    audit(text, mode=mode, secret=secret, valid_nodes=valid_nodes)
     return text
 
 
@@ -281,7 +300,7 @@ def _region_group(name: str, region: str, *, url: str, interval: int, timeout: i
     }
 
 
-def _apply_proxy_groups(document: dict[str, Any]) -> None:
+def _apply_proxy_groups(document: dict[str, Any], *, valid_nodes: bool = False) -> None:
     """Apply the macOS group layout on top of the shared template.
 
     * ``PROXY`` never lists raw provider nodes (``use`` removed) and cannot
@@ -308,7 +327,9 @@ def _apply_proxy_groups(document: dict[str, Any]) -> None:
         {
             "name": "US-FAST",
             "type": "fallback",
-            "use": [PROVIDER_NAME],
+            # Assignment mode: the measured valid-node pool replaces the raw
+            # subscription pool (upstream's docs/ARCHITECTURE.md US-FAST shape).
+            "use": [VALID_PROVIDER_NAME] if valid_nodes else [PROVIDER_NAME],
             "filter": US_FILTER,
             "url": US_FAST_URL,
             "interval": 180,
@@ -323,17 +344,29 @@ def _apply_proxy_groups(document: dict[str, Any]) -> None:
         _region_group("GPT-SG", "SG", url=GPT_URL, interval=300, timeout=8000),
         _region_group("GPT-JP", "JP", url=GPT_URL, interval=300, timeout=8000),
     ]
-    gpt = {
-        "name": "GPT",
-        "type": "fallback",
-        "proxies": list(GPT_MEMBERS),
-        "url": GPT_URL,
-        "expected-status": 200,
-        "interval": 300,
-        "timeout": 8000,
-        "lazy": False,
-        "max-failed-times": 3,
-    }
+    if valid_nodes:
+        # Assignment mode: GPT becomes the selector the upstream stability
+        # entry manages (gpt_switch_entry rejects non-selector engines);
+        # members are the measured valid nodes, AUTO-FOREIGN stays reachable
+        # as a manual safety choice.
+        gpt = {
+            "name": "GPT",
+            "type": "select",
+            "proxies": ["AUTO-FOREIGN"],
+            "use": [VALID_PROVIDER_NAME],
+        }
+    else:
+        gpt = {
+            "name": "GPT",
+            "type": "fallback",
+            "proxies": list(GPT_MEMBERS),
+            "url": GPT_URL,
+            "expected-status": 200,
+            "interval": 300,
+            "timeout": 8000,
+            "lazy": False,
+            "max-failed-times": 3,
+        }
 
     # Keep GPT next to the other AI groups, immediately before US-FAST.
     for payload in gpt_groups:
@@ -418,7 +451,7 @@ def _in_cidr(value: str, cidr: str) -> bool:
     return network.overlaps(other)
 
 
-def audit(text: str, *, mode: str, secret: str | None = None) -> None:
+def audit(text: str, *, mode: str, secret: str | None = None, valid_nodes: bool = False) -> None:
     """Fail closed on any policy, security or mode regression."""
     leftover = sorted(set(_PLACEHOLDER.findall(text)))
     if leftover:
@@ -503,6 +536,16 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
         require(supplement.get("type") == "file" and bool(supplement.get("path")),
                 "source 1 supplement must use a local file")
         provider_group_sources.append("source1-local")
+    if valid_nodes:
+        valid_provider = document["proxy-providers"].get(VALID_PROVIDER_NAME)
+        require(isinstance(valid_provider, dict), f"missing file provider '{VALID_PROVIDER_NAME}'")
+        require(valid_provider.get("type") == "file",
+                f"{VALID_PROVIDER_NAME} must be a file provider")
+        require(valid_provider.get("path") == VALID_PROVIDER_PATH,
+                f"{VALID_PROVIDER_NAME} path must be {VALID_PROVIDER_PATH}")
+        valid_health = valid_provider.get("health-check") or {}
+        require(valid_health.get("enable") is True,
+                f"{VALID_PROVIDER_NAME} health-check must be enabled")
     interval = provider.get("interval")
     require(
         isinstance(interval, int) and interval >= PROVIDER_MIN_INTERVAL,
@@ -563,7 +606,10 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     us_fast = groups.get("US-FAST")
     require(isinstance(us_fast, dict), "missing proxy group US-FAST")
     require(us_fast.get("type") == "fallback", "US-FAST must be a fallback group")
-    require(us_fast.get("use") == provider_group_sources, "US-FAST must use the provider")
+    require(
+        us_fast.get("use") == ([VALID_PROVIDER_NAME] if valid_nodes else provider_group_sources),
+        "US-FAST must use the " + ("valid-node" if valid_nodes else "subscription") + " provider",
+    )
     require(us_fast.get("filter") == US_FILTER, "US-FAST filter must be the strict US filter")
     require(us_fast.get("url") == US_FAST_URL, f"US-FAST url must be {US_FAST_URL}")
     require(us_fast.get("interval") == 180, "US-FAST interval must be 180")
@@ -589,11 +635,19 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
 
     gpt = groups.get("GPT")
     require(isinstance(gpt, dict), "missing proxy group GPT")
-    require(gpt.get("type") == "fallback", "GPT must be a fallback group")
-    require(gpt.get("proxies") == GPT_MEMBERS, f"GPT must list {GPT_MEMBERS}")
-    require(gpt.get("url") == GPT_URL, f"GPT url must be {GPT_URL}")
-    require(gpt.get("interval") == 300, "GPT interval must be 300")
-    require(gpt.get("max-failed-times") == 3, "GPT max-failed-times must be 3")
+    if valid_nodes:
+        require(gpt.get("type") == "select",
+                "assignment mode requires GPT to be a select group (stability entry)")
+        require(gpt.get("use") == [VALID_PROVIDER_NAME],
+                f"assignment mode GPT must draw from '{VALID_PROVIDER_NAME}'")
+        require(gpt.get("proxies") == ["AUTO-FOREIGN"],
+                "assignment mode GPT must keep AUTO-FOREIGN as the manual fallback member")
+    else:
+        require(gpt.get("type") == "fallback", "GPT must be a fallback group")
+        require(gpt.get("proxies") == GPT_MEMBERS, f"GPT must list {GPT_MEMBERS}")
+        require(gpt.get("url") == GPT_URL, f"GPT url must be {GPT_URL}")
+        require(gpt.get("interval") == 300, "GPT interval must be 300")
+        require(gpt.get("max-failed-times") == 3, "GPT max-failed-times must be 3")
 
     # GROKBOT comes from the shared template; the audit keeps it from drifting.
     # The region subgroups' filter/fallback/use are enforced by the
@@ -827,6 +881,8 @@ __all__ = [
     "TIKTOK_RULE",
     "US_FAST_URL",
     "US_FILTER",
+    "VALID_PROVIDER_NAME",
+    "VALID_PROVIDER_PATH",
     "audit",
     "convert_provider",
     "ensure_geodata",

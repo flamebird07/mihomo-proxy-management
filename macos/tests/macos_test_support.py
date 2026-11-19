@@ -206,6 +206,7 @@ class FakeFlock:
 CORE_LABEL = "com.mihomo-proxy-management.core"
 BOOT_LABEL = "com.mihomo-proxy-management.boot-switch"
 FEISHU_LABEL = "com.mihomo-proxy-management.feishu-sync"
+NODE_LABEL = "com.mihomo-proxy-management.node-pipeline"
 
 
 def _target_label(argv) -> str:
@@ -217,6 +218,8 @@ def _target_label(argv) -> str:
         return BOOT_LABEL
     if FEISHU_LABEL in target:
         return FEISHU_LABEL
+    if NODE_LABEL in target:
+        return NODE_LABEL
     return CORE_LABEL
 
 
@@ -241,12 +244,15 @@ class LaunchdHarness:
         self.boot_running = False
         self.feishu_loaded = False
         self.feishu_running = False
+        self.node_loaded = False
+        self.node_running = False
         #: per-label ``launchctl disable`` override; the core starts disabled
         #: (install disables it) and the boot entry starts enabled.
         self.disabled_labels: dict[str, bool] = {
             CORE_LABEL: True,
             BOOT_LABEL: False,
             FEISHU_LABEL: False,
+            NODE_LABEL: False,
         }
         #: bootstrap/kickstart calls that load the job but leave it stopped,
         #: so ``wait_running`` times out (a start failure without a crash).
@@ -309,6 +315,14 @@ class LaunchdHarness:
     def feishu_disabled(self, value: bool) -> None:
         self.disabled_labels[FEISHU_LABEL] = value
 
+    @property
+    def node_disabled(self) -> bool:
+        return self.disabled_labels[NODE_LABEL]
+
+    @node_disabled.setter
+    def node_disabled(self, value: bool) -> None:
+        self.disabled_labels[NODE_LABEL] = value
+
     def _print(self, argv):
         target = _target_label(argv)
         if target == BOOT_LABEL:
@@ -324,6 +338,11 @@ class LaunchdHarness:
             if not self.feishu_loaded:
                 return (113, "", f'Could not find service "{FEISHU_LABEL}"')
             state = "running" if self.feishu_running else "not running"
+            return (0, f"state = {state}\n\tlast exit code = 0\n", "")
+        if target == NODE_LABEL:
+            if not self.node_loaded:
+                return (113, "", f'Could not find service "{NODE_LABEL}"')
+            state = "running" if self.node_running else "not running"
             return (0, f"state = {state}\n\tlast exit code = 0\n", "")
         if not self.loaded:
             return (113, "", 'Could not find service "com.mihomo-proxy-management.core"')
@@ -404,6 +423,10 @@ class LaunchdHarness:
         if target == FEISHU_LABEL:
             self._start_feishu()
             return (0, "", "")
+        if target == NODE_LABEL:
+            self.node_loaded = True
+            self.node_running = False
+            return (0, "", "")
         self._start()
         return (0, "", "")
 
@@ -416,6 +439,10 @@ class LaunchdHarness:
         if target == FEISHU_LABEL:
             self.feishu_loaded = False
             self.feishu_running = False
+            return (0, "", "")
+        if target == NODE_LABEL:
+            self.node_loaded = False
+            self.node_running = False
             return (0, "", "")
         self.loaded = False
         self.running = False

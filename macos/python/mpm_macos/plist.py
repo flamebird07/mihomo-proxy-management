@@ -52,7 +52,7 @@ from xml.sax.saxutils import escape
 from mpm_common.errors import FailClosed
 
 from .context import BINARY_ENV
-from .paths import BOOT_LABEL, FEISHU_SYNC_LABEL, LABEL
+from .paths import BOOT_LABEL, FEISHU_SYNC_LABEL, LABEL, NODE_PIPELINE_LABEL
 
 PLACEHOLDERS = (
     "__LABEL__",
@@ -74,7 +74,7 @@ SHELL_NAMES = {"sh", "bash", "zsh", "dash", "/bin/sh", "/bin/bash", "/bin/zsh", 
 PYTHON_SUFFIXES = ("python3", "python3.11", "python3.12", "python3.13")
 
 #: Labels this project may render and audit.
-ALLOWED_LABELS = (LABEL, BOOT_LABEL, FEISHU_SYNC_LABEL)
+ALLOWED_LABELS = (LABEL, BOOT_LABEL, FEISHU_SYNC_LABEL, NODE_PIPELINE_LABEL)
 
 
 def _values(
@@ -177,8 +177,8 @@ def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> 
     _require(document.get("Label") == label, "Label must be the project label")
     if label == BOOT_LABEL:
         return _audit_boot(document, label=label)
-    if label == FEISHU_SYNC_LABEL:
-        return _audit_feishu_sync(document, label=label)
+    if label in (FEISHU_SYNC_LABEL, NODE_PIPELINE_LABEL):
+        return _audit_interval_job(document, label=label)
     return _audit_core(document, label=label, home_dir=home_dir)
 
 
@@ -310,14 +310,22 @@ def _audit_boot(document: Any, *, label: str) -> dict[str, Any]:
     }
 
 
-def _audit_feishu_sync(document: Any, *, label: str) -> dict[str, Any]:
-    """The sync job is interval-driven: no boot run, no restart policy.
+#: The ``python -m`` entry each interval job must run (label -> module).
+_INTERVAL_JOB_ENTRIES = {
+    FEISHU_SYNC_LABEL: "mpm_macos.feishu_sync",
+    NODE_PIPELINE_LABEL: "mpm_macos.node_pipeline",
+}
 
-    ``RunAtLoad`` would run a sync right at install/bootstrap (before the
+
+def _audit_interval_job(document: Any, *, label: str) -> dict[str, Any]:
+    """An interval-driven job (feishu sync / node pipeline): no boot run, no
+    restart policy.
+
+    ``RunAtLoad`` would run the job right at install/bootstrap (before the
     core may even exist) and ``KeepAlive`` would retry a failing tick every
     ``ThrottleInterval`` seconds on top of the interval schedule - both are
     rejected.  ``StartInterval`` must be an integer of at least 300 s: the
-    script's own file lock prevents same-table write races, but a floor keeps
+    scripts' own file locks prevent same-table write races, but a floor keeps
     the schedule from hammering the subscription and the Feishu API.
     """
     run_at_load = document.get("RunAtLoad")
@@ -342,8 +350,8 @@ def _audit_feishu_sync(document: Any, *, label: str) -> dict[str, Any]:
 
     arguments = _audit_program_arguments(document)
     _require(
-        "mpm_macos.feishu_sync" in arguments,
-        "ProgramArguments must point at mpm_macos.feishu_sync",
+        _INTERVAL_JOB_ENTRIES[label] in arguments,
+        f"ProgramArguments must point at {_INTERVAL_JOB_ENTRIES[label]}",
     )
 
     working = _audit_paths_and_environment(document)

@@ -35,11 +35,16 @@ BOOT_LABEL = f"com.{PROJECT}.boot-switch"
 #: next interval, and a restart policy would only pile up overlapping runs.
 FEISHU_SYNC_LABEL = f"com.{PROJECT}.feishu-sync"
 XIGUA_IPPOOL_LABEL = f"com.{PROJECT}.xigua-ippool"
+#: Fourth system job: the node pipeline (port of upstream ``run-node-pipeline``):
+#: collect -> ops (probe/gate) -> provide (valid-node file provider) -> stable
+#: GPT switch.  StartInterval-driven like the Feishu sync, never at boot.
+NODE_PIPELINE_LABEL = f"com.{PROJECT}.node-pipeline"
 BINARY_NAME = "mihomo"
 RUNNER_NAME = "runner"
 PLIST_NAME = f"{LABEL}.plist"
 BOOT_PLIST_NAME = f"{BOOT_LABEL}.plist"
 FEISHU_SYNC_PLIST_NAME = f"{FEISHU_SYNC_LABEL}.plist"
+NODE_PIPELINE_PLIST_NAME = f"{NODE_PIPELINE_LABEL}.plist"
 
 SUPPORT_DIR_NAME = PROJECT
 RUN_DIR_NAME = PROJECT
@@ -73,6 +78,11 @@ class Layout:
     @property
     def xigua_ippool_plist(self) -> str:
         return os.path.join(self.plist_dir, f"{XIGUA_IPPOOL_LABEL}.plist")
+
+    @property
+    def node_pipeline_plist(self) -> str:
+        """The node pipeline job (valid-node provider + stable GPT switch)."""
+        return os.path.join(self.plist_dir, NODE_PIPELINE_PLIST_NAME)
 
     # ---- executables / read-only data ---------------------------------
     @property
@@ -130,6 +140,10 @@ class Layout:
         return os.path.join(self.template_dir, FEISHU_SYNC_PLIST_NAME + ".template")
 
     @property
+    def node_pipeline_plist_template(self) -> str:
+        return os.path.join(self.template_dir, NODE_PIPELINE_PLIST_NAME + ".template")
+
+    @property
     def config_template(self) -> str:
         return os.path.join(self.template_dir, "config.yaml.template")
 
@@ -185,6 +199,17 @@ class Layout:
         return os.path.join(self.providers, "subscription.yaml")
 
     @property
+    def valid_provider_file(self) -> str:
+        """The valid-node file provider built by the node pipeline.
+
+        Lives inside the mihomo home (``providers/``) like the subscription
+        cache: mihomo rejects provider paths outside ``-d``.  Built from the
+        Feishu 「有效节点」 table by the installed ``node_provider``; its
+        presence flips the renderer to valid-node assignment mode.
+        """
+        return os.path.join(self.providers, "node-valid.yaml")
+
+    @property
     def state_dir(self) -> str:
         """Project state only (secret, deployment record, snapshots); not ``-d``."""
         return os.path.join(self.support, "state")
@@ -237,6 +262,11 @@ class Layout:
         return os.path.join(self.state_dir, "feishu")
 
     @property
+    def node_state_dir(self) -> str:
+        """Node pipeline state (locks, switch state, rounds, alerts)."""
+        return os.path.join(self.state_dir, "node")
+
+    @property
     def logs(self) -> str:
         return os.path.join(self.support, "logs")
 
@@ -264,6 +294,14 @@ class Layout:
     def log_feishu_err(self) -> str:
         return os.path.join(self.logs, "feishu-sync.err.log")
 
+    @property
+    def log_node_pipeline_out(self) -> str:
+        return os.path.join(self.logs, "node-pipeline.out.log")
+
+    @property
+    def log_node_pipeline_err(self) -> str:
+        return os.path.join(self.logs, "node-pipeline.err.log")
+
     # ---- runtime ------------------------------------------------------
     @property
     def run_dir(self) -> str:
@@ -290,6 +328,7 @@ class Layout:
             self.boot_plist,
             self.feishu_sync_plist,
             self.xigua_ippool_plist,
+            self.node_pipeline_plist,
         ]
 
     def to_target_path(self, path: str) -> str:
@@ -338,6 +377,7 @@ def managed_dirs(layout: Layout) -> list[tuple[str, int]]:
         (layout.providers, 0o700),
         (layout.state_dir, 0o700),
         (layout.feishu_state_dir, 0o700),
+        (layout.node_state_dir, 0o700),
         (layout.logs, 0o750),
         (layout.run_dir, 0o700),
     ]
@@ -350,6 +390,8 @@ __all__ = [
     "FEISHU_SYNC_LABEL",
     "FEISHU_SYNC_PLIST_NAME",
     "LABEL",
+    "NODE_PIPELINE_LABEL",
+    "NODE_PIPELINE_PLIST_NAME",
     "PLIST_NAME",
     "PROJECT",
     "RUNNER_NAME",

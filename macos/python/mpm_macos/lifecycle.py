@@ -66,6 +66,7 @@ from . import config as config_mod
 from . import conflict as conflict_mod
 from . import context as context_mod
 from . import feishu_sync as feishu_sync_mod
+from . import node_pipeline as node_pipeline_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
 from .launchdctl import Launchd
@@ -78,7 +79,15 @@ from .network_proxy import (
     save_snapshot,
     snapshot_exists,
 )
-from .paths import BOOT_LABEL, FEISHU_SYNC_LABEL, LABEL, XIGUA_IPPOOL_LABEL, Layout, managed_dirs
+from .paths import (
+    BOOT_LABEL,
+    FEISHU_SYNC_LABEL,
+    LABEL,
+    NODE_PIPELINE_LABEL,
+    XIGUA_IPPOOL_LABEL,
+    Layout,
+    managed_dirs,
+)
 
 SUBCOMMANDS = (
     "preflight",
@@ -623,6 +632,12 @@ def _install_static(ctx: Context) -> list[str]:
         os.path.join(
             source, "templates", os.path.basename(layout.feishu_sync_plist_template)
         ): layout.feishu_sync_plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.node_pipeline_plist_template)
+        ): layout.node_pipeline_plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.feishu_sync_plist_template)
+        ): layout.feishu_sync_plist_template,
         os.path.join(repo, "config", "config.yaml.template"): layout.config_template,
     }
     for src, dest in template_sources.items():
@@ -652,6 +667,11 @@ def _install_static(ctx: Context) -> list[str]:
         "ippool-collector.py",
         "sync-xigua-ippool-feishu.py",
         "run-xigua-ippool.py",
+        # the node pipeline's assignment chain (upstream run-node-pipeline port)
+        "proxy-auto-switch.py",
+        "gpt_switch_entry.py",
+        "gpt_stability_policy.py",
+        "named_mutex_lock.py",
     ):
         if _copy_file(
             os.path.join(repo, "scripts", name),
@@ -659,6 +679,12 @@ def _install_static(ctx: Context) -> list[str]:
             mode=0o755,
         ):
             changed.append(name)
+    for package in (node_pipeline_mod.NODE_PROVIDER_PACKAGE, node_pipeline_mod.NODE_OPS_PACKAGE):
+        changed += _copy_tree(
+            os.path.join(repo, "scripts", package),
+            os.path.join(layout.scripts_dir, package),
+            mode=0o644,
+        )
 
     _install_cli(ctx)
     _install_runner(ctx)
@@ -816,6 +842,7 @@ def configure(
         mode=target_mode,
         provider_path=layout.provider_file,
         source1_supplement_path=supplement_path if supplement_nodes else None,
+        valid_nodes=os.path.isfile(layout.valid_provider_file),
     )
 
     validator = ctx.validator or _default_validator(ctx)
@@ -953,6 +980,72 @@ def _feishu_sync_launchd(ctx: Context) -> Launchd:
         plist=ctx.layout.feishu_sync_plist,
         label=FEISHU_SYNC_LABEL,
         sleeper=ctx.sleeper,
+    )
+
+
+def _install_node_pipeline_plist(ctx: Context) -> bool:
+    """Render the node pipeline job: same render+audit gate as the core plist.
+
+    The audit (interval-job rules) rejects a boot run, a restart policy and
+    any secret/URL in the document.
+    """
+    layout = ctx.layout
+    target = layout.to_target_path
+    rendered = plist_mod.render_from_file(
+        layout.node_pipeline_plist_template,
+        label=NODE_PIPELINE_LABEL,
+        python=target(ctx.python),
+        package_dir=target(layout.share_python),
+        home_dir=target(layout.mihomo_home),
+        config=target(layout.config),
+        binary=target(layout.binary),
+        run_dir=target(layout.run_dir),
+        log_out=target(layout.log_node_pipeline_out),
+        log_err=target(layout.log_node_pipeline_err),
+        sync_interval=str(node_pipeline_mod.pipeline_interval_seconds(ctx.environ)),
+    )
+    plist_mod.audit_text(rendered, label=NODE_PIPELINE_LABEL, home_dir=target(layout.mihomo_home))
+    if is_noop(layout.node_pipeline_plist, rendered, mode=0o644):
+        return False
+    write_atomic(layout.node_pipeline_plist, rendered, mode=0o644)
+    return True
+
+
+def _node_pipeline_launchd(ctx: Context) -> Launchd:
+    """The node pipeline job (StartInterval-driven, never at boot)."""
+    return Launchd(
+        ctx.executor,
+        plist=ctx.layout.node_pipeline_plist,
+        label=NODE_PIPELINE_LABEL,
+        sleeper=ctx.sleeper,
+    )
+
+
+def _install_node_pipeline_job(ctx: Context, report: Report) -> None:
+    """Register the node pipeline like the feishu job: enable + bootstrap.
+
+    No hold stamp is needed (no RunAtLoad, the first tick fires one interval
+    after the load).  Missing Feishu credentials do NOT fail the install: the
+    tick reports them and retries on the next interval.
+    """
+    job = _node_pipeline_launchd(ctx)
+    if _install_node_pipeline_plist(ctx):
+        report.add("node-pipeline LaunchDaemon plist installed")
+    else:
+        report.add("node-pipeline LaunchDaemon plist unchanged")
+    if job.state().loaded:
+        job.bootout()
+    job.enable()
+    if job.is_disabled():
+        raise FailClosed(
+            "install finished but the node-pipeline LaunchDaemon is still disabled; "
+            "the valid-node assignment would never run"
+        )
+    job.bootstrap()
+    report.add(
+        "node-pipeline registered: collect -> probe/gate -> valid-node provider -> "
+        f"stable GPT switch every {node_pipeline_mod.pipeline_interval_seconds(ctx.environ)}s "
+        "(MPM_NODE_PIPELINE_INTERVAL_SECONDS), first run one interval from now"
     )
 
 
@@ -1415,6 +1508,7 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
         " (MPM_FEISHU_SYNC_INTERVAL_SECONDS), first run one interval from now"
     )
     _install_xigua_ippool_job(ctx, report)
+    _install_node_pipeline_job(ctx, report)
 
     if skip_start:
         report.status = "OK"
@@ -2110,6 +2204,22 @@ def _proxy_matches(ctx: Context, state: DeploymentState) -> bool | None:
     return True
 
 
+def _node_pipeline_status(ctx: Context) -> dict[str, Any]:
+    """Launchd state of the node pipeline job (read-only, never throws)."""
+    try:
+        job = _node_pipeline_launchd(ctx)
+        state = job.state()
+        disabled = job.is_disabled()
+    except Exception as exc:  # noqa: BLE001 - degraded, not fatal
+        return {"loaded": False, "running": False, "disabled": None, "error": _failure_reason(exc)}
+    return {
+        "loaded": state.loaded,
+        "running": state.running,
+        "disabled": disabled,
+        "last_exit": state.last_exit,
+    }
+
+
 def _feishu_sync_status(ctx: Context) -> dict[str, Any]:
     """Launchd state of the Feishu speedtest sync job (read-only, never throws).
 
@@ -2149,6 +2259,7 @@ def status(ctx: Context) -> Report:
         "plist": {"present": os.path.isfile(layout.plist)},
         "network_proxy": {"matches_saved_state": _proxy_matches(ctx, state)},
         "feishu_sync": _feishu_sync_status(ctx),
+        "node_pipeline": _node_pipeline_status(ctx),
     }
 
     client: ControllerClient | None = None
@@ -2435,6 +2546,13 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
         except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
             report.warn("xigua-ippool shutdown failed: " + _failure_reason(exc))
 
+    pipeline = _node_pipeline_launchd(ctx)
+    try:
+        pipeline.bootout()
+        pipeline.disable()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("node-pipeline shutdown failed: " + _failure_reason(exc))
+
     removed: list[str] = []
 
     def discard(path: str) -> None:
@@ -2447,6 +2565,7 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
     discard(layout.boot_plist)
     discard(layout.feishu_sync_plist)
     discard(layout.xigua_ippool_plist)
+    discard(layout.node_pipeline_plist)
     discard(layout.cli_entry)
     discard(layout.switch_entry)
     discard(layout.libexec)

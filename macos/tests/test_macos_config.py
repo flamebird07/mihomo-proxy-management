@@ -366,6 +366,74 @@ def test_grokbot_group_falls_back_to_auto_foreign_never_direct():
     assert grok_index < rules.index("GEOSITE,cn,DIRECT")
 
 
+def _render_valid(mode: str = "tun") -> str:
+    return config.render(
+        _template(),
+        secret=SECRET,
+        subscription_url=URL,
+        interval_minutes=30,
+        mode=mode,
+        valid_nodes=True,
+    )
+
+
+def test_valid_nodes_mode_switches_gpt_and_us_fast_to_the_valid_pool():
+    """Assignment mode: GPT becomes the selector the stability entry manages,
+    US-FAST draws from the measured pool, both stay fail-safe."""
+    document = yaml.safe_load(_render_valid("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    valid_provider = document["proxy-providers"][config.VALID_PROVIDER_NAME]
+    assert valid_provider["type"] == "file"
+    assert valid_provider["path"] == config.VALID_PROVIDER_PATH
+    assert valid_provider["health-check"]["enable"] is True
+
+    gpt = groups["GPT"]
+    assert gpt["type"] == "select"
+    assert gpt["use"] == [config.VALID_PROVIDER_NAME]
+    assert gpt["proxies"] == ["AUTO-FOREIGN"], "manual fallback member stays"
+
+    us_fast = groups["US-FAST"]
+    assert us_fast["type"] == "fallback"
+    assert us_fast["use"] == [config.VALID_PROVIDER_NAME]
+    assert us_fast["filter"] == config.US_FILTER, "the strict US filter is unchanged"
+
+    # the region subgroups keep drawing from the subscription pool
+    for name in ("GPT-US", "GPT-SG", "GPT-JP"):
+        assert groups[name]["use"] == ["subscription"]
+
+
+def test_valid_nodes_mode_audit_rejects_drift():
+    document = yaml.safe_load(_render_valid("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    groups["GPT"]["type"] = "fallback"  # the entry cannot manage a fallback
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+    document = yaml.safe_load(_render_valid("tun"))
+    del document["proxy-providers"][config.VALID_PROVIDER_NAME]
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+    # subscription mode must not silently accept the assignment shape either
+    document = yaml.safe_load(_render_valid("tun"))
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=False)
+
+
+def test_valid_nodes_mode_rejects_a_missing_file_provider():
+    document = yaml.safe_load(_render("tun"))
+    document["proxy-providers"][config.VALID_PROVIDER_NAME] = {
+        "type": "file",
+        "path": config.VALID_PROVIDER_PATH,
+    }
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+
 def test_grokbot_audit_rejects_drift():
     document = yaml.safe_load(_render("tun"))
     grokbot = next(g for g in document["proxy-groups"] if g["name"] == "GROKBOT")

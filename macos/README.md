@@ -28,6 +28,7 @@ macos/python/mpm_macos/
   switch.py           mpm-switch：Nextin <-> mihomo，失败自动回滚到 Nextin
   boot.py             开机入口（boot-switch LaunchDaemon）：等登录用户/默认路由 -> 复用 switch 的 root 流程
   feishu_sync.py      飞书测速同步入口（feishu-sync LaunchDaemon，StartInterval 驱动）
+  node_pipeline.py    节点自动分配入口（node-pipeline LaunchDaemon：collect->测速门控->有效节点 provider->稳定切换）
   lifecycle.py        install/configure/start/stop/restart/status/health/groups/uninstall
   runner.py           持有 core 锁、启动前冲突检测、可选 caffeinate -i、信号转发、退出码映射
   cli.py              命令入口（无业务逻辑）
@@ -866,6 +867,62 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
 `no node matches: mihomo degrades this group to COMPATIBLE (direct)`**——空池组静默
 降级成直连正是 grok/US-FAST 类问题的来源；区域名对不上订阅命名时一眼可见。
 控制器不可达时只降级为匹配计数（状态 OK，不报错）。
+
+### 节点自动分配流水线（node-pipeline LaunchDaemon，上游 run-node-pipeline 移植）
+
+上游 `feat/node-split-refactor` 把"按节点自动分配到本机"拆成 node_provider / node_ops
+两个模块 + GPT 统一稳定切换入口（数据只存飞书两表：节点测速总表、有效节点）。macOS 以
+第四个 system LaunchDaemon `com.mihomo-proxy-management.node-pipeline` 移植整条链：
+
+```text
+每 MPM_NODE_PIPELINE_INTERVAL_SECONDS（默认 3600s，夹 [600, 86400]）一个 tick：
+ 1 python -m node_provider --collect   订阅源 -> 飞书「节点测速总表」（失败容忍，
+                                      下一步仍对既有表刷新测量）
+ 2 python -m node_ops                 源无关隔离内核测速（空闲端口 17890 起、TUN off、
+                                      不碰生产端口/组）+ 地区分类 + GPT 连续轮数门控
+                                      -> 「有效节点」表 + 测量列
+ 3 python -m node_provider --output   有效节点表 -> providers/node-valid.yaml
+                                      （mihomo home 内的 file provider，原子写，
+                                      低于 min-nodes 保留上一版）
+ 4 proxy-auto-switch.py               统一 GPT 稳定切换入口（gpt_switch_entry：
+                                      10 轮稳定门槛、读回校验；GPT 不是 selector 时
+                                      以 engine_not_selector 干净拒绝）
+ 5 apply                              node-valid 首次出现/消失时，在 lifecycle 锁内
+                                      重渲染 config 并热重载 core（一次翻转只渲染一次）
+```
+
+**有效节点分配模式（valid_nodes）**：渲染器检测 `providers/node-valid.yaml` 是否存在——
+存在时（第 5 步翻转后）`GPT` 变为 **select 组**（`use: [node-valid]`，成员是实测过关的
+节点 + 手动兜底 AUTO-FOREIGN——上游稳定入口只管理 selector 引擎），`US-FAST` 的
+`use` 切到 `node-valid`（严格美国 filter 不变）；文件不存在时回退纯订阅模式。mihomo
+拒绝文件缺失的 file provider，所以渲染必须由存在性门控；audit 在两种模式下各自锁定
+组形。`configure`/`install` 自动带 `valid_nodes=os.path.isfile(node-valid.yaml)`。
+
+要点：
+
+* 凭据：与飞书测速同步同一套 `FEISHU_APP_ID/SECRET`（0600 秘密文件）；缺失时 tick 报告
+  缺键并退出 4，下个周期重试——**不阻塞 install**，也不影响核心服务。
+* GPT 稳定切换的跨进程锁：上游 named_mutex 在 POSIX 只有进程内回退；本分支补了真正的
+  `flock` 文件锁（`_PosixFileMutex`，30s 预算，持锁进程死亡由内核释放；锁文件不删除，
+  避免 unlink 竞态分裂成两把锁）。Windows 仍走 kernel32。
+* plist 走 interval 型审计（无 RunAtLoad/KeepAlive、StartInterval>=600 整数、入口必须是
+  `mpm_macos.node_pipeline`、ProcessType Background）；install 注册（enable 读回 +
+  bootstrap，重装先 bootout）、uninstall 摘除、status 显示 `node_pipeline` 状态。
+* 安装面：`install` 额外复制 `node_provider/`、`node_ops/` 包与
+  `proxy-auto-switch.py`、`gpt_switch_entry.py`、`gpt_stability_policy.py`、
+  `named_mutex_lock.py` 到 `libexec/scripts/`；状态在 `state/node/`（锁、切换状态、
+  轮记录）；日志 `logs/node-pipeline.log` / `node_ops.log` / `proxy-auto-switch.log`。
+* 抓取不着急：源抓取（第 1 步）失败只记日志不阻断测量/分配；wmsxwd 源 403 期间流水线
+  照常对表内既有节点工作。
+* 验收：
+
+```sh
+sudo env PYTHONPATH=/usr/local/share/mihomo-proxy-management/python \
+     /usr/local/bin/python3 -m mpm_macos.node_pipeline --dry-run   # 前置检查+argv
+sudo launchctl kickstart system/com.mihomo-proxy-management.node-pipeline
+tail "/Library/Application Support/mihomo-proxy-management/logs/node-pipeline.log"
+sudo /usr/local/bin/mihomo-proxy-management groups    # GPT now= 稳定入口选中的节点
+```
 
 ## 8. 测试
 
