@@ -209,17 +209,28 @@ class FeishuClient:
             deleted += len(chunk)
         return deleted
 
-    def batch_create(self, table_id: str, records: List[dict]) -> int:
-        created = 0
+    def batch_create(self, table_id: str, records: List[dict]) -> List[str]:
+        created_ids: List[str] = []
         for start in range(0, len(records), 100):
             chunk = records[start:start + 100]
-            self.call(
+            data = self.call(
                 "POST",
                 f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_create",
                 body={"records": chunk},
             )
-            created += len(chunk)
-        return created
+            for item in data.get("records") or []:
+                record_id = item.get("record_id")
+                if record_id:
+                    created_ids.append(record_id)
+        return created_ids
+
+    def update_record(self, table_id: str, record_id: str, fields: dict) -> None:
+        self.call(
+            "PUT",
+            f"/bitable/v1/apps/{self.app_token}/tables/{table_id}"
+            f"/records/{record_id}",
+            body={"fields": fields},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +314,8 @@ def replace_all(client: FeishuClient, table_id: str, records: List[dict],
         else:
             log("records created=0")
         return 0
-    created = client.batch_create(table_id, records)
+    created_ids = client.batch_create(table_id, records)
+    created = len(created_ids)
     log(f"records created={created}")
     if created != len(records):
         log("records delete skipped reason=create_incomplete")
@@ -311,4 +323,64 @@ def replace_all(client: FeishuClient, table_id: str, records: List[dict],
     if old_ids:
         deleted = client.batch_delete(table_id, old_ids)
         log(f"records deleted={deleted}")
+    return created
+
+
+def _as_number(value: Any) -> Optional[int]:
+    """Parse a NUMBER field readback that may arrive as int or str."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return int(float(text))
+            except ValueError:
+                return None
+    return None
+
+
+def replace_source_rows(client: FeishuClient, table_id: str, source_number: int,
+                        records: List[dict],
+                        log: Callable[[str], None]) -> int:
+    """Replace only the rows belonging to one source.
+
+    New rows are created first; once every row was created, every pre-existing
+    row of the same source that is not one of the newly created rows is
+    deleted.  Under concurrent writers the last finisher therefore removes the
+    other machine's rows for this source and no duplicate rows remain.
+
+    An empty payload is refused: the source's old rows are kept.
+    """
+    if not records:
+        log(f"records replace refused empty_payload source={source_number}")
+        return 0
+    created_ids = list(client.batch_create(table_id, records))
+    created = len(created_ids)
+    log(f"records created={created} source={source_number}")
+    if created != len(records):
+        log("records delete skipped reason=create_incomplete")
+        return created
+    existing = client.list_records(table_id)
+    created_set = set(created_ids)
+    stale: List[str] = []
+    for row in existing:
+        fields = row.get("fields") or {}
+        if _as_number(fields.get("源编号")) != source_number:
+            continue
+        record_id = row.get("record_id")
+        if not record_id or record_id in created_set:
+            continue
+        stale.append(record_id)
+    if stale:
+        deleted = client.batch_delete(table_id, stale)
+        log(f"records deleted={deleted} source={source_number}")
     return created

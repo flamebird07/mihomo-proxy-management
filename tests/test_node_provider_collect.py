@@ -61,33 +61,57 @@ class FakeReader:
 
 
 class FakeClient:
-    def __init__(self, old_rows=None):
-        self.old_rows = list(old_rows or [])
+    SPECS = {"tbl-n": schema.NODES_TABLE, "tbl-v": schema.VALID_TABLE,
+             "tbl-s": schema.COLLECT_STATE_TABLE}
+
+    def __init__(self, old_rows=None, state_rows=None):
+        self.rows = {"tbl-n": list(old_rows or []),
+                     "tbl-v": [],
+                     "tbl-s": list(state_rows or [])}
         self.calls = []
         self.tables = [
             {"name": schema.NODES_TABLE_NAME, "table_id": "tbl-n"},
             {"name": schema.VALID_TABLE_NAME, "table_id": "tbl-v"},
+            {"name": schema.COLLECT_STATE_TABLE_NAME, "table_id": "tbl-s"},
         ]
+        self._next = 0
 
     def list_tables(self):
         return list(self.tables)
 
     def list_fields(self, table_id):
-        spec = schema.NODES_TABLE if table_id == "tbl-n" else schema.VALID_TABLE
+        spec = self.SPECS[table_id]
         return [{"field_id": f"fld-{name}", "field_name": name, "type": ftype,
                  "property": prop} for name, ftype, prop in spec["fields"]]
 
     def list_records(self, table_id):
         self.calls.append(("list_records", table_id))
-        return list(self.old_rows) if table_id == "tbl-n" else []
+        return list(self.rows.get(table_id, []))
 
     def batch_create(self, table_id, records):
         self.calls.append(("batch_create", table_id, records))
-        return len(records)
+        created = []
+        for record in records:
+            self._next += 1
+            record_id = f"new{self._next}"
+            created.append(record_id)
+            self.rows.setdefault(table_id, []).append(
+                {"record_id": record_id, "fields": dict(record["fields"])})
+        return created
 
     def batch_delete(self, table_id, record_ids):
         self.calls.append(("batch_delete", table_id, record_ids))
+        self.rows[table_id] = [row for row in self.rows.get(table_id, [])
+                               if row.get("record_id") not in record_ids]
         return len(record_ids)
+
+    def update_record(self, table_id, record_id, fields):
+        self.calls.append(("update_record", table_id, record_id, fields))
+        for row in self.rows.get(table_id, []):
+            if row.get("record_id") == record_id:
+                row["fields"] = dict(fields)
+                return
+        raise AssertionError("unknown record id")
 
     def create_table(self, *args):  # pragma: no cover - not expected
         raise AssertionError("unexpected create_table")
@@ -97,11 +121,6 @@ class FakeClient:
 
     def update_field(self, *args):  # pragma: no cover - not expected
         raise AssertionError("unexpected update_field")
-
-
-class ExplodingClient:
-    def __getattr__(self, name):
-        raise AssertionError(f"client.{name} must not be called in dry-run")
 
 
 def settings(**kwargs):
@@ -326,14 +345,19 @@ class MergeTests(unittest.TestCase):
 
 
 class RunCollectTests(unittest.TestCase):
-    def test_dry_run_never_touches_client_or_disk(self):
+    def test_dry_run_reads_state_but_never_writes(self):
+        client = FakeClient()
         code = run_collect(
-            settings(), ExplodingClient(), Logger(),
+            settings(), client, Logger(),
             env_values=ENV,
             fetcher=fetcher_map({ENV["SUBSCRIPTION_URL_1"]: YAML_ONE}),
             now_ms=1_700_000_000_000,
         )
         self.assertEqual(code, 0)
+        writes = [call for call in client.calls
+                  if call[0] in ("batch_create", "batch_delete", "update_record")]
+        self.assertEqual(writes, [])
+        self.assertIn(("list_records", "tbl-s"), client.calls)
 
     def test_no_nodes_is_exit_3(self):
         logger = Logger()
@@ -343,7 +367,7 @@ class RunCollectTests(unittest.TestCase):
         self.assertTrue(any("no nodes collected" in line for line in logger.lines))
 
     def test_write_replaces_total_table_only(self):
-        old = [{"record_id": "old1", "fields": {"节点名": "gone"}}]
+        old = [{"record_id": "old1", "fields": {"节点名": "gone", "源编号": 1}}]
         client = FakeClient(old_rows=old)
         code = run_collect(
             settings(dry_run=False), client, Logger(),
@@ -352,12 +376,14 @@ class RunCollectTests(unittest.TestCase):
             now_ms=1_700_000_000_000,
         )
         self.assertEqual(code, 0)
-        creates = [call for call in client.calls if call[0] == "batch_create"]
+        creates = [call for call in client.calls
+                   if call[0] == "batch_create" and call[1] == "tbl-n"]
         self.assertEqual([call[1] for call in creates], ["tbl-n"])
         fields = creates[0][2][0]["fields"]
         self.assertEqual(fields["来源"], "飞兔")
         self.assertEqual(fields["源编号"], 1)
-        deletes = [call for call in client.calls if call[0] == "batch_delete"]
+        deletes = [call for call in client.calls
+                   if call[0] == "batch_delete" and call[1] == "tbl-n"]
         self.assertEqual(deletes[0][2], ["old1"])
 
     def test_secrets_and_node_passwords_never_logged(self):
