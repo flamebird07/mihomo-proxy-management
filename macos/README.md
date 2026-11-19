@@ -912,6 +912,9 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
   `proxy-auto-switch.py`、`gpt_switch_entry.py`、`gpt_stability_policy.py`、
   `named_mutex_lock.py` 到 `libexec/scripts/`；状态在 `state/node/`（锁、切换状态、
   轮记录）；日志 `logs/node-pipeline.log` / `node_ops.log` / `proxy-auto-switch.log`。
+* 源 4（西瓜加速 App）通道与上游流水线 argv 保持一致（`--from-app source4`）：macOS 上
+  无 DPAPI/ShuttleClient，通道按 `profile_missing` 优雅记失败并继续（每 app 通道独立容错，
+  永不断轮）。
 * 抓取不着急：源抓取（第 1 步）失败只记日志不阻断测量/分配；wmsxwd 源 403 期间流水线
   照常对表内既有节点工作。
 * 验收：

@@ -137,6 +137,10 @@ def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
          "--sources-env", secret,
          "--env-file", secret,
          "--fetch-proxy", "http://127.0.0.1:7890",
+         # Mirrors upstream run-node-pipeline: the source4 app channel is
+         # attempted and degrades to a logged per-channel failure on hosts
+         # without it (macOS: no DPAPI/ShuttleClient -> profile_missing).
+         "--from-app", "source4",
          "--lock-file", os.path.join(state, "node_provider.lock")],
         [sys.executable, "-m", NODE_OPS_PACKAGE,
          "--env-file", secret,
