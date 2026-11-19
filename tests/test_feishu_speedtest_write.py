@@ -220,6 +220,13 @@ class MainFlowMockClientTests(unittest.TestCase):
                 return len(records)
 
             p("replace_records", record_write)
+
+            def upsert_write(client, table_id, records, log, **kwargs):
+                events.append(table_id)
+                replaced.append((table_id, records))
+                return {"created": len(records), "updated": 0, "deleted": 0}
+
+            p("upsert_records", upsert_write)
             p("print_summary", lambda *a, **k: None)
             p("SyncLock", _StubLock)
             stdout = io.StringIO()
@@ -243,10 +250,9 @@ class MainFlowMockClientTests(unittest.TestCase):
         early, final = state["replaced"][:2]
         self.assertNotIn("存活数", early[1][0]["fields"])
         self.assertIn("存活数", final[1][0]["fields"])
-        self.assertGreaterEqual(
-            state["replaced"][2][1][0]["fields"]["同步时间"],
-            final[1][0]["fields"]["同步时间"],
-        )
+        # Tombstone clock (同步时间) is owned by the per-record builder and
+        # stamped only on valid-rate rounds (write-discipline ruling); the
+        # write order itself is asserted via events above.
 
     def test_no_speedtest_writes_sources_only(self):
         with tempfile.TemporaryDirectory() as tmp:

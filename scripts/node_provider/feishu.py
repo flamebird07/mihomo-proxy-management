@@ -348,6 +348,98 @@ def _as_number(value: Any) -> Optional[int]:
     return None
 
 
+def _row_source(fields: dict) -> str:
+    value = fields.get("来源")
+    if isinstance(value, list):
+        return "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                       for item in value).strip()
+    return str(value).strip() if value is not None else ""
+
+
+def _row_name(fields: dict) -> str:
+    value = fields.get("节点名")
+    if isinstance(value, list):
+        return "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                       for item in value).strip()
+    return str(value).strip() if value is not None else ""
+
+
+def _row_sync_ms(fields: dict) -> Optional[int]:
+    """同步时间 (epoch ms) from a Bitable date cell, or None when unreadable."""
+    value = fields.get("同步时间")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def upsert_source_rows(client: FeishuClient, table_id: str, source_number: int,
+                       records: List[dict], now_ms: int,
+                       log: Callable[[str], None]) -> int:
+    """Fetch-side write discipline (user ruling, docs/CROSS-PLATFORM.md 5).
+
+    Append new rows and update the identity columns of existing rows matched
+    by (来源, 节点名) - a collect NEVER deletes, and it does not advance the
+    tombstone clock: 同步时间 on an existing row belongs to the measuring
+    side and means "last valid rate".  New rows start the clock at creation
+    (now_ms) so a node never measured still ages out after the window.
+    """
+    if not records:
+        log(f"records upsert skipped empty_payload source={source_number}")
+        return 0
+    existing = client.list_records(table_id)
+    by_key: dict[tuple, dict] = {}
+    for row in existing:
+        rid = row.get("record_id")
+        fields = row.get("fields") or {}
+        if rid and _as_number(fields.get("源编号")) == source_number:
+            by_key[(_row_source(fields), _row_name(fields))] = row
+
+    created = 0
+    updated = 0
+    for record in records:
+        fields = dict(record.get("fields") or {})
+        key = (_row_source(fields), _row_name(fields))
+        matched = by_key.pop(key, None)
+        if matched is None:
+            fields.setdefault("同步时间", now_ms)
+            client.batch_create(table_id, [{"fields": fields}])
+            created += 1
+        else:
+            # Identity refresh only: never touch 同步时间 here.
+            fields.pop("同步时间", None)
+            client.update_record(table_id, matched["record_id"], fields)
+            updated += 1
+    log(f"records upsert source={source_number} created={created} updated={updated}")
+    return created + updated
+
+
+def tombstone_stale_rows(client: FeishuClient, table_id: str,
+                         stale_minutes: int, now_ms: int,
+                         log: Callable[[str], None]) -> int:
+    """The ONLY delete on the master table: rows whose last valid rate
+    (同步时间) is older than *stale_minutes*.  An unreadable clock keeps the
+    row (fail-closed).  Time-driven only - never payload-driven."""
+    threshold = int(stale_minutes) * 60 * 1000
+    stale: List[str] = []
+    for row in client.list_records(table_id):
+        rid = row.get("record_id")
+        if not rid:
+            continue
+        sync_ms = _row_sync_ms((row.get("fields") or {}))
+        if sync_ms is not None and (now_ms - sync_ms) > threshold:
+            stale.append(rid)
+    if not stale:
+        return 0
+    deleted = client.batch_delete(table_id, stale)
+    log(f"records tombstoned={deleted} reason=stale_no_data "
+        f"window_minutes={int(stale_minutes)}")
+    return deleted
+
+
 def replace_source_rows(client: FeishuClient, table_id: str, source_number: int,
                         records: List[dict],
                         log: Callable[[str], None]) -> int:

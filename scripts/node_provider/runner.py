@@ -12,13 +12,20 @@ mihomo controller is contacted.
 
 from __future__ import annotations
 
+import os
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import builder, collect as collect_mod, collect_state, schema
 from .envfile import EnvFileError, read_env_file
-from .feishu import FeishuError, ensure_table, replace_source_rows
+from .feishu import (
+    FeishuError,
+    ensure_table,
+    replace_source_rows,
+    tombstone_stale_rows,
+    upsert_source_rows,
+)
 from .logutil import Logger
 from .subscription import DEFAULT_FETCH_PROXY, fetch_subscription
 from .writer import OutputError, atomic_write
@@ -31,6 +38,25 @@ EXIT_PARTIAL = 5
 
 DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
 DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
+
+
+#: Master-table tombstone window (minutes).  同步时间 on the master table is
+#: the measuring side's "last valid rate" clock; a row nobody refreshed within
+#: this window is deleted by :func:`feishu.tombstone_stale_rows` - the only
+#: delete the pipeline ever performs.  ``FEISHU_STALE_NODE_MINUTES`` overrides.
+DEFAULT_STALE_NODE_MINUTES = 7 * 24 * 60
+
+
+def stale_node_window_minutes() -> int:
+    raw = os.environ.get("FEISHU_STALE_NODE_MINUTES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_STALE_NODE_MINUTES
 
 
 @dataclass
@@ -266,13 +292,13 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         logger.error(f"table write failed class={type(exc).__name__}")
         return EXIT_READ
 
-    total_created = 0
+    total_written = 0
     for source_number in sorted(grouped):
         source_records = grouped[source_number]
         try:
-            created = replace_source_rows(
+            written = upsert_source_rows(
                 client, nodes_table["table_id"], source_number,
-                source_records, logger.info)
+                source_records, stamp, logger.info)
         except FeishuError as exc:
             logger.error(f"table write failed source={source_number} "
                          f"class={exc.kind}")
@@ -281,7 +307,19 @@ def run_collect(settings: Settings, client, logger: Logger, *,
             logger.error(f"table write failed source={source_number} "
                          f"class={type(exc).__name__}")
             return EXIT_READ
-        total_created += created
+        total_written += written
 
-    logger.info(f"collect written nodes={total_created}")
+    # The ONLY delete (write-discipline ruling): time tombstone over the
+    # whole table - 同步时间 means "last valid rate", so this removes rows
+    # nobody measured for the window, never rows a payload diff dislikes.
+    try:
+        tombstone_stale_rows(
+            client, nodes_table["table_id"], stale_node_window_minutes(),
+            stamp, logger.info)
+    except FeishuError as exc:
+        logger.warn(f"tombstone skipped class={exc.kind}")
+    except Exception as exc:  # noqa: BLE001 - GC failure never fails collect
+        logger.warn(f"tombstone skipped class={type(exc).__name__}")
+
+    logger.info(f"collect written nodes={total_written}")
     return EXIT_OK

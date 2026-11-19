@@ -183,6 +183,14 @@ class FeishuClient:
 
     # -- records -----------------------------------------------------------
 
+    def update_record(self, table_id: str, record_id: str, fields: dict) -> None:
+        self.call(
+            "PUT",
+            f"/bitable/v1/apps/{self.app_token}/tables/{table_id}"
+            f"/records/{record_id}",
+            body={"fields": fields},
+        )
+
     def list_records(self, table_id: str) -> List[dict]:
         records: List[dict] = []
         page_token = ""
@@ -277,6 +285,75 @@ def ensure_tables(client: FeishuClient,
         ensure_fields(client, table_id, spec["fields"], log)
         tables[spec["key"]] = {"table_id": table_id, "name": spec["name"]}
     return tables
+
+
+def _cell_text(value) -> str:
+    if isinstance(value, list):
+        return "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                       for item in value).strip()
+    return str(value).strip() if value is not None else ""
+
+
+def _sync_ms(fields: dict):
+    value = fields.get("同步时间")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def upsert_node_rows(client, table_id: str, records: List[dict],
+                     now_ms: int, log) -> int:
+    """Measuring-side write (user ruling): update each row's measurement
+    columns in place, matched by (来源, 节点名); append rows that vanished
+    from the read (another host added them mid-round is not possible here -
+    entries come from the same table - but keeps the write total).  Never
+    deletes; 同步时间 is present on a record only when this round produced a
+    valid rate, so the clock means "last valid rate" and failed probes leave
+    the old clock untouched."""
+    existing = client.list_records(table_id)
+    by_key = {}
+    for row in existing:
+        rid = row.get("record_id")
+        fields = row.get("fields") or {}
+        if rid:
+            by_key[(_cell_text(fields.get("来源")), _cell_text(fields.get("节点名")))] = row
+    updated = 0
+    created = 0
+    for record in records:
+        fields = {k: v for k, v in (record.get("fields") or {}).items() if v is not None}
+        key = (_cell_text(fields.get("来源")), _cell_text(fields.get("节点名")))
+        matched = by_key.pop(key, None)
+        if matched is not None:
+            client.update_record(table_id, matched["record_id"], fields)
+            updated += 1
+        else:
+            fields.setdefault("同步时间", now_ms)
+            client.batch_create(table_id, [{"fields": fields}])
+            created += 1
+    log(f"records upsert updated={updated} created={created}")
+    return updated + created
+
+
+def tombstone_stale_rows(client, table_id: str, stale_minutes: int,
+                         now_ms: int, log) -> int:
+    """The ONLY delete on the master table: rows whose last valid rate
+    (同步时间) is older than *stale_minutes*.  Unreadable clock keeps the
+    row (fail-closed).  Time-driven only."""
+    threshold = int(stale_minutes) * 60 * 1000
+    stale = [row.get("record_id") for row in client.list_records(table_id)
+             if row.get("record_id")
+             and _sync_ms(row.get("fields") or {}) is not None
+             and (now_ms - _sync_ms(row.get("fields") or {})) > threshold]
+    if not stale:
+        return 0
+    deleted = client.batch_delete(table_id, stale)
+    log(f"records tombstoned={deleted} reason=stale_no_data "
+        f"window_minutes={int(stale_minutes)}")
+    return deleted
 
 
 def replace_all(client: FeishuClient, table_id: str, records: List[dict],

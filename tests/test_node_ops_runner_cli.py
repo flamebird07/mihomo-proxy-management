@@ -86,6 +86,9 @@ class FakeClient:
         self.calls.append(("batch_delete", table_id, record_ids))
         return len(record_ids)
 
+    def update_record(self, table_id, record_id, fields):
+        self.calls.append(("update_record", table_id, record_id, fields))
+
     def create_table(self, name, fields):  # pragma: no cover - not expected
         raise AssertionError("unexpected create_table")
 
@@ -152,8 +155,12 @@ class PipelineTests(unittest.TestCase):
         summary = run(settings(dry_run=False), Logger(None), client=client,
                       prober=FakeProber())
         self.assertEqual(summary.wrote_nodes, summary.collected)
+        # Write discipline: the master table is UPDATED in place (measured
+        # rows), the derived valid table is rebuilt via creates.
+        updates = [call for call in client.calls if call[0] == "update_record"]
+        self.assertEqual(len(updates), summary.collected)
         creates = [call for call in client.calls if call[0] == "batch_create"]
-        self.assertEqual({call[1] for call in creates}, {"tbl-n", "tbl-v"})
+        self.assertEqual({call[1] for call in creates}, {"tbl-v"})
         valid_rows = [call[2] for call in creates if call[1] == "tbl-v"][0]
         self.assertTrue(valid_rows)
         self.assertTrue(all("GPT可用" in row["fields"] for row in valid_rows))
@@ -164,9 +171,10 @@ class PipelineTests(unittest.TestCase):
                             测速目标="old-target", 地区检测时间=123)
         client = FakeClient(node_rows=[original])
         run(settings(dry_run=False), Logger(None), client=client, prober=FakeProber())
-        node_rows = [call[2] for call in client.calls
-                     if call[0] == "batch_create" and call[1] == "tbl-n"][0]
-        fields = node_rows[0]["fields"]
+        node_writes = [call for call in client.calls
+                       if call[0] == "update_record" and call[1] == "tbl-n"]
+        self.assertEqual(len(node_writes), 1)
+        fields = node_writes[0][3]
         for key in schema.NODES_IDENTITY_FIELDS:
             self.assertEqual(fields[key], original["fields"][key], key)
         self.assertEqual(fields["源编号"], 1)

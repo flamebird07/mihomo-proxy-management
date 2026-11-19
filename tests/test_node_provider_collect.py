@@ -388,7 +388,10 @@ class RunCollectTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertTrue(any("no nodes collected" in line for line in logger.lines))
 
-    def test_write_replaces_total_table_only(self):
+    def test_write_upserts_total_table_and_never_deletes_by_payload(self):
+        """Write-discipline ruling: collect appends/updates only.  A leftover
+        row of the same source survives the write (no 同步时间 -> the time
+        tombstone keeps it fail-closed); only a stale clock ever deletes."""
         old = [{"record_id": "old1", "fields": {"节点名": "gone", "源编号": 1}}]
         client = FakeClient(old_rows=old)
         code = run_collect(
@@ -404,9 +407,12 @@ class RunCollectTests(unittest.TestCase):
         fields = creates[0][2][0]["fields"]
         self.assertEqual(fields["来源"], "飞兔")
         self.assertEqual(fields["源编号"], 1)
+        # No payload-driven delete: the leftover row stays.
         deletes = [call for call in client.calls
                    if call[0] == "batch_delete" and call[1] == "tbl-n"]
-        self.assertEqual(deletes[0][2], ["old1"])
+        self.assertEqual(deletes, [])
+        self.assertEqual([row["fields"]["节点名"] for row in client.rows["tbl-n"]],
+                         ["gone", fields["节点名"]])
 
     def test_secrets_and_node_passwords_never_logged(self):
         logger = Logger()

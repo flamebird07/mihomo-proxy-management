@@ -13,11 +13,13 @@ The only external side effect is Feishu table replacement (disabled by
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import records, schema
+from . import feishu
 from .feishu import FeishuClient, ensure_tables, replace_all
 from .gate import evaluate_nodes, previous_passes, previous_streaks
 from .logutil import Logger
@@ -136,6 +138,25 @@ def _locate_tables(client: FeishuClient) -> Dict[str, Dict[str, str]]:
     return found
 
 
+#: Master-table tombstone window (minutes): a row nobody measured within this
+#: window is deleted (the only delete in the pipeline).  Overridable via
+#: ``FEISHU_STALE_NODE_MINUTES``; hour-accurate because 同步时间 is the
+#: measuring side's last-valid-rate clock.
+DEFAULT_STALE_NODE_MINUTES = 7 * 24 * 60
+
+
+def stale_node_window_minutes() -> int:
+    raw = os.environ.get("FEISHU_STALE_NODE_MINUTES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_STALE_NODE_MINUTES
+
+
 def run(settings: Settings, log: Logger,
         client: Optional[FeishuClient] = None,
         prober: Optional[Any] = None,
@@ -202,11 +223,17 @@ def run(settings: Settings, log: Logger,
         return summary
 
     try:
-        summary.wrote_nodes = replace_all(
-            client, nodes_table["table_id"], node_records, log.info, allow_empty=False,
+        summary.wrote_nodes = feishu.upsert_node_rows(
+            client, nodes_table["table_id"], node_records, stamp, log.info,
         )
         summary.wrote_valid = replace_all(
             client, valid_table["table_id"], valid_records, log.info, allow_empty=True,
+        )
+        # The ONLY delete (write-discipline ruling): rows with no valid rate
+        # for the window.  7 days by default, hour-accurate via 同步时间.
+        feishu.tombstone_stale_rows(
+            client, nodes_table["table_id"], stale_node_window_minutes(),
+            stamp, log.info,
         )
     except Exception as exc:
         raise RunError(f"table write failed ({type(exc).__name__})", exit_code=5) from None

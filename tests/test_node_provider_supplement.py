@@ -114,8 +114,9 @@ class SupplementTests(unittest.TestCase):
                  patch.object(runner_mod.collect_state, "read_skip_set", return_value=set()), \
                  patch.object(runner_mod, "ensure_table",
                               return_value={"table_id": "tblX"}), \
-                 patch.object(runner_mod, "replace_source_rows",
-                              side_effect=lambda _c, _t, number, rows, _l: len(rows)) as replace:
+                 patch.object(runner_mod, "tombstone_stale_rows", return_value=0), \
+                 patch.object(runner_mod, "upsert_source_rows",
+                              side_effect=lambda _c, _t, number, rows, _n, _l: len(rows)) as replace:
                 logger = runner_mod.Logger(None) if hasattr(runner_mod, "Logger") else None
                 code = runner_mod.run_collect(
                     settings, client=object(), logger=_NullLogger())
@@ -138,8 +139,9 @@ class SupplementTests(unittest.TestCase):
                  patch.object(runner_mod.collect_state, "read_skip_set", return_value=set()), \
                  patch.object(runner_mod, "ensure_table",
                               return_value={"table_id": "tblX"}), \
-                 patch.object(runner_mod, "replace_source_rows",
-                              side_effect=lambda _c, _t, number, rows, _l: len(rows)) as replace:
+                 patch.object(runner_mod, "tombstone_stale_rows", return_value=0), \
+                 patch.object(runner_mod, "upsert_source_rows",
+                              side_effect=lambda _c, _t, number, rows, _n, _l: len(rows)) as replace:
                 code = runner_mod.run_collect(
                     settings, client=object(), logger=_NullLogger())
                 self.assertEqual(code, runner_mod.EXIT_OK)
@@ -163,8 +165,9 @@ class SupplementTests(unittest.TestCase):
                               return_value={("subscription", 1)}), \
                  patch.object(runner_mod, "ensure_table",
                               return_value={"table_id": "tblX"}), \
-                 patch.object(runner_mod, "replace_source_rows",
-                              side_effect=lambda _c, _t, number, rows, _l: len(rows)) as replace:
+                 patch.object(runner_mod, "tombstone_stale_rows", return_value=0), \
+                 patch.object(runner_mod, "upsert_source_rows",
+                              side_effect=lambda _c, _t, number, rows, _n, _l: len(rows)) as replace:
                 code = runner_mod.run_collect(
                     settings, client=object(), logger=_NullLogger())
                 self.assertEqual(code, runner_mod.EXIT_OK)

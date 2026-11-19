@@ -496,7 +496,10 @@ class RunCollectStateTests(unittest.TestCase):
         node_ids = [row["record_id"] for row in client.rows["tbl-nodes"]]
         self.assertIn("s1-old", node_ids)      # skipped source untouched
         self.assertIn("s3-old", node_ids)      # other source untouched
-        self.assertNotIn("s2-old", node_ids)   # collected source (CoffeeCloud) replaced
+        # Write-discipline ruling: even the collected source's leftover row
+        # survives the write (append/update only); the time tombstone is the
+        # sole deleter and these rows carry no clock.
+        self.assertIn("s2-old", node_ids)
         self.assertTrue(any(record_id.startswith("new") for record_id in node_ids))
         created_tables = [call[1] for call in client.calls
                           if call[0] == "batch_create" and call[1] == "tbl-nodes"]

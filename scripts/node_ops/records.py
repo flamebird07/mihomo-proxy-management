@@ -107,6 +107,11 @@ def build_node_records(entries: Iterable[NodeEntry], result: ProbeResult,
             "测速目标": target_label,
             "地区检测时间": region_ms,
         })
+        if not delay:
+            # Tombstone clock = last valid rate (write-discipline ruling): a
+            # failed probe updates the measurements but must not extend the
+            # row's life.  The in-place upsert keeps the previous clock.
+            fields.pop("同步时间", None)
         records.append({"fields": fields})
     return records
 

@@ -1360,6 +1360,20 @@ class FeishuClient:
             time.sleep(0.3)
         return created
 
+    def update_records(self, table_id: str, items: list[dict]) -> int:
+        """batch_update existing rows: ``[{"record_id", "fields"}]``."""
+        updated = 0
+        for start in range(0, len(items), 100):
+            chunk = items[start:start + 100]
+            self.call(
+                "PUT",
+                f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_update",
+                body={"records": chunk},
+            )
+            updated += len(chunk)
+            time.sleep(0.3)
+        return updated
+
 
 # ---------------------------------------------------------------------------
 # Table provisioning
@@ -3198,7 +3212,11 @@ def build_node_records(pool: list[tuple[dict, str]], delays: dict[str, int | Non
                 "存活": bool(delay),
                 "测速目标": target,
                 "测速路径": "订阅 Mihomo",
-                "同步时间": sync_ms,
+                # Tombstone clock = LAST VALID RATE (user ruling): only a row
+                # measured alive this round carries 同步时间; failed rows keep
+                # their previous clock so 7 days without a measurable rate
+                # deletes them.  upsert_records stamps creates with now.
+                "同步时间": sync_ms if delay else None,
             }
         )
         records.append({"fields": fields})
@@ -3253,11 +3271,12 @@ INDEPENDENT_PATH_LABELS = frozenset({
 MAIN_PATH_LABELS = frozenset({"", "订阅 Mihomo"})
 DEFAULT_INDEPENDENT_STALE_MINUTES = 60
 INDEPENDENT_STALE_MINUTES_ENV = "FEISHU_INDEPENDENT_STALE_MINUTES"
-# Main-path rows whose 来源 is absent from this machine's payload belong to
-# another machine's source set (multi-host deployment): keep them while their
-# 同步时间 is fresh so one host's sync never wipes another host's sources.
-DEFAULT_FOREIGN_SOURCE_STALE_MINUTES = 7 * 24 * 60
-FOREIGN_SOURCE_STALE_MINUTES_ENV = "FEISHU_FOREIGN_SOURCE_STALE_MINUTES"
+# WRITE DISCIPLINE (user ruling 2026-11-20, docs/CROSS-PLATFORM.md §5):
+# fetch-side writers only APPEND/UPDATE rows - they never delete by payload
+# diff.  The ONLY deletion is the time tombstone: a row nobody refreshed for
+# this long is deleted, regardless of which host owns it.
+DEFAULT_STALE_NODE_MINUTES = 7 * 24 * 60
+STALE_NODE_MINUTES_ENV = "FEISHU_STALE_NODE_MINUTES"
 # Feishu FT_DATE_TIME numeric values are epoch milliseconds (13+ digits).
 _MS_NUMERIC_MIN = 10 ** 12
 
@@ -3279,16 +3298,16 @@ def independent_stale_minutes(raw: str | None = None) -> int:
         return DEFAULT_INDEPENDENT_STALE_MINUTES
 
 
-def foreign_source_stale_minutes(raw: str | None = None) -> int:
-    """Retention window (minutes) for main-path rows of sources absent from
-    this machine's payload.  Default 7 days: a host offline for a week stops
-    propping up its rows; unreadable overrides fall back to the default."""
-    text = (str(DEFAULT_FOREIGN_SOURCE_STALE_MINUTES)
+def stale_node_minutes(raw: str | None = None) -> int:
+    """Time-tombstone window (minutes) for shared table rows.  Default 7 days:
+    a row no writer refreshed within this window is deleted; nothing else
+    ever deletes.  Unreadable overrides fall back to the default."""
+    text = (str(DEFAULT_STALE_NODE_MINUTES)
             if raw is None else str(raw).strip())
     if raw is None:
         text = os.environ.get(
-            FOREIGN_SOURCE_STALE_MINUTES_ENV,
-            str(DEFAULT_FOREIGN_SOURCE_STALE_MINUTES),
+            STALE_NODE_MINUTES_ENV,
+            str(DEFAULT_STALE_NODE_MINUTES),
         ).strip()
     try:
         value = int(text)
@@ -3296,17 +3315,29 @@ def foreign_source_stale_minutes(raw: str | None = None) -> int:
             raise ValueError("stale minutes must be positive")
         return value
     except (TypeError, ValueError):
-        return DEFAULT_FOREIGN_SOURCE_STALE_MINUTES
+        return DEFAULT_STALE_NODE_MINUTES
 
 
-def _source_label(value: Any) -> str:
-    """Read the 来源 single-select (string) or text-chunks (list) as text."""
+def _field_text(value: Any) -> str:
+    """Read a Bitable cell (string, or text-chunks list) as plain text."""
     if isinstance(value, list):
         return "".join(
             str(item.get("text", "")) if isinstance(item, dict) else str(item)
             for item in value
         ).strip()
     return str(value).strip() if value is not None else ""
+
+
+def _node_row_key(fields: dict) -> tuple:
+    """Row identity in the shared nodes/gpt tables: (path, 来源, 节点名)."""
+    return (path_label(fields.get("测速路径")),
+            _field_text(fields.get("来源")),
+            _field_text(fields.get("节点名")))
+
+
+def _source_row_key(fields: dict) -> tuple:
+    """Row identity in the sources-status table: (源名称,)."""
+    return (_field_text(fields.get("源名称")),)
 
 
 def path_label(value: Any) -> str:
@@ -3459,29 +3490,88 @@ def log_delete_plan(log: Logger, plan: list[dict], *, phase: str) -> None:
         )
 
 
+def upsert_records(client: FeishuClient, table_id: str, records: list[dict],
+                   log: Logger, *, table_key: str,
+                   row_key=_node_row_key,
+                   now_ms: int | None = None) -> dict:
+    """Fetch-side write discipline (user ruling, docs/CROSS-PLATFORM.md 5).
+
+    * payload rows are APPENDED, or UPDATE the existing row with the same
+      identity key - a host never deletes another host's (or its own) rows
+      because its payload changed;
+    * the ONLY deletions are time-driven, never payload-driven:
+        - rows nobody refreshed within ``stale_node_minutes`` (default 7
+          days) are tombstoned - regardless of which host/source owns them;
+        - independent-path rows (Ninja Desktop / 源1独立 / 源3独立) keep their
+          own shorter freshness window (``independent_stale_minutes``);
+        - an unreadable 同步时间 keeps the row (fail-closed).
+    """
+    existing = client.list_records(table_id)
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    tombstone_ms = int(stale_node_minutes()) * 60 * 1000
+    independent_ms = int(independent_stale_minutes()) * 60 * 1000
+    nodes_table = table_key == "nodes"
+
+    existing_by_key: dict[tuple, dict] = {}
+    stale_ids: list[str] = []
+    for row in existing:
+        rid = row.get("record_id")
+        fields = row.get("fields") or {}
+        if not rid:
+            continue
+        label = path_label(fields.get("测速路径"))
+        if nodes_table and is_independent_path(label):
+            parsed, _warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
+            if parsed is not None and (now_ms - parsed) > independent_ms:
+                stale_ids.append(rid)  # ninja lifecycle, unchanged
+            continue
+        parsed, _warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
+        if parsed is not None and (now_ms - parsed) > tombstone_ms:
+            stale_ids.append(rid)  # 7-day time tombstone
+            continue
+        existing_by_key.setdefault(row_key(fields), row)
+
+    updates: list[dict] = []
+    creates: list[dict] = []
+    for record in records:
+        fields = {
+            key: value for key, value in (record.get("fields") or {}).items()
+            if value is not None  # e.g. no clock on a failed-rate round
+        }
+        key = row_key(fields)
+        matched = existing_by_key.pop(key, None)
+        if matched is not None:
+            updates.append({"record_id": matched["record_id"], "fields": fields})
+        else:
+            # New row: the tombstone clock starts at creation.
+            fields.setdefault("同步时间", now_ms)
+            creates.append({"fields": fields})
+
+    counts = {"created": 0, "updated": 0, "deleted": 0}
+    if creates:
+        counts["created"] = client.batch_create(table_id, creates)
+    if updates:
+        counts["updated"] = client.update_records(table_id, updates)
+    if stale_ids:
+        counts["deleted"] = client.batch_delete(table_id, stale_ids)
+    log.info(
+        f"upsert {table_key} created={counts['created']} "
+        f"updated={counts['updated']} tombstoned={counts['deleted']} "
+        f"reason=stale_no_data"
+    )
+    return counts
+
+
 def plan_table_deletions(existing: list[dict], records: list[dict], *,
                          preserve_ninja: bool,
                          table_key: str | None,
                          now_ms: int,
                          stale_minutes: int,
-                         log: Logger | None = None,
-                         foreign_stale_minutes: int | None = None) -> list[dict]:
-    """Plan deletions by 测速路径 ownership. Items have record_id/path/reason only.
-
-    Multi-host semantics: main-path rows whose 来源 is absent from this
-    machine's payload belong to another host's source set and are kept while
-    fresh (同步时间 within *foreign_stale_minutes*, default 7 days) - one
-    host's sync must never wipe another host's sources.  Rows with an empty
-    来源 stay owned by the writer (replaced as before).
-    """
+                         log: Logger | None = None) -> list[dict]:
+    """Plan deletions by 测速路径 ownership. Items have record_id/path/reason only."""
     plan: list[dict] = []
     threshold_ms = int(stale_minutes) * 60 * 1000
-    foreign_threshold_ms = (int(foreign_stale_minutes if foreign_stale_minutes is not None
-                                else foreign_source_stale_minutes()) * 60 * 1000)
-    payload_sources = {
-        _source_label((record.get("fields") or {}).get("来源"))
-        for record in records
-    } - {""}
     for row in existing:
         rid = row.get("record_id")
         if not rid:
@@ -3526,23 +3616,6 @@ def plan_table_deletions(existing: list[dict], records: list[dict], *,
                 item["reason"] = "empty_regions_clear_main"
                 plan.append(item)
             continue
-        source_name = _source_label(fields.get("来源"))
-        if source_name and source_name not in payload_sources:
-            # foreign-source row: another host owns this group.  Keep while
-            # fresh; unreadable 同步时间 keeps it (fail-closed, like the
-            # independent path).  Empty 来源 stays writer-owned.
-            parsed, warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
-            if warning or parsed is None:
-                if log is not None:
-                    log.warn(
-                        f"records foreign keep source={source_name} "
-                        f"reason=sync_time_{'unreadable' if parsed is None else warning}"
-                    )
-                continue
-            if (now_ms - parsed) > foreign_threshold_ms:
-                item["reason"] = "stale_foreign_source"
-                plan.append(item)
-            continue
         item["reason"] = "replaced_by_new_payload"
         plan.append(item)
     return plan
@@ -3576,7 +3649,6 @@ def replace_records(client: FeishuClient, table_id: str, records: list[dict],
         now_ms=now_ms,
         stale_minutes=stale_minutes,
         log=log,
-        foreign_stale_minutes=foreign_source_stale_minutes(),
     )
     log_delete_plan(log, plan, phase="dry-run")
     ids = [item["record_id"] for item in plan]
@@ -4101,7 +4173,9 @@ def main(argv: list[str] | None = None) -> int:
             for record in early_source_records:
                 record["fields"].pop("存活数", None)
             with hold_writer_lock(log, args.lock_file):
-                count = replace_records(client, source_table_id, early_source_records, log)
+                count = upsert_records(client, source_table_id, early_source_records, log,
+                                    table_key="sources", row_key=_source_row_key)["created"]
+                count += 0  # updates are not creates; keep the historical metric
             log.info(f"table sources rows={count} phase=subscription_fetched")
 
         # --- pool + speed test ------------------------------------------
@@ -4131,7 +4205,9 @@ def main(argv: list[str] | None = None) -> int:
             records = build_source_records(results, sync_ms)
             try:
                 with hold_writer_lock(log, args.lock_file):
-                    count = replace_records(client, source_table_id, records, log)
+                    counts = upsert_records(client, source_table_id, records, log,
+                                        table_key="sources", row_key=_source_row_key)
+                    count = counts["created"] + counts["updated"]
             except SyncError as exc:
                 log.warn(f"table sources early measured write failed class={exc.kind}")
                 return
@@ -4353,16 +4429,10 @@ def main(argv: list[str] | None = None) -> int:
                 table_id = (tables.get(key) or {}).get("table_id")
                 if not table_id:
                     raise SyncError("api_error", f"missing_table_id:{key}")
-                if key == "nodes":
-                    published_ms = int(time.time() * 1000)
-                    for record in records:
-                        record["fields"]["同步时间"] = published_ms
-                if key in ("nodes", "gpt_regions"):
-                    count = replace_records(
-                        client, table_id, records, log,
-                        preserve_ninja=True, table_key=key)
-                else:
-                    count = replace_records(client, table_id, records, log, table_key=key)
+                # The per-record builders own the tombstone clock
+                # (valid-rate rounds only); no blanket stamping here.
+                counts = upsert_records(client, table_id, records, log, table_key=key)
+                count = counts["created"] + counts["updated"]
                 log.info(f"table {key} rows={count}")
 
         if next_gpt_history is not None:

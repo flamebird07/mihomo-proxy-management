@@ -51,17 +51,30 @@
 | 本地节点补充 | App 通道（AtlasCore/Ninja/西瓜进程内存/DPAPI 缓存） | `--supplement-yaml`：`providers/nextin.yaml` + `providers/supplements/*.yaml`（任意来源文件丢入即入库总表） |
 | 已知噪音 | — | node-pipeline 末步报 `missing_group MUSE` 退出 1：mac 模板无 MUSE 组，纯日志噪音，分配/切换不受影响 |
 
-## 5. 多机共存语义（Windows + Mac 同时跑）
+## 5. 多机共存语义（Windows + Mac 同时跑）+ 写入纪律裁定
+
+**用户裁定（2026-11-20，最高优先级，覆盖此前的"按源替换/保留"实现）——两个功能互不干扰的根基：**
+
+1. **抓取侧（node_provider collect、sync 链的表写入）只有追加和更新，没有删除能力**。
+   写入 = upsert：按行身份匹配（表2/表3：测速路径+来源+节点名；表1：源名称；总表：来源+节点名），
+   命中→更新该行字段；未命中→新增。载荷差异永不触发删除——一台机器的轮次绝不可能删掉
+   另一台机器（或自己）的任何来源行。
+2. **测速/自动切换侧（node_ops、sync 链测速半边）纯读节点身份，只写测量列**：
+   速率（延迟ms）、实际地区、可不可用（存活/GPT可用/连续轮数）。
+3. **同步时间 = 时间墓碑时钟，语义是"最后一次测出有效速率的时刻"**（按小时累计）。
+   本轮测出有效速率 → 推进时钟；测不出 → 时钟不动（旧值保留，原地更新不重置）。
+   新行以创建时刻起表。抓取侧的身份更新**不推进**时钟。
+4. **删除只有一个来源：时间墓碑**。行超过 `FEISHU_STALE_NODE_MINUTES`（默认 10080 分钟
+   = 7 天，按小时精确）没有任何有效速率数据 → 删除，与载荷无关、与哪台机器无关。
+   时钟不可读 → 保留（fail-closed）。Ninja/独立路径行维持其独立的 60 分钟新鲜度窗口。
+   「有效节点」表是测速侧的派生输出，整表重建（它就是速率/可用性本身）。
+
+落地位置：sync 链 `upsert_records`；总表 `node_provider.feishu.upsert_source_rows` +
+`tombstone_stale_rows`；测量回写 `node_ops.feishu.upsert_node_rows` + 墓碑；测试锚
+`tests/test_write_discipline.py`。
 
 - **采集 24h 滚动去重**（S7）：任一机器抓过某源（成功或失败都记录），另一台 24h 内自动跳过——
   状态在飞书「采集状态」表；测速/发布不受影响，照常每小时。
-- **总表按源替换**（S5）：各机器只替换自己采集到的源，跳过日不误删其他源节点。
-- **sync 链表2/表3 按源保留**（2026-11-20，`plan_table_deletions`）：主路径行按「来源」
-  分组——载荷里有的来源整组替换；载荷里**没有**的来源（另一台机器的源集）保留到
-  「同步时间」超过保留窗（默认 7 天，`FEISHU_FOREIGN_SOURCE_STALE_MINUTES` 可调）才清理，
-  同步时间不可读时保留（fail-closed）。Windows 全量池覆盖所有来源 → 端态与旧版一致；
-  修复的问题：Windows 关机期间，Mac 的每 10 分钟同步曾把 CoffeeCloud/西瓜加速行整表
-  替换删掉。Ninja/独立路径行保留语义不变。
 - 凭据：两端可用**同一个**飞书应用（推荐）；mac 端凭据在 0600 的
   `state/subscription.env`（FEISHU_APP_ID/SECRET/BITABLE_APP_TOKEN + SUBSCRIPTION_URL*），
   缺失=报告+下周期重试，不阻塞安装。
