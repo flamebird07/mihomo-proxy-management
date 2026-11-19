@@ -60,6 +60,57 @@ function Write-ChainLog {
     }
 }
 
+# XGFIX1: capture python stderr in memory only (nothing unsanitized is
+# written to disk).  PS 5.1 trap: under $ErrorActionPreference='Stop' a
+# redirected native stderr line raises a terminating NativeCommandError,
+# so EAP is lowered only around the native call and restored in finally.
+$script:lastPythonStderr = @()
+function Invoke-PythonWithStderrCapture {
+    param([string[]]$PythonArgs)
+    $script:lastPythonStderr = @()
+    $captured = @()
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & python @PythonArgs 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                $captured += $_.ToString()
+            } else {
+                [Console]::Out.WriteLine([string]$_)
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $script:lastPythonStderr = $captured
+}
+
+# XGFIX1: extends Protect-LogText (reused unchanged) with the three stderr
+# tail shapes: credentials, ip:port, domains.  Bare IPv4 without a port and
+# hyphen-split GUIDs stay visible on purpose; timestamps cannot match the
+# ip:port rule because it requires a dotted quad before the colon.
+function Protect-StderrTailText {
+    param([string]$Text)
+    $Text = Protect-LogText $Text
+    $Text = [regex]::Replace($Text, '(?i)\bbearer\s+\S+', 'Bearer <redacted>')
+    $Text = [regex]::Replace($Text, '(?i)\b(api[_-]?key|key|access[_-]?token)\b\s*[:=]\s*\S+', '$1=<redacted>')
+    $Text = [regex]::Replace($Text, '(?i)(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])', '<redacted-hex>')
+    $Text = [regex]::Replace($Text, '(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=])', '<redacted-b64>')
+    $Text = [regex]::Replace($Text, '\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d):[1-9]\d{0,4}\b', '<ip:port>')
+    $Text = [regex]::Replace($Text, '(?i)(?<![\\/.\w-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?![a-z0-9-])', '<domain>')
+    return $Text
+}
+
+# XGFIX1: log at most the last 20 stderr lines of one failed python stage.
+function Write-StderrTail {
+    param([string]$Stage, [string[]]$Lines)
+    if ($null -eq $Lines -or $Lines.Count -eq 0) { return }
+    $first = [Math]::Max(0, $Lines.Count - 20)
+    for ($i = $first; $i -lt $Lines.Count; $i++) {
+        Write-ChainLog ('stderr tail stage=' + $Stage + ' line ' + ($i + 1) + '/' + $Lines.Count + ' ' + (Protect-StderrTailText $Lines[$i]))
+    }
+}
+
 $stage1 = Join-Path $root 'xigua-ippool.stage1.yaml'
 
 if ($Mode -eq 'production' -and [string]::IsNullOrWhiteSpace($FinalProvider)) {
@@ -82,10 +133,11 @@ $collectorArgs = @(
     '--lock', (Join-Path $root 'collector.lock'),
     '--mode', 'dry-run'
 )
-& python @collectorArgs
+Invoke-PythonWithStderrCapture $collectorArgs
 $collectorExit = $LASTEXITCODE
 $poolExit = $collectorExit
 Write-ChainLog "stage collector exit=$collectorExit"
+if ($collectorExit -ne 0) { Write-StderrTail -Stage 'collector' -Lines $script:lastPythonStderr }
 
 $healthExit = $null
 $stage2Output = if ($Mode -eq 'production') {
@@ -107,10 +159,11 @@ if ($collectorExit -eq 0 -and $needsE2E) {
         '--workers', [string]$Workers
     )
     foreach ($url in $Target) { $healthArgs += @('--target', $url) }
-    & python @healthArgs
+    Invoke-PythonWithStderrCapture $healthArgs
     $healthExit = $LASTEXITCODE
     $poolExit = $healthExit
     Write-ChainLog "stage health exit=$healthExit"
+    if ($healthExit -ne 0) { Write-StderrTail -Stage 'health' -Lines $script:lastPythonStderr }
 } else {
     Write-ChainLog 'stage health skipped'
 }
@@ -125,9 +178,10 @@ $feishuArgs = @(
     '--lock', (Join-Path $root 'feishu-sync.lock')
 )
 if ($Mode -eq 'production') { $feishuArgs += @('--final-provider', $stage2Output) }
-& python @feishuArgs
+Invoke-PythonWithStderrCapture $feishuArgs
 $feishuExit = $LASTEXITCODE
 Write-ChainLog "stage feishu exit=$feishuExit"
+if ($feishuExit -ne 0) { Write-StderrTail -Stage 'feishu' -Lines $script:lastPythonStderr }
 
 Write-Output "POOL_RESULT collector=$collectorExit final=$poolExit"
 Write-Output "FEISHU_RESULT exit=$feishuExit"

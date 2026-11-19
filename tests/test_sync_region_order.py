@@ -535,12 +535,26 @@ class CorpseCleanupTests(unittest.TestCase):
             self.assertEqual([p.name for p in stale], ["mihomo-feishu-old"])
 
     def test_macos_cleanup_does_not_scan_or_signal_system_processes(self):
-        with patch.object(sync.sys, "platform", "darwin"), \
+        """darwin-safety under the upstream owner.json design: cleanup never
+        inspects or signals processes on any platform, so a launchd system job
+        can never kill another user's process by directory-name substring."""
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as root, \
+             patch.object(sync.sys, "platform", "darwin"), \
              patch.object(sync.subprocess, "run") as run, \
              patch.object(sync.os, "kill") as kill:
-            self.assertEqual(sync._kill_corpse_processes(RecordingLog()), 0)
+            stale_dir = Path(root) / "mihomo-feishu-old"
+            stale_dir.mkdir()
+            past = time.time() - 7200
+            os.utime(stale_dir, (past, past))
+            procs, dirs = sync.cleanup_temp_corpses(RecordingLog(), temp_roots=[root])
+            self.assertEqual(procs, 0)
+            # no owner.json -> fail-closed: kept, never removed, never signalled
+            self.assertEqual(dirs, 0)
+            self.assertTrue(stale_dir.exists())
         run.assert_not_called()
         kill.assert_not_called()
+        self.assertFalse(hasattr(sync, "_kill_corpse_processes"))
 
     def test_cleanup_removes_stale_keeps_production(self):
         import tempfile as _tempfile
@@ -551,15 +565,22 @@ class CorpseCleanupTests(unittest.TestCase):
             for d in (old_dir, fresh_dir, prod):
                 d.mkdir()
                 (d / "config.yaml").write_text("x", encoding="utf-8")
+            # Stale + proven-dead owner (nonexistent pid) may be deleted.
+            # Process count is always 0; the kill helper no longer exists.
+            (old_dir / "owner.json").write_text(
+                json.dumps({"pid": 1_999_999_999, "create_time": 1.0}),
+                encoding="utf-8",
+            )
             past = time.time() - 7200
             os.utime(old_dir, (past, past))
             log = RecordingLog()
-            with patch.object(sync, "_kill_corpse_processes", lambda _log: 2):
-                procs, dirs = sync.cleanup_temp_corpses(log, temp_roots=[root])
-            self.assertEqual((procs, dirs), (2, 1))
+            procs, dirs = sync.cleanup_temp_corpses(log, temp_roots=[root])
+            self.assertEqual(procs, 0)
+            self.assertEqual(dirs, 1)
             self.assertFalse(old_dir.exists())
             self.assertTrue(fresh_dir.exists())
             self.assertTrue(prod.exists())
+            self.assertFalse(hasattr(sync, "_kill_corpse_processes"))
 
 
 class Stage2BFlagTests(unittest.TestCase):
