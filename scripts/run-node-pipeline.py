@@ -17,7 +17,8 @@ PRODUCTION_PROVIDER = r"C:\mihomo\providers\node-valid.yaml"
 
 STEPS = [
     [sys.executable, "-m", "node_provider", "--collect",
-     "--sources-env", str(ROOT / "config" / "subscription.env")],
+     "--sources-env", str(ROOT / "config" / "subscription.env"),
+     "--from-app", "source4"],
     [sys.executable, "-m", "node_ops"],
     [sys.executable, "-m", "node_provider", "--output", PRODUCTION_PROVIDER],
 ]
