@@ -80,8 +80,14 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(first)
 
     def test_install_never_writes_outside_the_sandbox_root(self) -> None:
+        # A host that already runs a real installation keeps those paths; the
+        # invariant under test is that a SANDBOX install never *creates* them.
+        paths = ("/etc/" + "mihomo-proxy-management", "/usr/local/bin/mihomo-proxy-management")
+        preexisting = {path: os.path.exists(path) for path in paths}
         self.sb.installed()
-        for path in ("/etc/" + "mihomo-proxy-management", "/usr/local/bin/mihomo-proxy-management"):
+        for path in paths:
+            if preexisting[path]:
+                continue  # cannot observe creation on an already-installed host
             self.assertFalse(os.path.exists(path), f"host path touched: {path}")
 
     def test_install_without_secret_fails_closed(self) -> None:

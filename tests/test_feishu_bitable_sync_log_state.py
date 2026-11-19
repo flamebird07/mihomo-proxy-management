@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -138,12 +139,23 @@ class BatEntrypointTests(unittest.TestCase):
                     return line.split(">>", 1)[1].split()[0].strip().strip('"')
         self.fail(f"no redirect line for {needle!r} in {BAT}")
 
+    @staticmethod
+    def bat_redirect_basename(needle):
+        """File name of a bat redirect target.
+
+        The bat is a Windows artifact: its targets may carry a
+        ``%ENV%\`` prefix and always use backslashes, so the name must be
+        taken with PureWindowsPath - ``os.path.basename`` silently returns
+        the whole string on POSIX hosts.
+        """
+        target = BatEntrypointTests.bat_redirect_for(BatEntrypointTests(), needle)
+        return pathlib.PureWindowsPath(target).name.lower()
+
     def test_sync_stdout_does_not_share_the_logger_log_file(self):
-        redirected = self.bat_redirect_for("sync-feishu-bitable.py")
-        self.assertNotEqual(os.path.basename(redirected).lower(),
+        redirected = self.bat_redirect_basename("sync-feishu-bitable.py")
+        self.assertNotEqual(redirected,
                             os.path.basename(sync.DEFAULT_LOG_FILE).lower())
-        self.assertEqual(os.path.basename(redirected).lower(),
-                         "feishu-bitable-sync.stdout.log")
+        self.assertEqual(redirected, "feishu-bitable-sync.stdout.log")
 
     def test_sync_and_auto_switch_stdout_logs_are_distinct(self):
         self.assertNotEqual(self.bat_redirect_for("sync-feishu-bitable.py"),

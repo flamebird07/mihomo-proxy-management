@@ -622,6 +622,45 @@ def _read_lock_meta(path: str) -> tuple[int, str, str]:
     return pid, ts, token
 
 
+def _mutex_flock_path(mutex_name: str) -> str:
+    """Deterministic flock file for a Windows-style ``Local\\name``.
+
+    Mirrors ``named_mutex_lock.posix_lock_path`` (inline so this script stays
+    standalone when installed without its siblings).
+    """
+    import re as _re
+    import tempfile as _tempfile
+
+    safe = _re.sub(r"[^A-Za-z0-9._-]+", "_", mutex_name or "").strip("_") or "sync-mutex"
+    directory = os.environ.get("NAMED_MUTEX_LOCK_DIR") or _tempfile.gettempdir()
+    return os.path.join(directory, f".{safe}.lock")
+
+
+def _acquire_mutex_flock(mutex_name: str, timeout_ms: int) -> int:
+    """Take the name-scoped advisory flock, or raise SyncError lock_busy.
+
+    On Windows the named mutex is the exclusion scope (kernel object keyed by
+    ``mutex_name``); this flock is its POSIX counterpart so two SyncLocks with
+    the same name exclude each other even when their metadata lock files live
+    at different paths.  The kernel releases the lock when the holder dies.
+    timeout_ms=0 is the historical zero-wait poll.
+    """
+    import fcntl
+
+    path = _mutex_flock_path(mutex_name)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise SyncError("lock_busy", "mutex_flock_timeout") from None
+            time.sleep(0.2)
+
+
 class SyncLock:
     """Single-instance lock with explicit, token-checked ownership.
 
@@ -637,6 +676,7 @@ class SyncLock:
         self.token = secrets.token_hex(8)
         self.fd: int | None = None      # POSIX: lock file fd
         self.mutex: int | None = None   # Windows: named mutex handle
+        self.mutex_fd: int | None = None  # POSIX: name-scoped flock fd
         self.held = False
 
     # -- helpers ---------------------------------------------------------
@@ -717,6 +757,14 @@ class SyncLock:
         self._write_meta()
 
     def _acquire_file(self) -> None:
+        self.mutex_fd = _acquire_mutex_flock(self.mutex_name, self.timeout_ms)
+        try:
+            self._acquire_file_locked()
+        except BaseException:
+            self._release_mutex_flock()
+            raise
+
+    def _acquire_file_locked(self) -> None:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
@@ -754,6 +802,20 @@ class SyncLock:
             return
         raise SyncError("lock_busy", "reacquire_failed")
 
+    def _release_mutex_flock(self) -> None:
+        if self.mutex_fd is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(self.mutex_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(self.mutex_fd)
+            self.mutex_fd = None
+
     # -- release ---------------------------------------------------------
     def release(self) -> None:
         if self.fd is None and self.mutex is None:
@@ -766,6 +828,7 @@ class SyncLock:
             with contextlib.suppress(OSError):
                 os.close(self.fd)
             self.fd = None
+        self._release_mutex_flock()
 
         # Unlink only while we still own the mutex, only if this object held the
         # lock, and only if the file still carries OUR token. A missing or
@@ -871,10 +934,48 @@ def _unix_from_process_handle(k32: Any, handle: Any) -> float | None:
     return _filetime_to_unix(creation)
 
 
+def _posix_process_create_time(pid: int) -> float | None:
+    """Process start time on POSIX hosts, or None when unreadable.
+
+    Linux ``ps`` answers ``-o etimes=`` in seconds directly; BSD/macOS ps
+    lacks ``etimes``, so its ``etime=`` wall string (``[d-]hh:mm:ss`` or
+    ``mm:ss``) is parsed instead.  Unreadable stays None - every caller is
+    fail-closed on an unknown create time.
+    """
+    try:
+        probed = subprocess.run(
+            ["ps", "-o", "etimes=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        text = (probed.stdout or "").strip()
+        if text.isdigit():
+            return time.time() - int(text)
+        probed = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        text = (probed.stdout or "").strip()
+        if not text:
+            return None
+        days = 0
+        if "-" in text:
+            days_text, text = text.split("-", 1)
+            days = int(days_text)
+        parts = [int(part) for part in text.split(":")]
+        if not parts or len(parts) > 3 or len(text.split(":")) > 3:
+            return None
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        hours, minutes, seconds = parts
+        return time.time() - (days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    except Exception:
+        return None
+
+
 def current_process_create_time() -> float | None:
     """Unix timestamp of this process's creation, or None if unreadable."""
     if sys.platform != "win32":
-        return None
+        return _posix_process_create_time(os.getpid())
     k32 = _kernel32()
     return _unix_from_process_handle(k32, k32.GetCurrentProcess())
 
@@ -896,7 +997,13 @@ def query_owner_process(pid: int) -> tuple[str, float | None]:
             return "missing", None
         except OSError:
             return "undetermined", None
-        return "undetermined", None
+        # Alive: an unreadable create time stays fail-closed (undetermined),
+        # otherwise ("opened", ts) enables the same pid-reuse detection the
+        # Windows branch has.
+        created = _posix_process_create_time(pid)
+        if created is None:
+            return "undetermined", None
+        return "opened", created
     import ctypes
 
     k32 = _kernel32()

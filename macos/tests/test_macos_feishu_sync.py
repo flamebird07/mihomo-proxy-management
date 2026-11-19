@@ -386,9 +386,9 @@ def test_save_secrets_derives_subscription_url_1_and_preserves_feishu_keys(tmp_p
     os.makedirs(layout.state_dir, exist_ok=True)
     _write_secret_file(
         layout,
-        app_id="FEISHU_APP_ID=cli_existing",
-        app_secret="FEISHU_APP_SECRET=existing_secret",
-        token="FEISHU_BITABLE_APP_TOKEN=existing_token",
+        app_id="FEISHU_APP_ID=cli_fake_existing",
+        app_secret="FEISHU_APP_SECRET=fake_kept_secret",
+        token="FEISHU_BITABLE_APP_TOKEN=fake_kept_token",
     )
     secrets = lifecycle.Secrets(
         subscription_url=SECRET_URL, controller_secret=SECRET_VALUE, interval_minutes=60
@@ -397,9 +397,9 @@ def test_save_secrets_derives_subscription_url_1_and_preserves_feishu_keys(tmp_p
 
     values = lifecycle.parse_env(Path(layout.secret_file).read_text(encoding="utf-8"))
     assert values["SUBSCRIPTION_URL_1"] == SECRET_URL
-    assert values["FEISHU_APP_ID"] == "cli_existing"
-    assert values["FEISHU_APP_SECRET"] == "existing_secret"
-    assert values["FEISHU_BITABLE_APP_TOKEN"] == "existing_token"
+    assert values["FEISHU_APP_ID"] == "cli_fake_existing"
+    assert values["FEISHU_APP_SECRET"] == "fake_kept_secret"
+    assert values["FEISHU_BITABLE_APP_TOKEN"] == "fake_kept_token"
     assert values["SUBSCRIPTION_URL"] == SECRET_URL
     assert_posix_mode(layout.secret_file, 0o600)
 
@@ -408,12 +408,12 @@ def test_save_secrets_derives_subscription_url_1_and_preserves_feishu_keys(tmp_p
         subscription_url=SECRET_URL,
         controller_secret=SECRET_VALUE,
         interval_minutes=60,
-        feishu_app_id="cli_new",
+        feishu_app_id="cli_fake_new",
     )
     lifecycle.save_secrets(layout, updated)
     values = lifecycle.parse_env(Path(layout.secret_file).read_text(encoding="utf-8"))
-    assert values["FEISHU_APP_ID"] == "cli_new"
-    assert values["FEISHU_APP_SECRET"] == "existing_secret"
+    assert values["FEISHU_APP_ID"] == "cli_fake_new"
+    assert values["FEISHU_APP_SECRET"] == "fake_kept_secret"
 
 
 def test_load_secrets_reads_feishu_keys_from_env_and_file(tmp_path):
@@ -421,13 +421,13 @@ def test_load_secrets_reads_feishu_keys_from_env_and_file(tmp_path):
     os.makedirs(layout.state_dir, exist_ok=True)
     _write_secret_file(
         layout,
-        app_id="FEISHU_APP_ID=cli_file",
-        app_secret="FEISHU_APP_SECRET=file_secret",
-        token="FEISHU_BITABLE_APP_TOKEN=file_token",
+        app_id="FEISHU_APP_ID=cli_fake_file",
+        app_secret="FEISHU_APP_SECRET=fake_file_secret",
+        token="FEISHU_BITABLE_APP_TOKEN=fake_file_token",
     )
     secrets = lifecycle.load_secrets(layout, environ={}, system_profile=False)
-    assert secrets.feishu_app_id == "cli_file"
-    assert secrets.feishu_bitable_app_token == "file_token"
+    assert secrets.feishu_app_id == "cli_fake_file"
+    assert secrets.feishu_bitable_app_token == "fake_file_token"
 
     secrets = lifecycle.load_secrets(
         layout,
@@ -435,7 +435,7 @@ def test_load_secrets_reads_feishu_keys_from_env_and_file(tmp_path):
         system_profile=False,
     )
     assert secrets.feishu_app_id == "cli_env"
-    assert secrets.feishu_bitable_app_token == "file_token"
+    assert secrets.feishu_bitable_app_token == "fake_file_token"
 def test_xigua_schedule_is_opt_in_and_removed_with_its_source(tmp_path, monkeypatch):
     ctx = make_context(tmp_path)
     layout = ctx.layout

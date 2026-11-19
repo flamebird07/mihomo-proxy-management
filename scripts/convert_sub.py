@@ -150,6 +150,16 @@ def _p(params: Dict[str, List[str]], key: str, default: Optional[str] = None) ->
     return values[0]
 
 
+def _masked_endpoint(proxy: Dict[str, Any]) -> str:
+    """``***.example.invalid:<port>`` - the port is safe, the host never is."""
+    port = proxy.get("port")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 0
+    return f"***.example.invalid:{port}"
+
+
 def _safe_type(value: Any) -> str:
     # Even a bare name or unknown type may be an upstream credential.
     allowed = KNOWN_PROXY_TYPES | set(URI_SCHEMES) | set(SINGBOX_TYPES) | NON_NODE_TYPES
@@ -1241,6 +1251,9 @@ Examples:
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
     parser.add_argument("--user-agent", default=None,
                         help=f"HTTP User-Agent (default: {DEFAULT_USER_AGENT})")
+    parser.add_argument("--show-endpoints", action="store_true",
+                        help="With --list, also print each node's endpoint as a masked "
+                             "placeholder (***.example.invalid:port); real hosts never appear")
     parser.add_argument("--skip-unknown", action="store_true",
                         help="Explicitly drop nodes whose type is not recognised (counted)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode")
@@ -1301,7 +1314,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.list:
             for index, proxy in enumerate(proxies):
-                print(f"node#{index + 1} [{_safe_type(proxy.get('type'))}]")
+                line = f"node#{index + 1} [{_safe_type(proxy.get('type'))}]"
+                if getattr(args, "show_endpoints", False):
+                    line += f" {_masked_endpoint(proxy)}"
+                print(line)
         else:
             if args.merge:
                 output, added = merge_into_yaml(proxies, args.merge)

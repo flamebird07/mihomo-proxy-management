@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import os
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -485,6 +486,8 @@ class Win32TerminateIfOwnImageTests(unittest.TestCase):
         return [args[0] for call_name, args in k32.calls if call_name == name]
 
     def test_module_kernel32_ctypes_signatures(self):
+        if os.name != "nt":
+            self.skipTest("kernel32 signatures are Windows-only (module.kernel32 is None on POSIX)")
         k32 = module.kernel32
         self.assertIsNotNone(k32)
         from ctypes import wintypes

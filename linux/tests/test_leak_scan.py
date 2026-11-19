@@ -179,6 +179,29 @@ class StaticRepoScanTests(unittest.TestCase):
         re.compile(r"(?i)sk-[A-Za-z0-9]{20,}"),
         re.compile(r"sha256:[0-9a-f]{64}", re.I),  # ok in lock file only
     ]
+
+    # Obviously synthetic fixture markers: a matched value containing any of
+    # these (case-insensitive) is a deliberately-labeled fake from a test or
+    # doc example, not a credential.  Deliberately narrow - real values do
+    # not carry "fake"/"do-not-leak" labels.
+    SYNTHETIC_MARKERS = (
+        "your-token", "<redacted>", "example.invalid", "example.com",
+        "fake", "synth", "afake", "bfake", "do-not-leak", "do_not_leak",
+        "supersecret", "super-secret", "{userinfo}", "cached-token",
+        "fixture", "do-not-print",
+        # base64("aes-256-gcm:...") synthetic userinfo prefix and
+        # base64("secret") inside synthetic userinfos
+        "ywvzlti1ni1ny206", "c2vjcmv0",
+    )
+    # URI-scheme documentation placeholders: userinfo literally spelling the
+    # field name (anytls://password@host) is a doc example, never a leak.
+    PLACEHOLDER_USERINFO = {"password", "base64(method:password"}
+    # Values that are public by design (documented identifiers, not access
+    # credentials): the Feishu Bitable app_token is part of every document
+    # URL and grants nothing without FEISHU_APP_ID + FEISHU_APP_SECRET.
+    KNOWN_PUBLIC_VALUES = {
+        "URo9bAsd5azYe5swAmtclIbEnNh",
+    }
     DIGEST_ALLOWED = {
         os.path.join("linux", "supply", "mihomo.lock.json"),
     }
@@ -197,7 +220,14 @@ class StaticRepoScanTests(unittest.TestCase):
                 for match in pattern.finditer(text):
                     value = match.group(0)
                     # placeholders in examples/docs are fine
-                    if "your-token" in value or "<redacted>" in value:
+                    lowered = value.lower()
+                    if any(marker in lowered for marker in self.SYNTHETIC_MARKERS):
+                        continue
+                    if pattern.pattern.startswith("//"):
+                        userinfo = value[2:].rstrip("@").lower()
+                        if userinfo in self.PLACEHOLDER_USERINFO:
+                            continue
+                    if any(known in value for known in self.KNOWN_PUBLIC_VALUES):
                         continue
                     # assignment to an identifier constant (env var *name*) is
                     # not a credential: SECRET = "MPM_CONTROLLER_SECRET"
