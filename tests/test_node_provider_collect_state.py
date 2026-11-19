@@ -5,6 +5,7 @@ All clients are synthetic: no network, no real Feishu, no file state.
 
 import os
 import sys
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -250,7 +251,40 @@ class RecordSuccessTests(unittest.TestCase):
                             for line in logger.lines))
 
 
+class SuccessEntryNumberingTests(unittest.TestCase):
+    def test_subscription_entry_uses_env_slot_source_number(self):
+        result = types.SimpleNamespace(
+            per_channel={"subscription:CoffeeCloud": 5, "subscription:飞兔": 3})
+        entries = collect_state.success_entries(result)
+        self.assertEqual(entries, [
+            (2, "CoffeeCloud", "subscription", 5),
+            (1, "飞兔", "subscription", 3),
+        ])
+
+    def test_app_entry_uses_renumbered_app_source(self):
+        result = types.SimpleNamespace(
+            per_channel={"app:source4": 7, "app:source3": 2})
+        entries = collect_state.success_entries(result)
+        self.assertEqual(entries, [
+            (2, "CoffeeCloud", "app", 2),
+            (3, "西瓜加速", "app", 7),
+        ])
+
+
 class CollectSkipTests(unittest.TestCase):
+    def test_skipped_subscription_by_renumbered_key(self):
+        calls = []
+
+        def fetch(url, ua, timeout):
+            calls.append(url)
+            return URI_ONE
+
+        result = collect.collect(
+            ENV_1_3, fetcher=fetch, skip={("subscription", 2)})
+        self.assertNotIn(ENV_1_3["SUBSCRIPTION_URL_3"], calls)
+        self.assertIn(ENV_1_3["SUBSCRIPTION_URL_1"], calls)
+        self.assertIn("subscription:CoffeeCloud", result.skipped)
+
     def test_skipped_subscription_is_not_fetched(self):
         calls = []
 
@@ -390,8 +424,8 @@ class RunCollectStateTests(unittest.TestCase):
     def test_partial_skip_replaces_only_collected_source(self):
         node_rows = [
             {"record_id": "s1-old", "fields": {"源编号": 1, "节点名": "keep1"}},
-            {"record_id": "s2-old", "fields": {"源编号": "2", "节点名": "keep2"}},
-            {"record_id": "s3-old", "fields": {"源编号": 3, "节点名": "old3"}},
+            {"record_id": "s2-old", "fields": {"源编号": "2", "节点名": "old2"}},
+            {"record_id": "s3-old", "fields": {"源编号": 3, "节点名": "keep3"}},
         ]
         client = TableClient(node_rows=node_rows, state_rows=[state_row(1)])
         code = run_collect(
@@ -401,24 +435,26 @@ class RunCollectStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         node_ids = [row["record_id"] for row in client.rows["tbl-nodes"]]
         self.assertIn("s1-old", node_ids)      # skipped source untouched
-        self.assertIn("s2-old", node_ids)      # other source untouched
-        self.assertNotIn("s3-old", node_ids)   # collected source replaced
+        self.assertIn("s3-old", node_ids)      # other source untouched
+        self.assertNotIn("s2-old", node_ids)   # collected source (CoffeeCloud) replaced
         self.assertIn("new1", node_ids)
         created_tables = [call[1] for call in client.calls
                           if call[0] == "batch_create" and call[1] == "tbl-nodes"]
         self.assertEqual(set(created_tables), {"tbl-nodes"})
         for call in client.calls:
             if call[0] == "batch_create" and call[1] == "tbl-nodes":
-                self.assertEqual({r["fields"]["源编号"] for r in call[2]}, {3})
+                self.assertEqual({r["fields"]["源编号"] for r in call[2]}, {2})
+                self.assertEqual({r["fields"]["来源"] for r in call[2]},
+                                 {"CoffeeCloud"})
         state_rows = client.rows["tbl-state"]
         keys = {(r["fields"]["通道"], r["fields"]["源编号"]) for r in state_rows}
         self.assertIn(("subscription", 1), keys)   # pre-existing today row
-        self.assertIn(("subscription", 3), keys)   # newly recorded
+        self.assertIn(("subscription", 2), keys)   # newly recorded (CoffeeCloud)
         self.assertFalse(any(r["fields"]["最近读取时间"] == YESTERDAY_MS
                              for r in state_rows))
 
     def test_failed_source_does_not_record_state(self):
-        node_rows = [{"record_id": "s2-old", "fields": {"源编号": 2}}]
+        node_rows = [{"record_id": "s3-old", "fields": {"源编号": 3}}]
         client = TableClient(node_rows=node_rows, state_rows=[])
         code = run_collect(
             settings(), client, Logger(), env_values=ENV_1_3,
@@ -427,8 +463,8 @@ class RunCollectStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         state_keys = {(r["fields"]["通道"], r["fields"]["源编号"])
                       for r in client.rows["tbl-state"]}
-        self.assertEqual(state_keys, {("subscription", 3)})
-        self.assertIn("s2-old", [r["record_id"] for r in client.rows["tbl-nodes"]])
+        self.assertEqual(state_keys, {("subscription", 2)})
+        self.assertIn("s3-old", [r["record_id"] for r in client.rows["tbl-nodes"]])
 
     def test_dry_run_zero_write_and_keeps_rows(self):
         node_rows = [{"record_id": "s1-old", "fields": {"源编号": 1}}]

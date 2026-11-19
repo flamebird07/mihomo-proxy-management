@@ -38,10 +38,10 @@ FT_CHECKBOX = 7
 DATE_PROPERTY: dict[str, Any] = {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}
 NUMBER_PROPERTY: dict[str, Any] = {"formatter": "0"}
 
-SOURCE_OPTIONS = ("飞兔", "星辰", "CoffeeCloud", "西瓜加速", "未知")
+SOURCE_OPTIONS = ("飞兔", "CoffeeCloud", "西瓜加速", "未知")
 REGION_GROUP_OPTIONS = ("美国", "新加坡", "日本", "其他", "未知")
 
-SOURCE_BY_INDEX = {1: "飞兔", 2: "星辰", 3: "CoffeeCloud", 4: "西瓜加速"}
+SOURCE_BY_INDEX = {1: "飞兔", 2: "CoffeeCloud", 3: "西瓜加速"}
 
 NODES_TABLE_KEY = "nodes"
 NODES_TABLE_NAME = "节点测速总表"

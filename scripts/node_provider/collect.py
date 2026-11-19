@@ -116,13 +116,13 @@ def _collect_subscription(env_values: Dict[str, str], timeout: int,
                           skip: Optional[set] = None) -> List[CollectedNode]:
     nodes: List[CollectedNode] = []
     settings_by_index = source_settings(env_values)
-    for index in range(1, 4):
-        source = schema.SOURCE_BY_INDEX[index]
-        if skip and ("subscription", index) in skip:
+    for slot, number in sorted(schema.SUBSCRIPTION_SOURCE_BY_ENV_SLOT.items()):
+        source = schema.SOURCE_BY_INDEX[number]
+        if skip and ("subscription", number) in skip:
             warn(f"source={source} skipped reason=read_today")
             result.skipped.append(f"subscription:{source}")
             continue
-        info = settings_by_index.get(str(index))
+        info = settings_by_index.get(str(slot))
         if info is None:
             warn(f"source={source} skipped reason=no_url")
             continue
@@ -152,7 +152,7 @@ def _collect_subscription(env_values: Dict[str, str], timeout: int,
             warn(f"source={source} failed class={type(exc).__name__.lower()}")
             continue
         result.per_channel[f"subscription:{source}"] = len(parsed)
-        nodes.extend(CollectedNode(config=node, source=source, source_number=index)
+        nodes.extend(CollectedNode(config=node, source=source, source_number=number)
                      for node in parsed)
         warn(f"source={source} collected={len(parsed)}")
     return nodes

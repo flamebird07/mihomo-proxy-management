@@ -130,6 +130,14 @@ def settings(**kwargs):
 
 
 class SubscriptionChannelTests(unittest.TestCase):
+    def test_renumbered_source_maps(self):
+        self.assertEqual(schema.SOURCE_BY_INDEX,
+                         {1: "飞兔", 2: "CoffeeCloud", 3: "西瓜加速"})
+        self.assertEqual(schema.SUBSCRIPTION_SOURCE_BY_ENV_SLOT, {1: 1, 3: 2})
+        self.assertEqual(app_extract.APP_SOURCE_NUMBER,
+                         {"source1": 1, "source3": 2, "source4": 3})
+        self.assertNotIn(2, schema.SUBSCRIPTION_SOURCE_BY_ENV_SLOT)
+
     def test_subscription_records_have_source_number_and_defaults(self):
         env = {"SUBSCRIPTION_URL_1": ENV["SUBSCRIPTION_URL_1"],
                "SUBSCRIPTION_URL_3": ENV["SUBSCRIPTION_URL_3"]}
@@ -143,7 +151,7 @@ class SubscriptionChannelTests(unittest.TestCase):
         self.assertEqual(by_name["us-01"].source, "飞兔")
         self.assertEqual(by_name["us-01"].source_number, 1)
         self.assertEqual(by_name["sg-01"].source, "CoffeeCloud")
-        self.assertEqual(by_name["sg-01"].source_number, 3)
+        self.assertEqual(by_name["sg-01"].source_number, 2)
 
         records = collect.build_records(result.nodes, 1_700_000_000_000)
         fields = records[0]["fields"]
@@ -159,11 +167,25 @@ class SubscriptionChannelTests(unittest.TestCase):
     def test_empty_body_is_failed_not_raised(self):
         result = collect.collect(
             ENV, fetcher=fetcher_map({ENV["SUBSCRIPTION_URL_1"]: YAML_ONE,
-                                      ENV["SUBSCRIPTION_URL_2"]: "   \n"}),
+                                      ENV["SUBSCRIPTION_URL_3"]: "   \n"}),
         )
         self.assertEqual(result.collected, 1)
-        self.assertIn("subscription:星辰", result.failed)
+        self.assertIn("subscription:CoffeeCloud", result.failed)
         self.assertEqual(result.nodes[0].source, "飞兔")
+
+    def test_slot2_is_never_read(self):
+        calls = []
+
+        def fetch(url, ua, timeout):
+            calls.append(url)
+            return YAML_ONE
+
+        result = collect.collect(ENV, fetcher=fetch)
+        self.assertNotIn(ENV["SUBSCRIPTION_URL_2"], calls)
+        self.assertEqual(sorted(calls), sorted([ENV["SUBSCRIPTION_URL_1"],
+                                                ENV["SUBSCRIPTION_URL_3"]]))
+        self.assertNotIn("星辰", " ".join(result.per_channel))
+        self.assertNotIn("星辰", " ".join(result.failed))
 
     def test_http_403_is_failed_not_raised(self):
         def fetch(url, ua, timeout):
@@ -172,12 +194,12 @@ class SubscriptionChannelTests(unittest.TestCase):
             raise SubscriptionError("HTTP error 403 (URL redacted)", "http")
         result = collect.collect(ENV, fetcher=fetch)
         self.assertEqual(result.collected, 1)
-        self.assertEqual(len(result.failed), 2)
+        self.assertEqual(result.failed, ["subscription:CoffeeCloud"])
 
     def test_all_subscription_failures_yield_empty_result(self):
         result = collect.collect(ENV, fetcher=fetcher_map({}))
         self.assertEqual(result.collected, 0)
-        self.assertEqual(len(result.failed), 3)
+        self.assertEqual(len(result.failed), 2)
 
     def test_transient_network_error_retried_then_succeeds(self):
         calls = []
@@ -207,8 +229,8 @@ class SubscriptionChannelTests(unittest.TestCase):
         with patch.object(collect.time, "sleep"):
             result = collect.collect(ENV, fetcher=fetch)
         self.assertEqual(result.collected, 0)
-        self.assertEqual(len(calls), 3 * (collect.SUBSCRIPTION_RETRIES + 1))
-        self.assertEqual(len(result.failed), 3)
+        self.assertEqual(len(calls), 2 * (collect.SUBSCRIPTION_RETRIES + 1))
+        self.assertEqual(len(result.failed), 2)
 
     def test_http_error_is_not_retried(self):
         calls = []
@@ -222,7 +244,7 @@ class SubscriptionChannelTests(unittest.TestCase):
         with patch.object(collect.time, "sleep") as sleep:
             result = collect.collect(ENV, fetcher=fetch)
         self.assertEqual(result.collected, 1)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 2)
         sleep.assert_not_called()
 
 
