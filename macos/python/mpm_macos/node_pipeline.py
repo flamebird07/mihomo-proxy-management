@@ -141,6 +141,10 @@ def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
          # attempted and degrades to a logged per-channel failure on hosts
          # without it (macOS: no DPAPI/ShuttleClient -> profile_missing).
          "--from-app", "source4",
+         # source-1 supplement (e.g. the extracted Nextin/wmsxwd nodes): the
+         # host's own nodes enter the shared table even when the slot-1
+         # subscription fetch is blocked.
+         "--supplement-yaml", os.path.join(layout.providers, "nextin.yaml"),
          "--lock-file", os.path.join(state, "node_provider.lock")],
         [sys.executable, "-m", NODE_OPS_PACKAGE,
          "--env-file", secret,

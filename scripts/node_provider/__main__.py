@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY,
                         help="HTTP proxy for subscription fetch (--collect); "
                              "empty string = direct connection")
+    parser.add_argument("--supplement-yaml", action="append", default=[],
+                        help="Local provider YAML merged into source 1 (repeatable)")
     parser.add_argument("--source1-pid", type=int, default=None,
                         help="PID of the source1 AtlasCore process (--from-app source1)")
     parser.add_argument("--vault-dir", default=None,
@@ -168,6 +170,7 @@ def main(argv: Optional[List[str]] = None, client_factory=FeishuClient,
         fetch_proxy=args.fetch_proxy,
         source1_pid=args.source1_pid,
         vault_dir=args.vault_dir,
+        supplement_yaml=list(args.supplement_yaml),
     )
 
     if not args.collect:

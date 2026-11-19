@@ -132,6 +132,8 @@ def test_build_step_argv_uses_installed_paths_and_carries_no_secret_values(tmp_p
     assert collect[collect.index("--env-file") + 1] == layout.secret_file
     assert collect[collect.index("--fetch-proxy") + 1] == "http://127.0.0.1:7890"
     assert collect[collect.index("--from-app") + 1] == "source4"
+    assert collect[collect.index("--supplement-yaml") + 1] == os.path.join(
+        layout.providers, "nextin.yaml")
     assert collect[collect.index("--lock-file") + 1].startswith(layout.node_state_dir)
 
     ops = steps["ops"]
