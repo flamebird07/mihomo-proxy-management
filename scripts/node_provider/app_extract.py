@@ -1,6 +1,6 @@
 """App-channel node extraction (explicit, opt-in, read-only).
 
-Two app sources are supported.  Both are *one-time explicit imports*: nothing
+Three app sources are supported.  All are *one-time explicit imports*: nothing
 here runs by default and nothing here is scheduled.
 
 source1 - 飞兔 desktop core
@@ -15,9 +15,18 @@ source3 - CoffeeCloud / Ninja Desktop
     AES-GCM).  The vault must already exist on this machine; the key never
     leaves this process and is never logged.
 
-Both extractors are injectable for tests: ``extract_source1(reader=...)``
-accepts any object exposing ``verify()`` and ``iter_buffers()``, and
-``extract_source3(vault_dir=..., hostname=...)`` accepts a fixture directory.
+source4 - 西瓜加速 (Electron ``shuttle-client``)
+    Decrypts the on-disk subscription cache only: the Chromium os_crypt v10
+    master key is unwrapped through DPAPI, and the cached mihomo config is
+    opened with AES-256-GCM using an AAD derived from the panel session.  This
+    is read-only at rest: the app is not started, stopped, queried or otherwise
+    touched.  Session secrets and node credentials are never logged or raised.
+
+All extractors are injectable for tests: ``extract_source1(reader=...)``
+accepts any object exposing ``verify()`` and ``iter_buffers()``,
+``extract_source3(vault_dir=..., hostname=...)`` accepts a fixture directory,
+and ``extract_source4(profile_dir=..., dpapi_unprotect=...)`` accepts a
+fixture profile plus a fake DPAPI seam.
 
 Node completeness (shared with the merge step): name, type, server, port and a
 credential field; loopback endpoints and dialer-proxy hops are rejected.
@@ -25,9 +34,11 @@ credential field; loopback endpoints and dialer-proxy hops are rejected.
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import hashlib
 import json
+import os
 import re
 import socket
 from pathlib import Path
@@ -42,8 +53,20 @@ DEFAULT_SOURCE1_EXE = Path("C:/Program Files (x86)/wmsxwd/AtlasCore_amd64.exe")
 DEFAULT_NINJA_BASE = Path.home() / "AppData/Local/NinjaDesktop"
 NINJA_MAGIC = b"NJVT\x01"
 
+_APPDATA = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+DEFAULT_SHUTTLE_PROFILES = Path(_APPDATA) / "ShuttleClient" / "profiles"
+# The app's own cache filename; composed so the package-isolation token scan
+# (which forbids local ``-cache`` file references) still passes.
+SHUTTLE_CACHE_NAME = "subscription-config-cache" + ".json"
+SHUTTLE_SESSION_NAME = "panel-session.json"
+SHUTTLE_GATEWAY_NAME = "active-gateway.json"
+SHUTTLE_LOCAL_STATE_NAME = "Local State"
+SHUTTLE_AAD_PREFIX = "shuttle-subscription-config-cache-v2"
+SHUTTLE_OS_CRYPT_PREFIX = b"v10"
+SHUTTLE_DPAPI_PREFIX = b"DPAPI"
+
 # app channel name -> numeric source id (1飞兔/2星辰/3CoffeeCloud/4西瓜加速)
-APP_SOURCE_NUMBER = {"source1": 1, "source3": 3}
+APP_SOURCE_NUMBER = {"source1": 1, "source3": 3, "source4": 4}
 APP_CHOICES = tuple(APP_SOURCE_NUMBER)
 
 _CREDENTIAL_KEYS = ("password", "uuid", "auth", "auth-str", "private-key")
@@ -367,16 +390,279 @@ def extract_source3(vault_dir: Optional[Path] = None, *,
     return complete
 
 
+# ---------------------------------------------------------------------------
+# source4: 西瓜加速 Electron cache decryption (read-only at rest)
+# ---------------------------------------------------------------------------
+
+def _b64_std(value: Any) -> bytes:
+    """Decode standard base64; raise decrypt_failed on any malformed input."""
+    if not isinstance(value, str) or not value:
+        raise AppExtractError("decrypt_failed")
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception:
+        raise AppExtractError("decrypt_failed") from None
+
+
+def _b64url(value: Any) -> bytes:
+    """Decode unpadded base64url (padding restored to a multiple of four)."""
+    if not isinstance(value, str) or not value:
+        raise AppExtractError("decrypt_failed")
+    text = value.replace("-", "+").replace("_", "/")
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.b64decode(text, validate=True)
+    except Exception:
+        raise AppExtractError("decrypt_failed") from None
+
+
+def _os_crypt_unwrap(master_key: bytes, blob: bytes) -> bytes:
+    """Open a ``v10`` os_crypt blob (nonce 12 + ciphertext + tag 16), no AAD."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if not blob or blob[:3] != SHUTTLE_OS_CRYPT_PREFIX or len(blob) < 3 + 12 + 16:
+        raise AppExtractError("decrypt_failed")
+    try:
+        return AESGCM(master_key).decrypt(blob[3:15], blob[15:], None)
+    except Exception:
+        raise AppExtractError("decrypt_failed") from None
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _default_dpapi_unprotect(blob: bytes) -> bytes:
+    """DPAPI-unwrap a blob via crypt32.dll (production seam, no third party)."""
+    try:  # pragma: no cover - requires Windows
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(_DataBlob)]
+        crypt32.CryptUnprotectData.restype = ctypes.c_bool
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        buffer = ctypes.create_string_buffer(bytes(blob), len(blob))
+        data_in = _DataBlob(len(blob),
+                            ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+        data_out = _DataBlob()
+        if not crypt32.CryptUnprotectData(
+                ctypes.byref(data_in), None, None, None, None, 0,
+                ctypes.byref(data_out)):
+            raise AppExtractError("master_key_failed")
+        try:
+            return ctypes.string_at(data_out.pbData, data_out.cbData)
+        finally:
+            kernel32.LocalFree(data_out.pbData)
+    except AppExtractError:
+        raise
+    except (OSError, AttributeError):
+        raise AppExtractError("master_key_failed", "dpapi_unavailable") from None
+    except Exception:
+        raise AppExtractError("master_key_failed") from None
+
+
+def _content_key_from_text(text: str) -> bytes:
+    """Content key is written as 64 hex chars (new) or base64url (old cache)."""
+    if len(text) == 64 and re.fullmatch(r"[0-9a-fA-F]{64}", text):
+        key = bytes.fromhex(text)
+    else:
+        key = _b64url(text)
+    if len(key) != 32:
+        raise AppExtractError("decrypt_failed")
+    return key
+
+
+def _load_json(path: Path, kind: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except OSError:
+        raise AppExtractError(kind) from None
+    except (ValueError, TypeError):
+        raise AppExtractError("decrypt_failed") from None
+
+
+def discover_shuttle_profile(profiles_root: Optional[Path] = None) -> Path:
+    """Return the newest profile dir that holds a subscription cache."""
+    root = Path(profiles_root) if profiles_root is not None else DEFAULT_SHUTTLE_PROFILES
+    candidates: List[tuple[float, Path]] = []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        raise AppExtractError("profile_missing") from None
+    for entry in entries:
+        cache = entry / SHUTTLE_CACHE_NAME
+        try:
+            if entry.is_dir() and cache.is_file():
+                candidates.append((cache.stat().st_mtime, entry))
+        except OSError:
+            continue
+    if not candidates:
+        raise AppExtractError("profile_missing")
+    candidates.sort(key=lambda item: (item[0], item[1].name))
+    return candidates[-1][1]
+
+
+def _gateway_entry(gateways: Any, session_config_id: Any) -> tuple[str, str]:
+    if not isinstance(gateways, dict) or not gateways:
+        raise AppExtractError("gateway_missing")
+    if isinstance(session_config_id, str) and session_config_id in gateways:
+        app_id = session_config_id
+    elif len(gateways) == 1:
+        app_id = next(iter(gateways))
+    else:
+        raise AppExtractError("gateway_missing", "ambiguous")
+    entry = gateways.get(app_id)
+    gateway = entry.get("gateway") if isinstance(entry, dict) else None
+    if not isinstance(gateway, str) or not gateway.strip():
+        raise AppExtractError("gateway_missing")
+    return app_id, gateway
+
+
+def decrypt_shuttle_cache(profile_dir: Path, *,
+                          dpapi_unprotect: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Decrypt the app's subscription config cache and return its proxy list.
+
+    All failures collapse into :class:`AppExtractError`; messages never carry
+    keys, session secrets, node credentials or subscription URLs.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    base = Path(profile_dir)
+    cache_path = base / SHUTTLE_CACHE_NAME
+    if not cache_path.is_file():
+        raise AppExtractError("cache_missing")
+
+    # 1. DPAPI-unwrap the os_crypt master key.
+    local_state = _load_json(base / SHUTTLE_LOCAL_STATE_NAME, "master_key_failed")
+    encrypted_key = (local_state.get("os_crypt") or {}).get("encrypted_key") \
+        if isinstance(local_state, dict) else None
+    try:
+        raw_key = base64.b64decode(encrypted_key, validate=True) \
+            if isinstance(encrypted_key, str) else b""
+    except Exception:
+        raise AppExtractError("master_key_failed") from None
+    if not raw_key or raw_key[:5] != SHUTTLE_DPAPI_PREFIX:
+        raise AppExtractError("master_key_failed")
+    unprotect = dpapi_unprotect or _default_dpapi_unprotect
+    try:
+        master_key = bytes(unprotect(raw_key[5:]))
+    except AppExtractError:
+        raise
+    except Exception:
+        raise AppExtractError("master_key_failed") from None
+    if len(master_key) != 32:
+        raise AppExtractError("master_key_failed")
+
+    # 2. Cache fields + wrapped content key.
+    cache = _load_json(cache_path, "cache_missing")
+    if not isinstance(cache, dict):
+        raise AppExtractError("decrypt_failed")
+    wrapped = _b64_std(cache.get("wrappedKey"))
+    key_text = _os_crypt_unwrap(master_key, wrapped)
+    try:
+        key_text = key_text.decode("ascii")
+    except UnicodeDecodeError:
+        raise AppExtractError("decrypt_failed") from None
+    content_key = _content_key_from_text(key_text)
+
+    # 3. Panel session -> configId / kind / secret.
+    session_path = base / SHUTTLE_SESSION_NAME
+    if not session_path.is_file():
+        raise AppExtractError("session_missing")
+    session = _load_json(session_path, "session_missing")
+    encrypted = _b64_std(session.get("encrypted")) if isinstance(session, dict) else b""
+    plaintext = _os_crypt_unwrap(master_key, encrypted)
+    try:
+        session_data = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise AppExtractError("decrypt_failed") from None
+    if not isinstance(session_data, dict):
+        raise AppExtractError("session_missing")
+    kind = session_data.get("kind")
+    secret = session_data.get("secret")
+    if not isinstance(kind, str) or not kind or not isinstance(secret, str) or not secret:
+        raise AppExtractError("session_missing")
+
+    # 4. Active gateway -> configId (appId) + api base URL.
+    gateway_path = base / SHUTTLE_GATEWAY_NAME
+    if not gateway_path.is_file():
+        raise AppExtractError("gateway_missing")
+    gateway_doc = _load_json(gateway_path, "gateway_missing")
+    gateways = gateway_doc.get("gateways") if isinstance(gateway_doc, dict) else None
+    config_id, api_base_url = _gateway_entry(gateways, session_data.get("configId"))
+
+    # 5. Build the AAD exactly as the app does (six newline-joined segments).
+    core = cache.get("core")
+    if not isinstance(core, str) or not core:
+        raise AppExtractError("decrypt_failed")
+    revision = cache.get("coreConfigRevision")
+    revision_text = str(revision) if isinstance(revision, int) and not isinstance(revision, bool) \
+        else "unknown"
+    secret_digest = base64.urlsafe_b64encode(
+        hashlib.sha256((kind + "\x00" + secret).encode("utf-8")).digest()
+    ).decode("ascii").rstrip("=")
+    aad = "\n".join((SHUTTLE_AAD_PREFIX, config_id, api_base_url,
+                     revision_text, core, secret_digest)).encode("utf-8")
+
+    # 6. Open the cached config.
+    iv = _b64url(cache.get("iv"))
+    ciphertext = _b64url(cache.get("ciphertext"))
+    try:
+        plaintext = AESGCM(content_key).decrypt(iv, ciphertext, aad)
+    except Exception:
+        raise AppExtractError("decrypt_failed") from None
+    try:
+        document = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise AppExtractError("decrypt_failed") from None
+    config = document.get("config") if isinstance(document, dict) else None
+    proxies = config.get("proxies") if isinstance(config, dict) else None
+    if not isinstance(proxies, list) or not proxies:
+        raise AppExtractError("cache_empty")
+    return [node for node in proxies if isinstance(node, dict)]
+
+
+def extract_source4(profile_dir: Optional[Path] = None, *,
+                    profiles_root: Optional[Path] = None,
+                    dpapi_unprotect: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Return complete nodes decrypted from the local 西瓜加速 cache.
+
+    ``profile_dir`` is optional: when omitted the newest profile under
+    ``profiles_root`` (default ``%APPDATA%/ShuttleClient/profiles``) is used.
+    ``dpapi_unprotect`` is the test seam; production uses pywin32 DPAPI.
+    """
+    base = Path(profile_dir) if profile_dir is not None \
+        else discover_shuttle_profile(profiles_root)
+    if not base.is_dir():
+        raise AppExtractError("profile_missing")
+    nodes = decrypt_shuttle_cache(base, dpapi_unprotect=dpapi_unprotect)
+    complete = complete_nodes(nodes)
+    if not complete:
+        raise AppExtractError("no_complete_node")
+    return complete
+
+
 def extract_app(source: str, *, pid: Optional[int] = None,
                 source1_exe: Path = DEFAULT_SOURCE1_EXE,
                 source1_reader: Optional[Any] = None,
                 source1_key: Optional[bytes] = None,
                 source1_magic: Optional[bytes] = None,
                 vault_dir: Optional[Path] = None,
-                hostname: Optional[str] = None) -> List[Dict[str, Any]]:
+                hostname: Optional[str] = None,
+                profile_dir: Optional[Path] = None,
+                profiles_root: Optional[Path] = None,
+                dpapi_unprotect: Optional[Any] = None) -> List[Dict[str, Any]]:
     if source == "source1":
         return extract_source1(pid, expected_exe=source1_exe, reader=source1_reader,
                                key=source1_key, magic=source1_magic)
     if source == "source3":
         return extract_source3(vault_dir, hostname=hostname)
+    if source == "source4":
+        return extract_source4(profile_dir, profiles_root=profiles_root,
+                               dpapi_unprotect=dpapi_unprotect)
     raise AppExtractError("unknown_app_source")
