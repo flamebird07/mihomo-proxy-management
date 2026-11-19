@@ -1,8 +1,10 @@
 """Node pipeline daemon: the ``com.mihomo-proxy-management.node-pipeline`` job.
 
-macOS port of upstream ``scripts/run-node-pipeline.py`` (commit 8926713), the
-hourly scheduled task that turns measured nodes into the local machine's
-assignment:
+macOS port of upstream ``scripts/run-node-pipeline.py`` (the Windows entry;
+keep both step lists in sync), the hourly scheduled task that turns measured
+nodes into the local machine's assignment.  Cross-platform contract:
+``docs/CROSS-PLATFORM.md``:
+
 
 1. ``node_provider --collect``  - fetch the configured subscription sources
    into the Feishu 「节点测速总表」 (failures tolerated: a failed collect still
