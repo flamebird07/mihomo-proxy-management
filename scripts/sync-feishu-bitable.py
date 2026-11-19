@@ -3253,6 +3253,11 @@ INDEPENDENT_PATH_LABELS = frozenset({
 MAIN_PATH_LABELS = frozenset({"", "订阅 Mihomo"})
 DEFAULT_INDEPENDENT_STALE_MINUTES = 60
 INDEPENDENT_STALE_MINUTES_ENV = "FEISHU_INDEPENDENT_STALE_MINUTES"
+# Main-path rows whose 来源 is absent from this machine's payload belong to
+# another machine's source set (multi-host deployment): keep them while their
+# 同步时间 is fresh so one host's sync never wipes another host's sources.
+DEFAULT_FOREIGN_SOURCE_STALE_MINUTES = 7 * 24 * 60
+FOREIGN_SOURCE_STALE_MINUTES_ENV = "FEISHU_FOREIGN_SOURCE_STALE_MINUTES"
 # Feishu FT_DATE_TIME numeric values are epoch milliseconds (13+ digits).
 _MS_NUMERIC_MIN = 10 ** 12
 
@@ -3272,6 +3277,36 @@ def independent_stale_minutes(raw: str | None = None) -> int:
         return value
     except (TypeError, ValueError):
         return DEFAULT_INDEPENDENT_STALE_MINUTES
+
+
+def foreign_source_stale_minutes(raw: str | None = None) -> int:
+    """Retention window (minutes) for main-path rows of sources absent from
+    this machine's payload.  Default 7 days: a host offline for a week stops
+    propping up its rows; unreadable overrides fall back to the default."""
+    text = (str(DEFAULT_FOREIGN_SOURCE_STALE_MINUTES)
+            if raw is None else str(raw).strip())
+    if raw is None:
+        text = os.environ.get(
+            FOREIGN_SOURCE_STALE_MINUTES_ENV,
+            str(DEFAULT_FOREIGN_SOURCE_STALE_MINUTES),
+        ).strip()
+    try:
+        value = int(text)
+        if value <= 0:
+            raise ValueError("stale minutes must be positive")
+        return value
+    except (TypeError, ValueError):
+        return DEFAULT_FOREIGN_SOURCE_STALE_MINUTES
+
+
+def _source_label(value: Any) -> str:
+    """Read the 来源 single-select (string) or text-chunks (list) as text."""
+    if isinstance(value, list):
+        return "".join(
+            str(item.get("text", "")) if isinstance(item, dict) else str(item)
+            for item in value
+        ).strip()
+    return str(value).strip() if value is not None else ""
 
 
 def path_label(value: Any) -> str:
@@ -3429,10 +3464,24 @@ def plan_table_deletions(existing: list[dict], records: list[dict], *,
                          table_key: str | None,
                          now_ms: int,
                          stale_minutes: int,
-                         log: Logger | None = None) -> list[dict]:
-    """Plan deletions by 测速路径 ownership. Items have record_id/path/reason only."""
+                         log: Logger | None = None,
+                         foreign_stale_minutes: int | None = None) -> list[dict]:
+    """Plan deletions by 测速路径 ownership. Items have record_id/path/reason only.
+
+    Multi-host semantics: main-path rows whose 来源 is absent from this
+    machine's payload belong to another host's source set and are kept while
+    fresh (同步时间 within *foreign_stale_minutes*, default 7 days) - one
+    host's sync must never wipe another host's sources.  Rows with an empty
+    来源 stay owned by the writer (replaced as before).
+    """
     plan: list[dict] = []
     threshold_ms = int(stale_minutes) * 60 * 1000
+    foreign_threshold_ms = (int(foreign_stale_minutes if foreign_stale_minutes is not None
+                                else foreign_source_stale_minutes()) * 60 * 1000)
+    payload_sources = {
+        _source_label((record.get("fields") or {}).get("来源"))
+        for record in records
+    } - {""}
     for row in existing:
         rid = row.get("record_id")
         if not rid:
@@ -3477,6 +3526,23 @@ def plan_table_deletions(existing: list[dict], records: list[dict], *,
                 item["reason"] = "empty_regions_clear_main"
                 plan.append(item)
             continue
+        source_name = _source_label(fields.get("来源"))
+        if source_name and source_name not in payload_sources:
+            # foreign-source row: another host owns this group.  Keep while
+            # fresh; unreadable 同步时间 keeps it (fail-closed, like the
+            # independent path).  Empty 来源 stays writer-owned.
+            parsed, warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
+            if warning or parsed is None:
+                if log is not None:
+                    log.warn(
+                        f"records foreign keep source={source_name} "
+                        f"reason=sync_time_{'unreadable' if parsed is None else warning}"
+                    )
+                continue
+            if (now_ms - parsed) > foreign_threshold_ms:
+                item["reason"] = "stale_foreign_source"
+                plan.append(item)
+            continue
         item["reason"] = "replaced_by_new_payload"
         plan.append(item)
     return plan
@@ -3510,6 +3576,7 @@ def replace_records(client: FeishuClient, table_id: str, records: list[dict],
         now_ms=now_ms,
         stale_minutes=stale_minutes,
         log=log,
+        foreign_stale_minutes=foreign_source_stale_minutes(),
     )
     log_delete_plan(log, plan, phase="dry-run")
     ids = [item["record_id"] for item in plan]
