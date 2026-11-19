@@ -328,6 +328,148 @@ def test_us_fast_is_fallback_strict():
     assert "tolerance" not in us_fast
 
 
+def test_grokbot_group_falls_back_to_auto_foreign_never_direct():
+    """x.ai/grok.com must never degrade to direct: AUTO-FOREIGN is the last member."""
+    document = yaml.safe_load(_render("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    grokbot = groups["GROKBOT"]
+    assert grokbot["type"] == "fallback"
+    assert grokbot["proxies"] == ["GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP", "AUTO-FOREIGN"]
+    assert grokbot["url"] == "https://grok.com/cdn-cgi/trace"
+    assert grokbot["expected-status"] == 200
+    assert grokbot["interval"] == 300
+    assert grokbot["timeout"] == 8000
+    assert grokbot["lazy"] is False
+    assert grokbot["max-failed-times"] == 3
+    for name, region in (("GROKBOT-US", "US"), ("GROKBOT-SG", "SG"), ("GROKBOT-JP", "JP")):
+        group = groups[name]
+        assert group["type"] == "fallback"
+        assert group["use"] == ["subscription"]
+        assert group["filter"] == config.REGION_FILTERS[region]
+        assert group["url"] == "https://grok.com/cdn-cgi/trace"
+        assert group["expected-status"] == 200
+        assert group["interval"] == 300
+        assert group["timeout"] == 8000
+        assert group["lazy"] is False
+        assert group["max-failed-times"] == 3
+    assert "GROKBOT" in groups["GLOBAL"]["proxies"]
+
+    rules = document["rules"]
+    assert "DOMAIN-SUFFIX,x.ai,GROKBOT" in rules
+    assert "DOMAIN-SUFFIX,grok.com,GROKBOT" in rules
+    assert "DOMAIN-SUFFIX,x.ai,US-FAST" not in rules
+    assert "DOMAIN-SUFFIX,grok.com,US-FAST" not in rules
+    grok_index = min(
+        rules.index("DOMAIN-SUFFIX,x.ai,GROKBOT"),
+        rules.index("DOMAIN-SUFFIX,grok.com,GROKBOT"),
+    )
+    assert grok_index < rules.index("GEOSITE,cn,DIRECT")
+
+
+def _render_valid(mode: str = "tun") -> str:
+    return config.render(
+        _template(),
+        secret=SECRET,
+        subscription_url=URL,
+        interval_minutes=30,
+        mode=mode,
+        valid_nodes=True,
+    )
+
+
+def test_valid_nodes_mode_switches_gpt_and_us_fast_to_the_valid_pool():
+    """Assignment mode: GPT becomes the selector the stability entry manages,
+    US-FAST draws from the measured pool, both stay fail-safe."""
+    document = yaml.safe_load(_render_valid("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    valid_provider = document["proxy-providers"][config.VALID_PROVIDER_NAME]
+    assert valid_provider["type"] == "file"
+    assert valid_provider["path"] == config.VALID_PROVIDER_PATH
+    assert valid_provider["health-check"]["enable"] is True
+
+    gpt = groups["GPT"]
+    assert gpt["type"] == "select"
+    assert gpt["use"] == [config.VALID_PROVIDER_NAME]
+    assert gpt["proxies"] == ["AUTO-FOREIGN"], "manual fallback member stays"
+
+    us_fast = groups["US-FAST"]
+    assert us_fast["type"] == "fallback"
+    assert us_fast["use"] == [config.VALID_PROVIDER_NAME]
+    assert us_fast["filter"] == config.US_FILTER, "the strict US filter is unchanged"
+
+    # the region subgroups keep drawing from the subscription pool
+    for name in ("GPT-US", "GPT-SG", "GPT-JP"):
+        assert groups[name]["use"] == ["subscription"]
+
+
+def test_valid_nodes_mode_audit_rejects_drift():
+    document = yaml.safe_load(_render_valid("tun"))
+    groups = {group["name"]: group for group in document["proxy-groups"]}
+    groups["GPT"]["type"] = "fallback"  # the entry cannot manage a fallback
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+    document = yaml.safe_load(_render_valid("tun"))
+    del document["proxy-providers"][config.VALID_PROVIDER_NAME]
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+    # subscription mode must not silently accept the assignment shape either
+    document = yaml.safe_load(_render_valid("tun"))
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=False)
+
+
+def test_valid_nodes_mode_rejects_a_missing_file_provider():
+    document = yaml.safe_load(_render("tun"))
+    document["proxy-providers"][config.VALID_PROVIDER_NAME] = {
+        "type": "file",
+        "path": config.VALID_PROVIDER_PATH,
+    }
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun", valid_nodes=True)
+
+
+def test_grokbot_audit_rejects_drift():
+    document = yaml.safe_load(_render("tun"))
+    grokbot = next(g for g in document["proxy-groups"] if g["name"] == "GROKBOT")
+    grokbot["proxies"] = ["GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP", "DIRECT"]
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+    document = yaml.safe_load(_render("tun"))
+    document["rules"] = [
+        rule for rule in document["rules"] if rule != "DOMAIN-SUFFIX,x.ai,GROKBOT"
+    ]
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+    document = yaml.safe_load(_render("tun"))
+    subgroup = next(g for g in document["proxy-groups"] if g["name"] == "GROKBOT-SG")
+    subgroup["filter"] = "(?i)香港|HK"
+    broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+    with pytest.raises(config.RenderError):
+        config.audit(broken, mode="tun")
+
+
+def test_policy_warns_when_grokbot_regions_match_nothing():
+    """An empty GROKBOT region pool is a warning (AUTO-FOREIGN still covers it)."""
+    # US/JP keep CURSOR satisfied; only the SG pool is empty here.
+    report = policy.evaluate(["香港-01", "HK-02", "美国-01", "日本-01"])
+    assert not report.errors
+    assert report.grokbot == {"US": 1, "SG": 0, "JP": 1}
+    assert any("GROKBOT-SG has no matching node" in warning for warning in report.warnings)
+    good = policy.evaluate(["美国-01", "新加坡-01", "日本-01"])
+    assert good.grokbot == {"US": 1, "SG": 1, "JP": 1}
+    assert not any("GROKBOT" in warning for warning in good.warnings)
+
+
 def test_proxy_select_has_no_raw_nodes_and_store_selected_false():
     document = yaml.safe_load(_render("tun"))
     groups = {group["name"]: group for group in document["proxy-groups"]}

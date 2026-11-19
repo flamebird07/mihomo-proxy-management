@@ -17,6 +17,13 @@ Two labels exist, with deliberately different rules:
   network, so ``KeepAlive`` (in any form, ``SuccessfulExit: false`` included)
   is rejected.
 
+``com.mihomo-proxy-management.feishu-sync`` (the Feishu speedtest sync)
+  ``StartInterval``-driven, **no** ``RunAtLoad`` and **no** ``KeepAlive``:
+  the first tick fires one interval after the job is loaded (never during
+  install/bootstrap), and a failing tick is retried by the next interval, not
+  by a restart policy piling runs on top of each other.  ``StartInterval``
+  must be an integer of at least 300 seconds.
+
 ``WorkingDirectory`` and the runner's ``-d`` argument are mihomo's **home**
 (``Layout.support``), not this project's ``state/`` directory: the provider
 file and the geo databases live below the home, and mihomo rejects a provider
@@ -45,7 +52,7 @@ from xml.sax.saxutils import escape
 from mpm_common.errors import FailClosed
 
 from .context import BINARY_ENV
-from .paths import BOOT_LABEL, LABEL
+from .paths import BOOT_LABEL, FEISHU_SYNC_LABEL, LABEL, NODE_PIPELINE_LABEL
 
 PLACEHOLDERS = (
     "__LABEL__",
@@ -57,6 +64,7 @@ PLACEHOLDERS = (
     "__RUN_DIR__",
     "__LOG_OUT__",
     "__LOG_ERR__",
+    "__SYNC_INTERVAL__",
 )
 
 FORBIDDEN_TOKENS = ("caffeinate", "://", "secret", "token", "password")
@@ -66,7 +74,7 @@ SHELL_NAMES = {"sh", "bash", "zsh", "dash", "/bin/sh", "/bin/bash", "/bin/zsh", 
 PYTHON_SUFFIXES = ("python3", "python3.11", "python3.12", "python3.13")
 
 #: Labels this project may render and audit.
-ALLOWED_LABELS = (LABEL, BOOT_LABEL)
+ALLOWED_LABELS = (LABEL, BOOT_LABEL, FEISHU_SYNC_LABEL, NODE_PIPELINE_LABEL)
 
 
 def _values(
@@ -80,6 +88,7 @@ def _values(
     run_dir: str,
     log_out: str,
     log_err: str,
+    sync_interval: str = "600",
 ) -> dict[str, str]:
     return {
         "__LABEL__": label,
@@ -91,6 +100,7 @@ def _values(
         "__RUN_DIR__": run_dir,
         "__LOG_OUT__": log_out,
         "__LOG_ERR__": log_err,
+        "__SYNC_INTERVAL__": str(sync_interval),
     }
 
 
@@ -106,6 +116,7 @@ def render(
     run_dir: str,
     log_out: str,
     log_err: str,
+    sync_interval: str = "600",
 ) -> str:
     """Fill the template, validate it with plistlib and re-serialise it."""
     if label not in ALLOWED_LABELS:
@@ -120,6 +131,7 @@ def render(
         run_dir=run_dir,
         log_out=log_out,
         log_err=log_err,
+        sync_interval=sync_interval,
     )
     text = template_text
     for name, value in values.items():
@@ -165,6 +177,8 @@ def audit(document: Any, *, label: str = LABEL, home_dir: str | None = None) -> 
     _require(document.get("Label") == label, "Label must be the project label")
     if label == BOOT_LABEL:
         return _audit_boot(document, label=label)
+    if label in (FEISHU_SYNC_LABEL, NODE_PIPELINE_LABEL):
+        return _audit_interval_job(document, label=label)
     return _audit_core(document, label=label, home_dir=home_dir)
 
 
@@ -290,6 +304,61 @@ def _audit_boot(document: Any, *, label: str) -> dict[str, Any]:
 
     return {
         "label": document["Label"],
+        "keep_alive": keep_alive if keep_alive is not None else False,
+        "program_arguments": arguments,
+        "working_directory": working,
+    }
+
+
+#: The ``python -m`` entry each interval job must run (label -> module).
+_INTERVAL_JOB_ENTRIES = {
+    FEISHU_SYNC_LABEL: "mpm_macos.feishu_sync",
+    NODE_PIPELINE_LABEL: "mpm_macos.node_pipeline",
+}
+
+
+def _audit_interval_job(document: Any, *, label: str) -> dict[str, Any]:
+    """An interval-driven job (feishu sync / node pipeline): no boot run, no
+    restart policy.
+
+    ``RunAtLoad`` would run the job right at install/bootstrap (before the
+    core may even exist) and ``KeepAlive`` would retry a failing tick every
+    ``ThrottleInterval`` seconds on top of the interval schedule - both are
+    rejected.  ``StartInterval`` must be an integer of at least 300 s: the
+    scripts' own file locks prevent same-table write races, but a floor keeps
+    the schedule from hammering the subscription and the Feishu API.
+    """
+    run_at_load = document.get("RunAtLoad")
+    _require(
+        run_at_load is None or run_at_load is False,
+        "the sync job must not run at load (RunAtLoad absent or false)",
+    )
+    keep_alive = document.get("KeepAlive")
+    _require(
+        keep_alive is None or keep_alive is False,
+        "the sync job must not restart (KeepAlive absent or false)",
+    )
+    interval = document.get("StartInterval")
+    _require(
+        isinstance(interval, int) and not isinstance(interval, bool) and interval >= 300,
+        "StartInterval must be an integer >= 300",
+    )
+    _require(
+        document.get("ProcessType") == "Background",
+        "ProcessType must be Background",
+    )
+
+    arguments = _audit_program_arguments(document)
+    _require(
+        _INTERVAL_JOB_ENTRIES[label] in arguments,
+        f"ProgramArguments must point at {_INTERVAL_JOB_ENTRIES[label]}",
+    )
+
+    working = _audit_paths_and_environment(document)
+
+    return {
+        "label": document["Label"],
+        "start_interval": interval,
         "keep_alive": keep_alive if keep_alive is not None else False,
         "program_arguments": arguments,
         "working_directory": working,

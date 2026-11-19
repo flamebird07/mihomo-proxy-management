@@ -35,11 +35,21 @@ CODEBUDDY_REGIONS: dict[str, tuple[str, str]] = {
     "JP": ("CODEBUDDY-JP", r"(?i)日本|\bJP\b|Japan|🇯🇵"),
 }
 
+# GROKBOT reuses the exact US/SG/JP patterns already defined above - one
+# definition per region pattern, never a local copy.
+GROKBOT_REGIONS: dict[str, tuple[str, str]] = {
+    "US": ("GROKBOT-US", CURSOR_REGIONS["US"][1]),
+    "SG": ("GROKBOT-SG", CODEBUDDY_REGIONS["SG"][1]),
+    "JP": ("GROKBOT-JP", CURSOR_REGIONS["JP"][1]),
+}
+GROKBOT_GROUP = "GROKBOT"
+
 # Group name -> filter expression (template drift check).
 GROUP_FILTERS: dict[str, str] = {
     group: pattern for group, pattern in CURSOR_REGIONS.values()
 }
 GROUP_FILTERS.update({group: pattern for group, pattern in CODEBUDDY_REGIONS.values()})
+GROUP_FILTERS.update({group: pattern for group, pattern in GROKBOT_REGIONS.values()})
 
 CURSOR_GROUP = "CURSOR"
 CODEBUDDY_GROUP = "CODEBUDDY"
@@ -49,6 +59,7 @@ CODEBUDDY_GROUP = "CODEBUDDY"
 class PolicyReport:
     cursor: dict[str, int] = field(default_factory=dict)
     codebuddy: dict[str, int] = field(default_factory=dict)
+    grokbot: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -65,6 +76,7 @@ class PolicyReport:
             "ok": self.ok,
             "cursor": dict(self.cursor),
             "codebuddy": dict(self.codebuddy),
+            "grokbot": dict(self.grokbot),
             "errors": list(self.errors),
             "warnings": list(self.warnings),
         }
@@ -94,6 +106,12 @@ def evaluate(names: Iterable[str]) -> PolicyReport:
             report.warnings.append(
                 f"{group} has no matching node; CODEBUDDY falls back to DIRECT"
             )
+    for region, (group, pattern) in GROKBOT_REGIONS.items():
+        report.grokbot[region] = count_matches(pool, pattern)
+        if report.grokbot[region] == 0:
+            report.warnings.append(
+                f"{group} has no matching node; GROKBOT falls back to AUTO-FOREIGN"
+            )
     if report.cursor_total == 0:
         groups = ", ".join(group for group, _pattern in CURSOR_REGIONS.values())
         report.errors.append(
@@ -121,6 +139,8 @@ __all__ = [
     "CODEBUDDY_REGIONS",
     "CURSOR_GROUP",
     "CURSOR_REGIONS",
+    "GROKBOT_GROUP",
+    "GROKBOT_REGIONS",
     "GROUP_FILTERS",
     "PolicyReport",
     "count_matches",

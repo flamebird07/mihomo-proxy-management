@@ -65,6 +65,8 @@ from mpm_common.sanitize import HOST, sanitize
 from . import config as config_mod
 from . import conflict as conflict_mod
 from . import context as context_mod
+from . import feishu_sync as feishu_sync_mod
+from . import node_pipeline as node_pipeline_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
 from .launchdctl import Launchd
@@ -77,7 +79,15 @@ from .network_proxy import (
     save_snapshot,
     snapshot_exists,
 )
-from .paths import BOOT_LABEL, LABEL, Layout, managed_dirs
+from .paths import (
+    BOOT_LABEL,
+    FEISHU_SYNC_LABEL,
+    LABEL,
+    NODE_PIPELINE_LABEL,
+    XIGUA_IPPOOL_LABEL,
+    Layout,
+    managed_dirs,
+)
 
 SUBCOMMANDS = (
     "preflight",
@@ -88,6 +98,8 @@ SUBCOMMANDS = (
     "restart",
     "status",
     "health",
+    "groups",
+    "update-sources",
     "uninstall",
     "switch",
     "probe",
@@ -248,6 +260,18 @@ class Secrets:
     subscription_url: str
     controller_secret: str
     interval_minutes: int = 60
+    #: Optional Feishu bitable credentials for the sync daemon.  Empty means
+    #: "not configured yet": install still succeeds, the sync run reports the
+    #: missing keys and exits non-zero until the operator copies them from the
+    #: Windows host's ``~/.hermes/.env``.
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_bitable_app_token: str = ""
+    #: Optional additional subscription sources (``SUBSCRIPTION_URL_2..4``),
+    #: e.g. the airport the Nextin app subscribes to.  The Feishu speedtest
+    #: sync and ``update-sources`` read these keys from the same 0600 file;
+    #: they are never required and never overwrite the live provider.
+    extra_subscription_urls: dict[int, str] = field(default_factory=dict)
 
 
 def parse_env(text: str) -> dict[str, str]:
@@ -295,17 +319,78 @@ def load_secrets(
         # A zero interval would be silently clamped to the 3600 s floor, which
         # hides the "minutes written into a seconds field" class of mistake.
         raise FailClosed("SUBSCRIPTION_INTERVAL must be at least 1 minute")
-    return Secrets(subscription_url=url, controller_secret=secret, interval_minutes=minutes)
+    feishu_app_id = env.get("MPM_FEISHU_APP_ID") or values.get("FEISHU_APP_ID", "")
+    feishu_app_secret = env.get("MPM_FEISHU_APP_SECRET") or values.get("FEISHU_APP_SECRET", "")
+    feishu_token = env.get("MPM_FEISHU_BITABLE_APP_TOKEN") or values.get(
+        "FEISHU_BITABLE_APP_TOKEN", ""
+    )
+    extras: dict[int, str] = {}
+    for index in (2, 3, 4):
+        extra = (
+            env.get(f"MPM_SUBSCRIPTION_URL_{index}")
+            or values.get(f"SUBSCRIPTION_URL_{index}", "")
+        ).strip()
+        if extra:
+            extras[index] = extra
+    return Secrets(
+        subscription_url=url,
+        controller_secret=secret,
+        interval_minutes=minutes,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_bitable_app_token=feishu_token,
+        extra_subscription_urls=extras,
+    )
 
 
 def save_secrets(layout: Layout, secrets: Secrets) -> None:
-    payload = (
-        "# 0600 secret file - never commit.\n"
-        f"SUBSCRIPTION_URL={secrets.subscription_url}\n"
-        f"SECRET={secrets.controller_secret}\n"
-        f"SUBSCRIPTION_INTERVAL={secrets.interval_minutes}\n"
-    )
-    write_atomic(layout.secret_file, payload, mode=0o600)
+    """Write the 0600 secret file, preserving existing Feishu credentials.
+
+    A re-install must never silently drop the three optional ``FEISHU_*`` keys
+    (the operator copies them from the Windows host once), so they are kept
+    from the file when the caller did not supply new values.  The file also
+    carries the derived ``SUBSCRIPTION_URL_1`` mirror: the Feishu sync script
+    reads its sources as ``SUBSCRIPTION_URL_1..4``, and mirroring the deployed
+    ``SUBSCRIPTION_URL`` at every write means the mirror can never drift from
+    the URL it mirrors.
+    """
+    existing: dict[str, str] = {}
+    if os.path.isfile(layout.secret_file):
+        try:
+            existing = parse_env(read_text_strict(layout.secret_file))
+        except Exception:  # noqa: BLE001 - unreadable old file: write fresh content
+            existing = {}
+    app_id = secrets.feishu_app_id or existing.get("FEISHU_APP_ID", "")
+    app_secret = secrets.feishu_app_secret or existing.get("FEISHU_APP_SECRET", "")
+    app_token = secrets.feishu_bitable_app_token or existing.get("FEISHU_BITABLE_APP_TOKEN", "")
+    lines = [
+        "# 0600 secret file - never commit.",
+        f"SUBSCRIPTION_URL={secrets.subscription_url}",
+        f"SECRET={secrets.controller_secret}",
+        f"SUBSCRIPTION_INTERVAL={secrets.interval_minutes}",
+        "# Derived by install: the Feishu sync reads sources as SUBSCRIPTION_URL_1..4.",
+        f"SUBSCRIPTION_URL_1={secrets.subscription_url}",
+    ]
+    # Additional sources 2..4 (optional, e.g. the Nextin/wmsxwd subscription):
+    # kept from the file when this call carries no new value, so a hand-added
+    # source survives every re-install, and never reordered to break the
+    # converter's duplicate-key check.
+    for index in (2, 3, 4):
+        url_key = f"SUBSCRIPTION_URL_{index}"
+        value = secrets.extra_subscription_urls.get(index) or existing.get(url_key, "")
+        if value:
+            lines.append(f"{url_key}={value}")
+    for index in (2, 3, 4):
+        ua_key = f"SUBSCRIPTION_UA_{index}"
+        if ua_key in existing:
+            lines.append(f"{ua_key}={existing[ua_key]}")
+    if app_id:
+        lines.append(f"FEISHU_APP_ID={app_id}")
+    if app_secret:
+        lines.append(f"FEISHU_APP_SECRET={app_secret}")
+    if app_token:
+        lines.append(f"FEISHU_BITABLE_APP_TOKEN={app_token}")
+    write_atomic(layout.secret_file, "\n".join(lines) + "\n", mode=0o600)
 
 
 # ---- TUN observation ------------------------------------------------------
@@ -544,6 +629,15 @@ def _install_static(ctx: Context) -> list[str]:
         os.path.join(
             source, "templates", os.path.basename(layout.boot_plist_template)
         ): layout.boot_plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.feishu_sync_plist_template)
+        ): layout.feishu_sync_plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.node_pipeline_plist_template)
+        ): layout.node_pipeline_plist_template,
+        os.path.join(
+            source, "templates", os.path.basename(layout.feishu_sync_plist_template)
+        ): layout.feishu_sync_plist_template,
         os.path.join(repo, "config", "config.yaml.template"): layout.config_template,
     }
     for src, dest in template_sources.items():
@@ -561,6 +655,36 @@ def _install_static(ctx: Context) -> list[str]:
     convert_src = os.path.join(repo, "scripts", "convert_sub.py")
     if _copy_file(convert_src, layout.convert_sub, mode=0o755):
         changed.append("convert_sub.py")
+
+    # The Feishu sync daemon imports this script by path; it must sit next to
+    # the installed convert_sub.py because it imports its sibling via sys.path.
+    sync_src = os.path.join(repo, "scripts", feishu_sync_mod.SYNC_SCRIPT_NAME)
+    if _copy_file(sync_src, layout.sync_script, mode=0o755):
+        changed.append(feishu_sync_mod.SYNC_SCRIPT_NAME)
+
+    for name in (
+        "health-check-provider.py",
+        "ippool-collector.py",
+        "sync-xigua-ippool-feishu.py",
+        "run-xigua-ippool.py",
+        # the node pipeline's assignment chain (upstream run-node-pipeline port)
+        "proxy-auto-switch.py",
+        "gpt_switch_entry.py",
+        "gpt_stability_policy.py",
+        "named_mutex_lock.py",
+    ):
+        if _copy_file(
+            os.path.join(repo, "scripts", name),
+            os.path.join(layout.scripts_dir, name),
+            mode=0o755,
+        ):
+            changed.append(name)
+    for package in (node_pipeline_mod.NODE_PROVIDER_PACKAGE, node_pipeline_mod.NODE_OPS_PACKAGE):
+        changed += _copy_tree(
+            os.path.join(repo, "scripts", package),
+            os.path.join(layout.scripts_dir, package),
+            mode=0o644,
+        )
 
     _install_cli(ctx)
     _install_runner(ctx)
@@ -695,7 +819,13 @@ def configure(
         raise FailClosed(
             "provider node list is empty; cannot validate the CURSOR/CODEBUDDY policy"
         )
-    verdict = policy.enforce(nodes)
+    supplement_path = os.path.join(layout.providers, "nextin.yaml")
+    supplement_nodes = []
+    if os.path.isfile(supplement_path):
+        supplement_nodes = config_mod.provider_node_names(read_text_strict(supplement_path))
+        if not supplement_nodes:
+            raise FailClosed("the local source 1 supplement contains no nodes")
+    verdict = policy.enforce(nodes + supplement_nodes)
     for warning in verdict.warnings:
         report.warn(warning)
     report.data["policy"] = verdict.to_dict()
@@ -711,6 +841,8 @@ def configure(
         interval_minutes=secrets.interval_minutes,
         mode=target_mode,
         provider_path=layout.provider_file,
+        source1_supplement_path=supplement_path if supplement_nodes else None,
+        valid_nodes=os.path.isfile(layout.valid_provider_file),
     )
 
     validator = ctx.validator or _default_validator(ctx)
@@ -811,6 +943,162 @@ def _boot_launchd(ctx: Context) -> Launchd:
         label=BOOT_LABEL,
         sleeper=ctx.sleeper,
     )
+
+
+def _install_feishu_sync_plist(ctx: Context) -> bool:
+    """Render the Feishu sync job: same render+audit gate as the other plists.
+
+    The audit rejects a restart policy and a boot run: the job is purely
+    ``StartInterval``-driven and a failing tick waits for the next interval.
+    """
+    layout = ctx.layout
+    target = layout.to_target_path
+    rendered = plist_mod.render_from_file(
+        layout.feishu_sync_plist_template,
+        label=FEISHU_SYNC_LABEL,
+        python=target(ctx.python),
+        package_dir=target(layout.share_python),
+        home_dir=target(layout.mihomo_home),
+        config=target(layout.config),
+        binary=target(layout.binary),
+        run_dir=target(layout.run_dir),
+        log_out=target(layout.log_feishu_out),
+        log_err=target(layout.log_feishu_err),
+        sync_interval=str(feishu_sync_mod.sync_interval_seconds(ctx.environ)),
+    )
+    plist_mod.audit_text(rendered, label=FEISHU_SYNC_LABEL, home_dir=target(layout.mihomo_home))
+    if is_noop(layout.feishu_sync_plist, rendered, mode=0o644):
+        return False
+    write_atomic(layout.feishu_sync_plist, rendered, mode=0o644)
+    return True
+
+
+def _feishu_sync_launchd(ctx: Context) -> Launchd:
+    """The Feishu speedtest sync job (StartInterval-driven, never at boot)."""
+    return Launchd(
+        ctx.executor,
+        plist=ctx.layout.feishu_sync_plist,
+        label=FEISHU_SYNC_LABEL,
+        sleeper=ctx.sleeper,
+    )
+
+
+def _install_node_pipeline_plist(ctx: Context) -> bool:
+    """Render the node pipeline job: same render+audit gate as the core plist.
+
+    The audit (interval-job rules) rejects a boot run, a restart policy and
+    any secret/URL in the document.
+    """
+    layout = ctx.layout
+    target = layout.to_target_path
+    rendered = plist_mod.render_from_file(
+        layout.node_pipeline_plist_template,
+        label=NODE_PIPELINE_LABEL,
+        python=target(ctx.python),
+        package_dir=target(layout.share_python),
+        home_dir=target(layout.mihomo_home),
+        config=target(layout.config),
+        binary=target(layout.binary),
+        run_dir=target(layout.run_dir),
+        log_out=target(layout.log_node_pipeline_out),
+        log_err=target(layout.log_node_pipeline_err),
+        sync_interval=str(node_pipeline_mod.pipeline_interval_seconds(ctx.environ)),
+    )
+    plist_mod.audit_text(rendered, label=NODE_PIPELINE_LABEL, home_dir=target(layout.mihomo_home))
+    if is_noop(layout.node_pipeline_plist, rendered, mode=0o644):
+        return False
+    write_atomic(layout.node_pipeline_plist, rendered, mode=0o644)
+    return True
+
+
+def _node_pipeline_launchd(ctx: Context) -> Launchd:
+    """The node pipeline job (StartInterval-driven, never at boot)."""
+    return Launchd(
+        ctx.executor,
+        plist=ctx.layout.node_pipeline_plist,
+        label=NODE_PIPELINE_LABEL,
+        sleeper=ctx.sleeper,
+    )
+
+
+def _install_node_pipeline_job(ctx: Context, report: Report) -> None:
+    """Register the node pipeline like the feishu job: enable + bootstrap.
+
+    No hold stamp is needed (no RunAtLoad, the first tick fires one interval
+    after the load).  Missing Feishu credentials do NOT fail the install: the
+    tick reports them and retries on the next interval.
+    """
+    job = _node_pipeline_launchd(ctx)
+    if _install_node_pipeline_plist(ctx):
+        report.add("node-pipeline LaunchDaemon plist installed")
+    else:
+        report.add("node-pipeline LaunchDaemon plist unchanged")
+    if job.state().loaded:
+        job.bootout()
+    job.enable()
+    if job.is_disabled():
+        raise FailClosed(
+            "install finished but the node-pipeline LaunchDaemon is still disabled; "
+            "the valid-node assignment would never run"
+        )
+    job.bootstrap()
+    report.add(
+        "node-pipeline registered: collect -> probe/gate -> valid-node provider -> "
+        f"stable GPT switch every {node_pipeline_mod.pipeline_interval_seconds(ctx.environ)}s "
+        "(MPM_NODE_PIPELINE_INTERVAL_SECONDS), first run one interval from now"
+    )
+
+
+def _xigua_ippool_launchd(ctx: Context) -> Launchd:
+    return Launchd(
+        ctx.executor, plist=ctx.layout.xigua_ippool_plist,
+        label=XIGUA_IPPOOL_LABEL, sleeper=ctx.sleeper,
+    )
+
+
+def _install_xigua_ippool_job(ctx: Context, report: Report) -> None:
+    """Schedule the two-stage pool only when an explicit source is installed."""
+    import plistlib
+
+    layout = ctx.layout
+    path = layout.xigua_ippool_plist
+    source = os.path.join(layout.providers, "xigua-source.yaml")
+    job = _xigua_ippool_launchd(ctx)
+    if not os.path.isfile(source):
+        if os.path.isfile(path):
+            job.bootout()
+            job.disable()
+            remove_if_present(path)
+        return
+    check_secret_input(source, require_root_owned=ctx.system_profile)
+    target = layout.to_target_path
+    argv = [
+        target(ctx.python), target(os.path.join(layout.scripts_dir, "run-xigua-ippool.py")),
+        "--source-provider", target(source),
+        "--runtime-root", target(os.path.join(layout.state_dir, "xigua-ippool")),
+        "--final-provider", target(os.path.join(layout.providers, "xigua-ippool.yaml")),
+        "--core", target(layout.binary),
+        "--target", "https://www.gstatic.com/generate_204",
+        "--target", "https://chatgpt.com/cdn-cgi/trace",
+        "--env-file", target(layout.secret_file),
+        "--require-project-core",
+    ]
+    document = {
+        "Label": XIGUA_IPPOOL_LABEL,
+        "ProgramArguments": argv,
+        "StartInterval": 300,
+        "ProcessType": "Background",
+        "WorkingDirectory": target(layout.mihomo_home),
+        "StandardOutPath": target(os.path.join(layout.logs, "xigua-ippool.out.log")),
+        "StandardErrorPath": target(os.path.join(layout.logs, "xigua-ippool.err.log")),
+    }
+    rendered = plistlib.dumps(document).decode("utf-8")
+    if not is_noop(path, rendered, mode=0o644):
+        job.bootout()
+        write_atomic(path, rendered, mode=0o644)
+    job.enable()
+    job.bootstrap()
+    report.add("xigua-ippool registered: runs every 300s")
 
 
 # ---- boot-switch hold stamp -----------------------------------------------
@@ -1028,9 +1316,12 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
         layout.config_tun_backup,
     )
     secrets = ctx.secrets()
-    if not os.path.isfile(layout.secret_file):
-        save_secrets(layout, secrets)
-        _own(ctx, layout.secret_file)
+    # Always rewrite the 0600 secret file: save_secrets preserves the optional
+    # FEISHU_* keys and refreshes the derived SUBSCRIPTION_URL_1 mirror, so a
+    # re-install never loses credentials nor drifts the mirror away from the
+    # URL it mirrors.
+    save_secrets(layout, secrets)
+    _own(ctx, layout.secret_file)
 
     changed = _install_static(ctx)
     report.data["installed_files"] = len(changed)
@@ -1190,6 +1481,34 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
         "boot-switch registered (loaded, not running, hold acknowledged): the "
         "switch runs at boot or via `launchctl kickstart system/" + BOOT_LABEL + "`"
     )
+
+    # The Feishu speedtest sync job: enabled + bootstrapped like the boot entry
+    # (it must survive a re-install too, so a still-loaded old definition is
+    # booted out first).  No hold stamp is needed: without RunAtLoad the
+    # bootstrap cannot trigger a run, and the first tick fires one interval
+    # after the load.  Missing Feishu credentials do NOT fail the install -
+    # the tick reports them until the operator copies them over.
+    feishu = _feishu_sync_launchd(ctx)
+    if _install_feishu_sync_plist(ctx):
+        report.add("feishu-sync LaunchDaemon plist installed")
+    else:
+        report.add("feishu-sync LaunchDaemon plist unchanged")
+    if feishu.state().loaded:
+        feishu.bootout()
+    feishu.enable()
+    if feishu.is_disabled():
+        raise FailClosed(
+            "install finished but the feishu-sync LaunchDaemon is still disabled; "
+            "the speedtest sync would never run"
+        )
+    feishu.bootstrap()
+    report.add(
+        "feishu-sync registered: the speedtest sync fires every "
+        f"{feishu_sync_mod.sync_interval_seconds(ctx.environ)}s"
+        " (MPM_FEISHU_SYNC_INTERVAL_SECONDS), first run one interval from now"
+    )
+    _install_xigua_ippool_job(ctx, report)
+    _install_node_pipeline_job(ctx, report)
 
     if skip_start:
         report.status = "OK"
@@ -1444,6 +1763,9 @@ def _readiness(ctx: Context, secrets: Secrets) -> str:
 
 
 #: Groups that must have at least one live node before a start counts as good.
+#: GROKBOT needs no separate entry: its last fallback member is AUTO-FOREIGN,
+#: so it is live whenever AUTO-FOREIGN is (an extra name here would only add a
+#: failure mode, not coverage).
 REQUIRED_HEALTHY_GROUPS = ("AUTO-FOREIGN", "GPT")
 
 
@@ -1882,6 +2204,43 @@ def _proxy_matches(ctx: Context, state: DeploymentState) -> bool | None:
     return True
 
 
+def _node_pipeline_status(ctx: Context) -> dict[str, Any]:
+    """Launchd state of the node pipeline job (read-only, never throws)."""
+    try:
+        job = _node_pipeline_launchd(ctx)
+        state = job.state()
+        disabled = job.is_disabled()
+    except Exception as exc:  # noqa: BLE001 - degraded, not fatal
+        return {"loaded": False, "running": False, "disabled": None, "error": _failure_reason(exc)}
+    return {
+        "loaded": state.loaded,
+        "running": state.running,
+        "disabled": disabled,
+        "last_exit": state.last_exit,
+    }
+
+
+def _feishu_sync_status(ctx: Context) -> dict[str, Any]:
+    """Launchd state of the Feishu speedtest sync job (read-only, never throws).
+
+    ``status`` must keep working on an older install without the job and on a
+    machine where ``launchctl`` refuses to talk to us - every failure degrades
+    to a reported field instead of an exception.
+    """
+    try:
+        job = _feishu_sync_launchd(ctx)
+        state = job.state()
+        disabled = job.is_disabled()
+    except Exception as exc:  # noqa: BLE001 - degraded, not fatal
+        return {"loaded": False, "running": False, "disabled": None, "error": _failure_reason(exc)}
+    return {
+        "loaded": state.loaded,
+        "running": state.running,
+        "disabled": disabled,
+        "last_exit": state.last_exit,
+    }
+
+
 def status(ctx: Context) -> Report:
     report = Report(command="status")
     layout = ctx.layout
@@ -1899,6 +2258,8 @@ def status(ctx: Context) -> Report:
         "config": {"present": os.path.isfile(layout.config)},
         "plist": {"present": os.path.isfile(layout.plist)},
         "network_proxy": {"matches_saved_state": _proxy_matches(ctx, state)},
+        "feishu_sync": _feishu_sync_status(ctx),
+        "node_pipeline": _node_pipeline_status(ctx),
     }
 
     client: ControllerClient | None = None
@@ -1952,6 +2313,191 @@ def health(ctx: Context) -> Report:
     return report
 
 
+# ---- groups diagnostics ---------------------------------------------------
+
+
+def _group_line(row: dict[str, Any]) -> str:
+    """One human-readable ``groups`` row (sanitising happens at the streams)."""
+    parts = [str(row.get("name", "?")), str(row.get("type") or "?")]
+    if row.get("matched_nodes") is not None:
+        parts.append("matched=" + str(row["matched_nodes"]))
+    if row.get("now") is not None:
+        parts.append("now=" + str(row["now"]))
+    if row.get("alive") is not None:
+        parts.append("alive=" + ("yes" if row["alive"] else "no"))
+    members = row.get("members_alive") or {}
+    if members:
+        rendered = ",".join(
+            name + ("+" if alive else "-") if alive is not None else name + "?"
+            for name, alive in members.items()
+        )
+        parts.append("members=" + rendered)
+    return "  ".join(parts)
+
+
+def groups(ctx: Context) -> Report:
+    """Per-group routing report (read-only): who matches, who is alive, who wins.
+
+    Answers the "why does everything exit Hong Kong / which other regions are
+    usable" question without touching any state:
+
+    * for every provider-backed filter group it counts the provider nodes the
+      filter matches - **zero matches means mihomo silently degrades the group
+      to COMPATIBLE (direct)**, which is exactly how a region pool disappears;
+    * when the controller is reachable it also reports each group's alive
+      members and current selection.
+
+    The controller being down is a degraded report, not an error: the match
+    counts come from the provider file alone.
+    """
+    report = Report(command="groups")
+    layout = ctx.layout
+    names = _read_provider_nodes(ctx)
+    if not names:
+        report.warn(
+            "provider file has no nodes; run install/refresh first "
+            f"({HOST.text(layout.provider_file)})"
+        )
+    try:
+        specs = config_mod.group_specs(read_text_strict(layout.config))
+    except Exception as exc:  # noqa: BLE001 - a broken config is a reported failure
+        raise FailClosed("rendered config unreadable: " + _failure_reason(exc)) from exc
+
+    supplement_names = []
+    supplement_path = os.path.join(layout.providers, "nextin.yaml")
+    if any(spec["uses_supplement"] for spec in specs) and os.path.isfile(supplement_path):
+        supplement_names = config_mod.provider_node_names(read_text_strict(supplement_path))
+    report.data["provider_nodes"] = len(names) + len(supplement_names)
+
+    controller: dict[str, dict[str, Any]] = {}
+    try:
+        secrets = ctx.secrets()
+        payload = ctx.controller(secrets.controller_secret).proxies()
+        proxies = payload.get("proxies") if isinstance(payload, dict) else None
+        if isinstance(proxies, dict):
+            controller = {name: item for name, item in proxies.items() if isinstance(item, dict)}
+    except (FailClosed, ControllerError) as exc:
+        report.warn(
+            "controller unavailable; showing filter match counts only: "
+            + _failure_reason(exc)
+        )
+
+    rows: list[dict[str, Any]] = []
+    for spec in specs:
+        row: dict[str, Any] = dict(spec)
+        if spec["uses_provider"] and spec["filter"]:
+            try:
+                group_names = names + supplement_names if spec["uses_supplement"] else names
+                row["matched_nodes"] = policy.count_matches(group_names, spec["filter"])
+            except FailClosed:
+                row["matched_nodes"] = None
+            if row["matched_nodes"] == 0:
+                row["warning"] = "no node matches: mihomo degrades this group to COMPATIBLE (direct)"
+                report.warn(
+                    f"{spec['name']}: no node matches its filter; mihomo degrades "
+                    "it to COMPATIBLE (direct)"
+                )
+        members: dict[str, bool | None] = {}
+        for member in spec["proxies"]:
+            item = controller.get(member)
+            members[member] = None if item is None else bool(item.get("alive"))
+        if members:
+            row["members_alive"] = members
+        item = controller.get(spec["name"])
+        if item is not None:
+            row["now"] = item.get("now")
+            alive = item.get("alive")
+            row["alive"] = None if alive is None else bool(alive)
+        rows.append(row)
+        report.add(_group_line(row))
+    report.data["groups"] = rows
+    report.status = "OK"
+    return report
+
+
+# ---- update-sources -------------------------------------------------------
+
+
+#: Exit codes of ``convert_sub.py`` in multi-source mode (see its docs):
+#: 0 all sources fetched, 5 partial success with atomic output, 1 empty pool.
+CONVERT_PARTIAL_EXIT = 5
+
+
+def update_sources(
+    ctx: Context,
+    *,
+    output: str | None = None,
+    min_nodes: int | None = None,
+    quiet: bool = False,
+    load_module: Callable[[str], Any] | None = None,
+) -> Report:
+    """Fetch every configured subscription source and merge a candidate pool.
+
+    The macOS counterpart of Windows' ``update-subscription.ps1``: reads
+    ``SUBSCRIPTION_URL_1..3`` (+ per-source UA) from the 0600 secret file,
+    fetches/converts/merges them with the **installed** ``convert_sub.py``
+    (including the local supplement for source 1 when present), and writes the
+    merged candidate atomically as 0600.  The candidate is an evaluation
+    artifact - it never replaces the live provider; promoting it is a separate,
+    explicit decision.
+
+    Exit codes follow the converter: 0 all sources OK, 5 partial success
+    (output still written), 1 empty pool / below threshold.  The converter
+    never prints a subscription URL, and the URL never appears in argv - only
+    the env *file* is named.
+    """
+    report = Report(command="update-sources")
+    layout = ctx.layout
+    try:
+        secrets = ctx.secrets()
+        report.data["sources"] = sorted(secrets.extra_subscription_urls)
+    except FailClosed as exc:
+        report.warn("secret file unreadable: " + _failure_reason(exc))
+        report.data["sources"] = []
+    destination = output or os.path.join(layout.providers, "candidate.yaml")
+    supplement = os.path.join(layout.providers, "nextin.yaml")
+    protected = (layout.provider_file, supplement, layout.config, layout.secret_file)
+    if os.path.realpath(destination) in {os.path.realpath(path) for path in protected}:
+        raise FailClosed("candidate output must not replace a live configuration or source file")
+    argv = ["--sources-env-file", layout.secret_file, "-o", destination]
+    if os.path.isfile(supplement):
+        argv += ["--source1-supplement", supplement]
+    if min_nodes is not None:
+        argv += ["--min-nodes", str(min_nodes)]
+    module = (load_module or config_mod.load_convert_module)(layout.convert_sub)
+    try:
+        code = int(module.main(argv))
+    except SystemExit as exc:  # defensive: argparse on our argv never exits
+        code = int(exc.code or 0)
+    except FailClosed:
+        raise
+    except Exception as exc:  # noqa: BLE001 - converter failures are reported, sanitized
+        raise FailClosed("subscription conversion failed: " + _failure_reason(exc)) from exc
+
+    report.data["exit_code"] = code
+    report.data["output"] = HOST.text(destination)
+    if code in (0, CONVERT_PARTIAL_EXIT):
+        if not os.path.isfile(destination):
+            raise FailClosed(
+                "converter reported success but wrote no candidate file: "
+                + HOST.text(destination)
+            )
+        report.add("candidate pool written: " + HOST.text(destination))
+        report.status = "OK"
+        if code == CONVERT_PARTIAL_EXIT:
+            report.status = "DEGRADED"
+            report.exit_code = code
+            report.warn(
+                "some sources failed but the merged candidate was written "
+                "(exit 5; do not treat partial success as full success)"
+            )
+    else:
+        report.status = "FAILED"
+        report.exit_code = code
+        report.add(f"no candidate pool written (converter exit {code})")
+    return report
+
+
 # ---- uninstall ------------------------------------------------------------
 
 
@@ -1980,6 +2526,33 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
     except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
         report.warn("boot-switch disable failed: " + _failure_reason(exc))
 
+    # The Feishu sync job goes too: an enabled job whose plist was deleted
+    # would be an orphan launchd definition.  Best effort like the boot entry.
+    feishu = _feishu_sync_launchd(ctx)
+    try:
+        feishu.bootout()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("feishu-sync bootout failed: " + _failure_reason(exc))
+    try:
+        feishu.disable()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("feishu-sync disable failed: " + _failure_reason(exc))
+
+    if os.path.isfile(layout.xigua_ippool_plist):
+        xigua = _xigua_ippool_launchd(ctx)
+        try:
+            xigua.bootout()
+            xigua.disable()
+        except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+            report.warn("xigua-ippool shutdown failed: " + _failure_reason(exc))
+
+    pipeline = _node_pipeline_launchd(ctx)
+    try:
+        pipeline.bootout()
+        pipeline.disable()
+    except Exception as exc:  # noqa: BLE001 - reported, uninstall continues
+        report.warn("node-pipeline shutdown failed: " + _failure_reason(exc))
+
     removed: list[str] = []
 
     def discard(path: str) -> None:
@@ -1990,6 +2563,9 @@ def uninstall(ctx: Context, *, purge: bool = False, quiet: bool = False) -> Repo
 
     discard(layout.plist)
     discard(layout.boot_plist)
+    discard(layout.feishu_sync_plist)
+    discard(layout.xigua_ippool_plist)
+    discard(layout.node_pipeline_plist)
     discard(layout.cli_entry)
     discard(layout.switch_entry)
     discard(layout.libexec)

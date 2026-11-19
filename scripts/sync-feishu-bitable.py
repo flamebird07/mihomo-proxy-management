@@ -2016,7 +2016,7 @@ def load_cache_nodes(paths: list[str], log: Logger) -> list[dict]:
         valid: list[dict] = []
         try:
             converted, stats = convert_sub.convert_content(content, warn=lambda _m: None)
-            proxies = (converted or {}).get("proxies") if isinstance(converted, dict) else None
+            proxies = converted if isinstance(converted, list) else None
             if isinstance(proxies, list):
                 valid = [p for p in proxies if isinstance(p, dict) and p.get("name") and p.get("type")]
                 if valid:
@@ -2763,12 +2763,16 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    process = subprocess.Popen(
-        [core, "-d", str(runtime), "-f", str(config_path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=flags,
-    )
+    try:
+        process = subprocess.Popen(
+            [core, "-d", str(runtime), "-f", str(config_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+    except OSError:
+        shutil.rmtree(runtime, ignore_errors=True)
+        raise
     try:
         deadline = time.monotonic() + 20
         ready = False
@@ -3679,6 +3683,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpt-history-file", default=DEFAULT_GPT_HISTORY_FILE,
                         help="Local boolean history for the GPT consecutive-pass gate")
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY)
+    parser.add_argument("--source-cache-dir", help="Directory for writing fetched source caches")
+    parser.add_argument("--source1-supplement", help="Local provider YAML to add to source 1")
     parser.add_argument("--source1-cache", action="append", default=None,
                         help="Candidate YAML used when source 1 fails (repeatable)")
     parser.add_argument("--source2-cache", action="append", default=None,
@@ -3831,6 +3837,7 @@ def main(argv: list[str] | None = None) -> int:
             if index in (2, 3):
                 if result.result == "成功":
                     write_source_cache(index, result.nodes, log,
+                                       cache_dir=args.source_cache_dir,
                                        guard_tokens=_guard_tokens_for(url))
                 elif result.result == "失败" and result.error != "url_missing":
                     apply_source_cache(result, cache_read_paths[index], log)
@@ -3840,6 +3847,7 @@ def main(argv: list[str] | None = None) -> int:
                 # (拉取结果=缓存) must never fail the round.
                 if result.result == "成功":
                     write_source_cache(index, result.nodes, log,
+                                       cache_dir=args.source_cache_dir,
                                        guard_tokens=_guard_tokens_for(url))
                 else:
                     apply_source_cache(result, cache_read_paths[4], log)
@@ -3900,6 +3908,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"{first.error or 'fetch_failed'}; using cache; "
                     f"缓存文件时间={cache_file_time(cache_paths)}"
                 )
+
+        if first is not None and args.source1_supplement:
+            extra = load_cache_nodes([args.source1_supplement], log)
+            if extra:
+                if not first.nodes:
+                    first.result = "缓存"
+                first.nodes = convert_sub.merge_proxies(first.nodes + extra)
 
         # Publish fresh subscription metadata before the slow probe phase.
         # An omitted alive count means this snapshot has not been measured.

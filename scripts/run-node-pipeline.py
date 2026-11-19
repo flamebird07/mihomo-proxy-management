@@ -1,5 +1,11 @@
 """Sequential node pipeline for the scheduled task: collect -> ops -> provide.
 
+**Windows entry.**  The macOS counterpart is
+``macos/python/mpm_macos/node_pipeline.py`` (launchd job, adds a stable-GPT
+switch step and a presence-flip config re-render).  Keep the step list in
+sync across both files when adding/changing steps - see
+``docs/CROSS-PLATFORM.md`` section 3/6.
+
 Each step runs even if a previous one failed: a failed collect still lets ops
 refresh measurements on the existing table, and a failed ops round still lets
 provide republish the last valid set.  Exit code is 1 if any step failed.

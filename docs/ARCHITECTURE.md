@@ -1,5 +1,7 @@
 # Architecture & Troubleshooting
 
+> 跨平台（Windows/macOS）逻辑对照与修改纪律：**docs/CROSS-PLATFORM.md**（两端异步开发必读）。
+
 > Windows 架构如下；Linux 系统部署的架构、支持矩阵、DEGRADED 语义、供应链与
 > 生命周期规则见 [`LINUX.md`](LINUX.md)。
 > Everything below documents the Windows flow; the Linux system profile lives in

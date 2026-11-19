@@ -769,8 +769,10 @@ def test_reinstall_takes_over_a_kept_hold_and_never_opens_a_hold_less_window(tmp
     kept the stamp; the old job is still loaded and its RunAtLoad entry is
     still starting.  Deleting the stamp before creating a new one opens a
     hold-less window in which that entry performs the whole switch.  Every
-    ``launchctl`` call of this install must therefore observe the *original*
-    stamp file still in place.
+    ``launchctl`` call that targets the boot-switch job must therefore observe
+    the *original* stamp file still in place (calls on other jobs - the core
+    disable, the Feishu sync registration - cannot trigger the boot entry and
+    are outside this invariant).
     """
     ctx = make_context(tmp_path)
     harness = LaunchdHarness.attached(ctx.executor)
@@ -792,7 +794,7 @@ def test_reinstall_takes_over_a_kept_hold_and_never_opens_a_hold_less_window(tmp
     real_run = ctx.executor.run
 
     def checked_run(argv, **kwargs):
-        if argv and argv[0] == "launchctl":
+        if argv and argv[0] == "launchctl" and BOOT_LABEL in " ".join(argv):
             if not os.path.isfile(ctx.layout.boot_hold):
                 problems.append("launchctl ran without the hold: " + " ".join(argv))
             else:

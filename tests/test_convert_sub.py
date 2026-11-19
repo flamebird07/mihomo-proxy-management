@@ -785,6 +785,18 @@ class MultiSourceTests(unittest.TestCase):
         self.assertEqual(self.read_output(), "ORIGINAL")
         self.assertIn("below minimum 57", logs)
 
+    def test_source1_supplement_is_merged_before_the_minimum_check(self):
+        local = os.path.join(self.tmp.name, "supplement.yaml")
+        with open(local, "w", encoding="utf-8") as handle:
+            node = dict(synthetic_56()[0], name="added", port=8443)
+            yaml.safe_dump({"proxies": [synthetic_56()[0], node]}, handle)
+        rc, _, _, _ = self.run_sources(
+            "--source1-supplement", local, "--min-nodes", "57",
+            responses=[self.responses[0], "invalid", "invalid"],
+        )
+        self.assertEqual(rc, convert_sub.EXIT_PARTIAL)
+        self.assertEqual(len(yaml.safe_load(self.read_output())["proxies"]), 57)
+
     def test_all_sources_fail_closed(self):
         rc, logs, _, fetch = self.run_sources(responses=["invalid"] * 3)
         self.assertEqual(rc, convert_sub.EXIT_EMPTY)

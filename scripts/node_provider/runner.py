@@ -51,6 +51,7 @@ class Settings:
     fetch_proxy: str = DEFAULT_FETCH_PROXY
     source1_pid: Optional[int] = None
     vault_dir: Optional[str] = None
+    supplement_yaml: List[str] = field(default_factory=list)
 
 
 def read_rows(client, settings: Settings, logger: Logger):
@@ -130,6 +131,36 @@ def _record_attempts(client, result, host: str, stamp: int,
         host, stamp, logger.warn)
 
 
+def _load_supplement(paths: List[str], warn) -> List["collect_mod.CollectedNode"]:
+    """Load ``{"proxies": [...]}`` provider YAMLs as source-1 nodes."""
+    import yaml as _yaml
+
+    nodes: List["collect_mod.CollectedNode"] = []
+    source_name = schema.SOURCE_BY_INDEX[1]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8-sig") as handle:
+                document = _yaml.safe_load(handle)
+        except (OSError, UnicodeError) as exc:
+            warn(f"supplement unreadable path={path} class={type(exc).__name__}")
+            continue
+        except Exception as exc:  # pragma: no cover - malformed yaml
+            warn(f"supplement unparsable path={path} class={type(exc).__name__}")
+            continue
+        proxies = document.get("proxies") if isinstance(document, dict) else None
+        if not isinstance(proxies, list) or not proxies:
+            warn(f"supplement empty path={path}")
+            continue
+        count = 0
+        for config in proxies:
+            if isinstance(config, dict) and config.get("name") and config.get("type"):
+                nodes.append(collect_mod.CollectedNode(
+                    config=config, source=source_name, source_number=1))
+                count += 1
+        warn(f"supplement loaded path={path} nodes={count}")
+    return nodes
+
+
 def run_collect(settings: Settings, client, logger: Logger, *,
                 env_values: Optional[Dict[str, str]] = None,
                 fetcher=fetch_subscription,
@@ -181,6 +212,23 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         warn=logger.warn,
     )
     logger.info(result.summary())
+
+    # Local supplement (e.g. a host's app-extracted provider file): merged
+    # into source 1 after fetching, before the empty check.  A host whose
+    # subscription fetch is blocked (403) still contributes its local nodes
+    # to the shared table; semantic de-dupe keeps fetched nodes first so a
+    # working fetch is never shadowed by the file.
+    if settings.supplement_yaml:
+        extra = _load_supplement(settings.supplement_yaml, logger.warn)
+        if extra:
+            fetched_first = [n for n in result.nodes if n.source_number == 1]
+            rest = [n for n in result.nodes if n.source_number != 1]
+            source_name = schema.SOURCE_BY_INDEX[1]
+            merged, duplicates = collect_mod._merge(fetched_first + extra)
+            result.nodes = rest + merged
+            result.duplicates += duplicates
+            logger.info(f"supplement merged source={source_name} "
+                        f"nodes={len(merged)} duplicates={duplicates}")
 
     # Record every attempt (success or failure) as soon as the fetch phase
     # ends.  This does not depend on the total-table write below, and a failed

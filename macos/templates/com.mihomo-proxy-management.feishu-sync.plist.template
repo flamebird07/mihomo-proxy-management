@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-m</string>
+		<string>mpm_macos.feishu_sync</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>__PACKAGE_DIR__</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<!-- Periodic Feishu speedtest sync (tables 2/3).  No RunAtLoad and no
+	     KeepAlive on purpose: the first tick fires one interval after the
+	     job is loaded, and a failing tick must not be retried immediately -
+	     the next interval does that.  launchd skips ticks while a run is
+	     still going, so a slow sync cannot overlap itself. -->
+	<key>StartInterval</key>
+	<integer>__SYNC_INTERVAL__</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>__MIHOMO_HOME__</string>
+	<key>StandardOutPath</key>
+	<string>__LOG_OUT__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_ERR__</string>
+</dict>
+</plist>

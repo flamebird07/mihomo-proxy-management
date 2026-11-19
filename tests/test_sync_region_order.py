@@ -534,6 +534,28 @@ class CorpseCleanupTests(unittest.TestCase):
             stale = sync.find_stale_corpse_dirs([root], max_age_s=1800.0)
             self.assertEqual([p.name for p in stale], ["mihomo-feishu-old"])
 
+    def test_macos_cleanup_does_not_scan_or_signal_system_processes(self):
+        """darwin-safety under the upstream owner.json design: cleanup never
+        inspects or signals processes on any platform, so a launchd system job
+        can never kill another user's process by directory-name substring."""
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as root, \
+             patch.object(sync.sys, "platform", "darwin"), \
+             patch.object(sync.subprocess, "run") as run, \
+             patch.object(sync.os, "kill") as kill:
+            stale_dir = Path(root) / "mihomo-feishu-old"
+            stale_dir.mkdir()
+            past = time.time() - 7200
+            os.utime(stale_dir, (past, past))
+            procs, dirs = sync.cleanup_temp_corpses(RecordingLog(), temp_roots=[root])
+            self.assertEqual(procs, 0)
+            # no owner.json -> fail-closed: kept, never removed, never signalled
+            self.assertEqual(dirs, 0)
+            self.assertTrue(stale_dir.exists())
+        run.assert_not_called()
+        kill.assert_not_called()
+        self.assertFalse(hasattr(sync, "_kill_corpse_processes"))
+
     def test_cleanup_removes_stale_keeps_production(self):
         import tempfile as _tempfile
         with _tempfile.TemporaryDirectory() as root:

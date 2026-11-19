@@ -136,8 +136,82 @@ class _NamedMutex:
             k32.CloseHandle(handle)
 
 
+def posix_mutex_available() -> bool:
+    """True when a real cross-process ``flock`` mutex can be used (POSIX)."""
+    if os.name == "nt":
+        return False
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:  # pragma: no cover - exotic POSIX without fcntl
+        return False
+    return True
+
+
+def posix_lock_path(name: str) -> str:
+    """Deterministic lock-file path for a Windows-style ``Local\\name``."""
+    import re
+    import tempfile
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "unnamed-mutex"
+    directory = os.environ.get("NAMED_MUTEX_LOCK_DIR") or tempfile.gettempdir()
+    return os.path.join(directory, f".{safe}.lock")
+
+
+class _PosixFileMutex:
+    """One acquisition of a POSIX ``flock`` mutex (kernel-released on death).
+
+    Mirrors :class:`_NamedMutex`: ``LOCK_EX | LOCK_NB`` with a bounded retry
+    (30 s budget, 0.2 s steps), ``LockBusy`` on timeout. The kernel drops the
+    lock when the holder dies, so the abandoned-takeover case needs no special
+    handling. The lock file itself is never removed (unlink races a concurrent
+    holder into two independent locks).
+    """
+
+    def __init__(self, name: str, *, timeout_ms: int = WAIT_TIMEOUT_MS) -> None:
+        self.name = name
+        self.timeout_ms = timeout_ms
+        self._fd: Any = None
+        self.took_over = False  # flock semantics: a dead holder frees silently
+
+    def __enter__(self) -> "_PosixFileMutex":
+        import fcntl
+        import time as _time
+
+        path = posix_lock_path(self.name)
+        self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = _time.monotonic() + self.timeout_ms / 1000.0
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if _time.monotonic() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise LockBusy(self.name)
+                _time.sleep(0.2)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def named_mutex_lock_factory(name: str = LOCK_NAME):
-    """Return a context manager that holds the named mutex ``name``."""
+    """Return a context manager that holds the named mutex ``name``.
+
+    Windows kernel32 named mutex first; a real ``flock`` file mutex on POSIX
+    (cross-process, e.g. two launchd daemons on macOS); the process-wide
+    serial fallback only when neither exists.
+    """
     if windows_mutex_available():
         return _NamedMutex(name)
+    if posix_mutex_available():
+        return _PosixFileMutex(name)
     return serial_lock_factory(name)
