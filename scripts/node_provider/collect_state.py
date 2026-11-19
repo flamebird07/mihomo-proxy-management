@@ -1,20 +1,20 @@
-"""Cross-machine daily-collect state stored in the Feishu 「采集状态」 table.
+"""Cross-machine rolling-24h collect state in the Feishu 「采集状态」 table.
 
 Node collection runs on several machines and is scheduled hourly, but each
-source only needs to be read once per local calendar day.  Every successful
-read is recorded in Feishu; any machine that sees a source already read today
-skips it.
+source only needs to be attempted once per rolling 24-hour window.  Every
+attempt - successful or failed - is recorded in Feishu; any machine that sees
+an attempt less than 24 hours old skips that source.
 
 Design rules:
   * state lives only in Feishu - no local state file exists;
   * reads are fail-open: if the table cannot be read, collect as usual;
   * writes are best-effort: a failed state write must never fail collection;
-  * state rows are keyed by (源编号, 通道); at most one row per key.
+  * state rows are keyed by (源编号, 通道); at most one row per key;
+  * 最近读取时间 is the last *attempt* time; a failed attempt records 节点数=0.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import app_extract, schema
@@ -22,6 +22,8 @@ from .feishu import FeishuError
 
 SkipKey = Tuple[str, int]  # (通道, 源编号)
 Entry = Tuple[int, str, str, int]  # (源编号, 来源名, 通道, 节点数)
+
+SKIP_WINDOW_MS = 24 * 60 * 60 * 1000  # rolling window, not a calendar day
 
 
 def parse_number(value: Any) -> Optional[int]:
@@ -54,17 +56,13 @@ def parse_time_ms(value: Any) -> Optional[int]:
     return number
 
 
-def local_day(ms: int) -> Optional[Tuple[int, int, int]]:
-    """Local calendar day (year, month, day) for an epoch-millisecond stamp."""
-    try:
-        return time.localtime(int(ms) / 1000.0)[:3]
-    except (OverflowError, OSError, ValueError, TypeError):
-        return None
-
-
 def read_skip_set(client, now_ms: int,
                   log: Callable[[str], None]) -> Set[SkipKey]:
-    """Return the (通道, 源编号) keys whose last successful read was today.
+    """Return the (通道, 源编号) keys attempted less than 24 hours ago.
+
+    The window rolls with wall-clock time: a stamp 23h59m old is skipped, one
+    exactly 24h old is not, regardless of calendar-day boundaries.  Rows whose
+    timestamp is missing, unparsable or non-positive are ignored.
 
     Fail-open: a missing table or any FeishuError yields an empty set, so
     collection proceeds (duplicate reads are preferable to stale data).
@@ -88,9 +86,6 @@ def read_skip_set(client, now_ms: int,
         log(f"collect state read failed class={exc.kind}")
         return set()
 
-    today = local_day(now_ms)
-    if today is None:
-        return set()
     skip: Set[SkipKey] = set()
     for row in rows:
         fields = row.get("fields") or {}
@@ -101,35 +96,60 @@ def read_skip_set(client, now_ms: int,
         if source_number is None:
             continue
         read_at = parse_time_ms(fields.get("最近读取时间"))
-        if read_at is None or local_day(read_at) != today:
+        if read_at is None:
             continue
-        skip.add((channel, source_number))
+        if now_ms - read_at < SKIP_WINDOW_MS:
+            skip.add((channel, source_number))
     return skip
 
 
-def success_entries(result: Any) -> List[Entry]:
-    """Build state entries from the channels that succeeded this run."""
-    name_to_number = {name: number for number, name in schema.SOURCE_BY_INDEX.items()}
+def _entry_for(channel: str, ident: str, count: int) -> Optional[Entry]:
+    if channel == schema.COLLECT_CHANNEL_SUBSCRIPTION:
+        number = {name: num for num, name in schema.SOURCE_BY_INDEX.items()}.get(ident)
+        if number is None:
+            return None
+        return (number, ident, channel, count)
+    if channel == schema.COLLECT_CHANNEL_APP:
+        number = app_extract.APP_SOURCE_NUMBER.get(ident)
+        if number is None or number not in schema.SOURCE_BY_INDEX:
+            return None
+        return (number, schema.SOURCE_BY_INDEX[number], channel, count)
+    return None
+
+
+def attempt_entries(result: Any) -> List[Entry]:
+    """Build state entries from every channel attempted this run.
+
+    Successful channels carry their node count; each channel in ``failed``
+    yields an entry with 节点数=0 so the 24-hour window also suppresses
+    retries after a failure.  Skipped channels produce no entry.
+    """
     entries: List[Entry] = []
-    for key, count in sorted(result.per_channel.items()):
+    seen: Set[str] = set()
+
+    def add(key: str, count: int) -> None:
+        if key in seen:
+            return
         channel, _, ident = key.partition(":")
-        if channel == schema.COLLECT_CHANNEL_SUBSCRIPTION:
-            number = name_to_number.get(ident)
-            if number is None:
-                continue
-            entries.append((number, ident, channel, count))
-        elif channel == schema.COLLECT_CHANNEL_APP:
-            number = app_extract.APP_SOURCE_NUMBER.get(ident)
-            if number is None:
-                continue
-            entries.append((number, schema.SOURCE_BY_INDEX[number], channel, count))
+        entry = _entry_for(channel, ident, count)
+        if entry is not None:
+            seen.add(key)
+            entries.append(entry)
+
+    for key, count in sorted(result.per_channel.items()):
+        add(key, count)
+    for key in sorted(result.failed):
+        add(key, 0)
     return entries
 
 
-def record_success(client, table_id: str, entries: Iterable[Entry],
-                   hostname: str, stamp: int,
-                   log: Callable[[str], None]) -> None:
-    """Upsert one state row per (源编号, 通道).  Never raises."""
+def record_attempts(client, table_id: str, entries: Iterable[Entry],
+                    hostname: str, stamp: int,
+                    log: Callable[[str], None]) -> None:
+    """Upsert one state row per (源编号, 通道) for successful and failed attempts.
+
+    Never raises; a failed write is logged and collection continues.
+    """
     entries = list(entries)
     if not entries:
         return

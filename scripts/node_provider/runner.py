@@ -3,7 +3,7 @@
 Default (provide): read 「有效节点」 -> rebuild -> atomic write.
 ``--collect``: extract nodes (subscription and/or app) -> per-source
 replacement of 「节点测速总表」 identity/config columns, skipping any source
-already read today (recorded in 「采集状态」 by any machine).
+attempted within the last 24 hours (recorded in 「采集状态」 by any machine).
 
 Side effects: Feishu network I/O and, unless ``--dry-run``, either one atomic
 YAML replacement or per-source Feishu row replacement plus a state upsert.  No
@@ -116,6 +116,20 @@ def run(settings: Settings, client, logger: Logger, now_ms: Optional[int] = None
     return EXIT_PARTIAL if result.invalid else EXIT_OK
 
 
+def _record_attempts(client, result, host: str, stamp: int,
+                     logger: Logger) -> None:
+    """Record every attempted channel; a missing state table only warns."""
+    try:
+        state_table_id = ensure_table(
+            client, schema.COLLECT_STATE_TABLE, logger.info)["table_id"]
+    except FeishuError as exc:
+        logger.warn(f"collect state table unavailable class={exc.kind}")
+        return
+    collect_state.record_attempts(
+        client, state_table_id, collect_state.attempt_entries(result),
+        host, stamp, logger.warn)
+
+
 def run_collect(settings: Settings, client, logger: Logger, *,
                 env_values: Optional[Dict[str, str]] = None,
                 fetcher=fetch_subscription,
@@ -147,9 +161,9 @@ def run_collect(settings: Settings, client, logger: Logger, *,
     stamp = now_ms if now_ms is not None else collect_mod.now_ms()
     host = hostname if hostname is not None else socket.gethostname()
 
-    # Sources already read today on any machine are skipped.  Dry-run still
-    # performs this read so the reported plan matches a real run, but never
-    # creates the state table or writes to it.
+    # Sources attempted within the last 24 hours on any machine are skipped.
+    # Dry-run still performs this read so the reported plan matches a real run,
+    # but never creates the state table or writes to it.
     skip: set = set()
     if client is not None:
         skip = collect_state.read_skip_set(client, stamp, logger.warn)
@@ -167,12 +181,18 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         warn=logger.warn,
     )
     logger.info(result.summary())
+
+    # Record every attempt (success or failure) as soon as the fetch phase
+    # ends.  This does not depend on the total-table write below, and a failed
+    # state table only warns.  Dry-run never touches the state table.
+    if not settings.dry_run:
+        _record_attempts(client, result, host, stamp, logger)
+
     if not result.nodes:
         if result.skipped:
-            # Daily cadence: everything readable today was already read; the
-            # remaining failures (e.g. a banned source) are reported in the
-            # summary and retried next hour, not treated as a collect failure.
-            logger.info("collect skipped all sources read_today "
+            # Rolling-24h cadence: everything due was already attempted; the
+            # remaining failures are now recorded too and skipped next hour.
+            logger.info("collect skipped all sources within_24h "
                         f"failed={len(result.failed)}")
             return EXIT_OK
         logger.error("no nodes collected from any channel")
@@ -198,17 +218,6 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         logger.error(f"table write failed class={type(exc).__name__}")
         return EXIT_READ
 
-    state_table_id = None
-    try:
-        state_table_id = ensure_table(
-            client, schema.COLLECT_STATE_TABLE, logger.info)["table_id"]
-    except FeishuError as exc:
-        logger.warn(f"collect state table unavailable class={exc.kind}")
-
-    entries_by_source: Dict[int, List[Any]] = {}
-    for entry in collect_state.success_entries(result):
-        entries_by_source.setdefault(entry[0], []).append(entry)
-
     total_created = 0
     for source_number in sorted(grouped):
         source_records = grouped[source_number]
@@ -225,10 +234,6 @@ def run_collect(settings: Settings, client, logger: Logger, *,
                          f"class={type(exc).__name__}")
             return EXIT_READ
         total_created += created
-        if state_table_id and created == len(source_records):
-            collect_state.record_success(
-                client, state_table_id, entries_by_source.get(source_number, ()),
-                host, stamp, logger.warn)
 
     logger.info(f"collect written nodes={total_created}")
     return EXIT_OK

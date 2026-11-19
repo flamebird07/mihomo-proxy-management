@@ -119,7 +119,7 @@ def _collect_subscription(env_values: Dict[str, str], timeout: int,
     for slot, number in sorted(schema.SUBSCRIPTION_SOURCE_BY_ENV_SLOT.items()):
         source = schema.SOURCE_BY_INDEX[number]
         if skip and ("subscription", number) in skip:
-            warn(f"source={source} skipped reason=read_today")
+            warn(f"source={source} skipped reason=within_24h")
             result.skipped.append(f"subscription:{source}")
             continue
         info = settings_by_index.get(str(slot))
@@ -169,7 +169,7 @@ def _collect_app(from_app: List[str], warn: Callable[[str], None],
         source_number = app_extract.APP_SOURCE_NUMBER[name]
         source = schema.SOURCE_BY_INDEX[source_number]
         if skip and ("app", source_number) in skip:
-            warn(f"source={source} app={name} skipped reason=read_today")
+            warn(f"source={source} app={name} skipped reason=within_24h")
             result.skipped.append(f"app:{name}")
             continue
         result.attempted += 1

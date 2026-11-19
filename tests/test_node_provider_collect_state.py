@@ -5,6 +5,7 @@ All clients are synthetic: no network, no real Feishu, no file state.
 
 import os
 import sys
+import time
 import types
 import unittest
 
@@ -20,7 +21,9 @@ from node_provider.runner import Settings, run_collect  # noqa: E402
 from node_provider.subscription import SubscriptionError  # noqa: E402
 
 NOW_MS = 1_700_000_000_000
-YESTERDAY_MS = NOW_MS - 86_400_000
+HOUR_MS = 3_600_000
+DAY_MS = 24 * HOUR_MS
+EXACTLY_24H_MS = NOW_MS - DAY_MS
 YAML_ONE = """
 proxies:
   - name: us-01
@@ -93,15 +96,36 @@ class StateClient:
 
 
 class ReadSkipTests(unittest.TestCase):
-    def test_today_read_is_skipped(self):
+    def test_just_now_attempt_is_skipped(self):
         client = StateClient([state_row(1)])
         skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
         self.assertEqual(skip, {("subscription", 1)})
 
-    def test_yesterday_read_is_not_skipped(self):
-        client = StateClient([state_row(1, read_at=YESTERDAY_MS)])
+    def test_23h59m_old_attempt_is_skipped(self):
+        client = StateClient([state_row(1, read_at=NOW_MS - (DAY_MS - 60_000))])
+        skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
+        self.assertEqual(skip, {("subscription", 1)})
+
+    def test_exactly_24h_old_attempt_is_not_skipped(self):
+        client = StateClient([state_row(1, read_at=EXACTLY_24H_MS)])
         skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
         self.assertEqual(skip, set())
+
+    def test_25h_old_attempt_is_not_skipped(self):
+        client = StateClient([state_row(1, read_at=NOW_MS - 25 * HOUR_MS)])
+        skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
+        self.assertEqual(skip, set())
+
+    def test_cross_day_but_under_24h_is_still_skipped(self):
+        local_midnight = time.mktime(
+            (time.localtime(NOW_MS / 1000.0)[:3] + (0, 0, 0, 0, 0, -1)))
+        now_ms = int(local_midnight * 1000) + 30 * 60_000      # 00:30 local
+        read_at = now_ms - 2 * HOUR_MS                          # 22:30 previous day
+        self.assertNotEqual(time.localtime(read_at / 1000.0)[:3],
+                            time.localtime(now_ms / 1000.0)[:3])
+        client = StateClient([state_row(1, read_at=read_at)])
+        skip = collect_state.read_skip_set(client, now_ms, lambda _m: None)
+        self.assertEqual(skip, {("subscription", 1)})
 
     def test_numeric_string_readback_is_parsed(self):
         row = state_row("1", read_at=str(NOW_MS))
@@ -219,10 +243,10 @@ class ReplaceSourceRowsTests(unittest.TestCase):
         self.assertEqual([row["record_id"] for row in client.rows], ["a1"])
 
 
-class RecordSuccessTests(unittest.TestCase):
+class RecordAttemptsTests(unittest.TestCase):
     def test_no_row_creates(self):
         client = StateClient([])
-        collect_state.record_success(
+        collect_state.record_attempts(
             client, "tbl-state", [(1, "飞兔", "subscription", 4)],
             "machine-a", NOW_MS, lambda _m: None)
         self.assertEqual([w[0] for w in client.writes], ["batch_create"])
@@ -232,9 +256,18 @@ class RecordSuccessTests(unittest.TestCase):
         self.assertEqual(fields["最近读取时间"], NOW_MS)
         self.assertEqual(fields["节点数"], 4)
 
+    def test_failed_attempt_is_recorded_with_zero_nodes(self):
+        client = StateClient([])
+        collect_state.record_attempts(
+            client, "tbl-state", [(2, "CoffeeCloud", "subscription", 0)],
+            "machine-a", NOW_MS, lambda _m: None)
+        fields = client.writes[0][2][0]["fields"]
+        self.assertEqual(fields["源编号"], 2)
+        self.assertEqual(fields["节点数"], 0)
+
     def test_existing_row_updates(self):
         client = StateClient([state_row(1, record_id="state-1")])
-        collect_state.record_success(
+        collect_state.record_attempts(
             client, "tbl-state", [(1, "飞兔", "subscription", 9)],
             "machine-b", NOW_MS + 5, lambda _m: None)
         self.assertEqual([w[0] for w in client.writes], ["update_record"])
@@ -244,18 +277,19 @@ class RecordSuccessTests(unittest.TestCase):
     def test_write_failure_does_not_raise(self):
         logger = Logger()
         client = StateClient([], write_error=True)
-        collect_state.record_success(
+        collect_state.record_attempts(
             client, "tbl-state", [(1, "飞兔", "subscription", 1)],
             "machine-a", NOW_MS, logger.warn)
         self.assertTrue(any("collect state write failed" in line
                             for line in logger.lines))
 
 
-class SuccessEntryNumberingTests(unittest.TestCase):
+class AttemptEntryNumberingTests(unittest.TestCase):
     def test_subscription_entry_uses_env_slot_source_number(self):
         result = types.SimpleNamespace(
-            per_channel={"subscription:CoffeeCloud": 5, "subscription:飞兔": 3})
-        entries = collect_state.success_entries(result)
+            per_channel={"subscription:CoffeeCloud": 5, "subscription:飞兔": 3},
+            failed=[])
+        entries = collect_state.attempt_entries(result)
         self.assertEqual(entries, [
             (2, "CoffeeCloud", "subscription", 5),
             (1, "飞兔", "subscription", 3),
@@ -263,12 +297,29 @@ class SuccessEntryNumberingTests(unittest.TestCase):
 
     def test_app_entry_uses_renumbered_app_source(self):
         result = types.SimpleNamespace(
-            per_channel={"app:source4": 7, "app:source3": 2})
-        entries = collect_state.success_entries(result)
+            per_channel={"app:source4": 7, "app:source3": 2},
+            failed=[])
+        entries = collect_state.attempt_entries(result)
         self.assertEqual(entries, [
             (2, "CoffeeCloud", "app", 2),
             (3, "西瓜加速", "app", 7),
         ])
+
+    def test_failed_channels_become_zero_node_entries(self):
+        result = types.SimpleNamespace(
+            per_channel={"subscription:飞兔": 3},
+            failed=["subscription:CoffeeCloud", "app:source4"])
+        entries = collect_state.attempt_entries(result)
+        self.assertEqual(entries, [
+            (1, "飞兔", "subscription", 3),
+            (3, "西瓜加速", "app", 0),
+            (2, "CoffeeCloud", "subscription", 0),
+        ])
+
+    def test_skipped_channels_produce_no_entries(self):
+        result = types.SimpleNamespace(
+            per_channel={}, failed=[], skipped=["subscription:飞兔"])
+        self.assertEqual(collect_state.attempt_entries(result), [])
 
 
 class CollectSkipTests(unittest.TestCase):
@@ -313,12 +364,14 @@ class CollectSkipTests(unittest.TestCase):
 class TableClient:
     """Fake Feishu client covering nodes/valid/state tables."""
 
-    def __init__(self, node_rows=None, state_rows=None, include_state=True):
+    def __init__(self, node_rows=None, state_rows=None, include_state=True,
+                 nodes_write_error=False):
         self.rows = {
             "tbl-nodes": list(node_rows or []),
             "tbl-valid": [],
             "tbl-state": list(state_rows or []),
         }
+        self.nodes_write_error = nodes_write_error
         self.tables = [
             {"name": schema.NODES_TABLE_NAME, "table_id": "tbl-nodes"},
             {"name": schema.VALID_TABLE_NAME, "table_id": "tbl-valid"},
@@ -350,6 +403,8 @@ class TableClient:
 
     def batch_create(self, table_id, records):
         self.calls.append(("batch_create", table_id, records))
+        if self.nodes_write_error and table_id == "tbl-nodes":
+            raise FeishuError("api_error")
         ids = []
         for record in records:
             self._seq += 1
@@ -404,10 +459,10 @@ class RunCollectStateTests(unittest.TestCase):
         writes = [call for call in client.calls
                   if call[0] in ("batch_create", "batch_delete", "update_record")]
         self.assertEqual(writes, [])
-        self.assertTrue(any("skipped all sources read_today" in line
+        self.assertTrue(any("skipped all sources within_24h" in line
                             for line in logger.lines))
 
-    def test_skipped_with_failed_sources_is_exit_ok_and_zero_write(self):
+    def test_skipped_with_failed_source_records_failure_and_exit_ok(self):
         client = TableClient(state_rows=[state_row(1)])
         logger = Logger()
         code = run_collect(
@@ -415,10 +470,15 @@ class RunCollectStateTests(unittest.TestCase):
             fetcher=fetcher_map({}),
             hostname="machine-a", now_ms=NOW_MS)
         self.assertEqual(code, 0)
-        writes = [call for call in client.calls
-                  if call[0] in ("batch_create", "batch_delete", "update_record")]
-        self.assertEqual(writes, [])
-        self.assertTrue(any("skipped all sources read_today" in line
+        # No total-table write (no nodes), but the failed attempt is recorded.
+        node_writes = [call for call in client.calls
+                       if call[0] in ("batch_create", "batch_delete")
+                       and call[1] == "tbl-nodes"]
+        self.assertEqual(node_writes, [])
+        state = {(r["fields"]["通道"], r["fields"]["源编号"]): r["fields"]["节点数"]
+                 for r in client.rows["tbl-state"]}
+        self.assertEqual(state[("subscription", 2)], 0)
+        self.assertTrue(any("skipped all sources within_24h" in line
                             for line in logger.lines))
 
     def test_partial_skip_replaces_only_collected_source(self):
@@ -437,7 +497,7 @@ class RunCollectStateTests(unittest.TestCase):
         self.assertIn("s1-old", node_ids)      # skipped source untouched
         self.assertIn("s3-old", node_ids)      # other source untouched
         self.assertNotIn("s2-old", node_ids)   # collected source (CoffeeCloud) replaced
-        self.assertIn("new1", node_ids)
+        self.assertTrue(any(record_id.startswith("new") for record_id in node_ids))
         created_tables = [call[1] for call in client.calls
                           if call[0] == "batch_create" and call[1] == "tbl-nodes"]
         self.assertEqual(set(created_tables), {"tbl-nodes"})
@@ -448,12 +508,13 @@ class RunCollectStateTests(unittest.TestCase):
                                  {"CoffeeCloud"})
         state_rows = client.rows["tbl-state"]
         keys = {(r["fields"]["通道"], r["fields"]["源编号"]) for r in state_rows}
-        self.assertIn(("subscription", 1), keys)   # pre-existing today row
+        self.assertIn(("subscription", 1), keys)   # pre-existing row untouched
         self.assertIn(("subscription", 2), keys)   # newly recorded (CoffeeCloud)
-        self.assertFalse(any(r["fields"]["最近读取时间"] == YESTERDAY_MS
-                             for r in state_rows))
+        recorded = {(r["fields"]["通道"], r["fields"]["源编号"]): r["fields"]
+                    for r in state_rows}
+        self.assertEqual(recorded[("subscription", 2)]["最近读取时间"], NOW_MS)
 
-    def test_failed_source_does_not_record_state(self):
+    def test_failed_source_and_success_both_recorded(self):
         node_rows = [{"record_id": "s3-old", "fields": {"源编号": 3}}]
         client = TableClient(node_rows=node_rows, state_rows=[])
         code = run_collect(
@@ -461,10 +522,38 @@ class RunCollectStateTests(unittest.TestCase):
             fetcher=fetcher_map({ENV_1_3["SUBSCRIPTION_URL_3"]: URI_ONE}),
             hostname="machine-c", now_ms=NOW_MS)
         self.assertEqual(code, 0)
-        state_keys = {(r["fields"]["通道"], r["fields"]["源编号"])
-                      for r in client.rows["tbl-state"]}
-        self.assertEqual(state_keys, {("subscription", 2)})
+        state = {(r["fields"]["通道"], r["fields"]["源编号"]): r["fields"]["节点数"]
+                 for r in client.rows["tbl-state"]}
+        # 飞兔 (源1) never produced a body -> failed attempt, 0 nodes.
+        # CoffeeCloud (源2) succeeded with one node.
+        self.assertEqual(state, {("subscription", 1): 0, ("subscription", 2): 1})
         self.assertIn("s3-old", [r["record_id"] for r in client.rows["tbl-nodes"]])
+
+    def test_all_attempts_fail_exit_read_and_record_zero(self):
+        client = TableClient(state_rows=[])
+        logger = Logger()
+        code = run_collect(
+            settings(), client, logger, env_values=ENV_1_3,
+            fetcher=fetcher_map({}),
+            hostname="machine-a", now_ms=NOW_MS)
+        self.assertEqual(code, 3)
+        state = {(r["fields"]["通道"], r["fields"]["源编号"]): r["fields"]["节点数"]
+                 for r in client.rows["tbl-state"]}
+        self.assertEqual(state, {("subscription", 1): 0, ("subscription", 2): 0})
+        self.assertTrue(any("no nodes collected" in line for line in logger.lines))
+
+    def test_total_table_write_failure_still_records_attempt(self):
+        client = TableClient(state_rows=[], nodes_write_error=True)
+        logger = Logger()
+        code = run_collect(
+            settings(), client, logger, env_values=ENV_ONE,
+            fetcher=fetcher_map({ENV_ONE["SUBSCRIPTION_URL_1"]: YAML_ONE}),
+            hostname="machine-a", now_ms=NOW_MS)
+        self.assertEqual(code, 3)
+        state = {(r["fields"]["通道"], r["fields"]["源编号"]): r["fields"]["节点数"]
+                 for r in client.rows["tbl-state"]}
+        self.assertEqual(state, {("subscription", 1): 1})
+        self.assertTrue(any("table write failed" in line for line in logger.lines))
 
     def test_dry_run_zero_write_and_keeps_rows(self):
         node_rows = [{"record_id": "s1-old", "fields": {"源编号": 1}}]
