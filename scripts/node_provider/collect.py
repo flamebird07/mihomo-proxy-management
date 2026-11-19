@@ -9,8 +9,12 @@ The channels are independent: one failing source never blocks the others.  A
 source returning HTTP 200 with an empty body is classified ``empty`` and
 counted as failed, never raised.
 
-The merged pool replaces 「节点测速总表」.  Only identity/config columns are
-written; measurement columns are reset to defaults and belong to node_ops.
+The merged pool is written back to 「节点测速总表」 per source (see runner).
+Only identity/config columns are written; measurement columns are reset to
+defaults and belong to node_ops.
+
+A source listed in ``skip`` (channel, source number) was already read today
+on some machine and is neither fetched nor attempted.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ class CollectResult:
     nodes: List[CollectedNode] = field(default_factory=list)
     per_channel: Dict[str, int] = field(default_factory=dict)
     failed: List[str] = field(default_factory=list)
+    skipped: List[str] = field(default_factory=list)
     attempted: int = 0
     duplicates: int = 0
 
@@ -63,7 +68,8 @@ class CollectResult:
     def summary(self) -> str:
         channels = ",".join(f"{key}={value}" for key, value in sorted(self.per_channel.items()))
         return (f"collected={self.collected} duplicates={self.duplicates} "
-                f"failed={len(self.failed)} channels=[{channels}]")
+                f"failed={len(self.failed)} skipped={len(self.skipped)} "
+                f"channels=[{channels}]")
 
 
 def _merge(items: Iterable[CollectedNode]) -> tuple[List[CollectedNode], int]:
@@ -106,12 +112,17 @@ SUBSCRIPTION_RETRIES = 2
 def _collect_subscription(env_values: Dict[str, str], timeout: int,
                           fetcher: Callable[[str, str, int], str],
                           warn: Callable[[str], None],
-                          result: CollectResult) -> List[CollectedNode]:
+                          result: CollectResult,
+                          skip: Optional[set] = None) -> List[CollectedNode]:
     nodes: List[CollectedNode] = []
     settings_by_index = source_settings(env_values)
-    for index in range(1, 4):
-        source = schema.SOURCE_BY_INDEX[index]
-        info = settings_by_index.get(str(index))
+    for slot, number in sorted(schema.SUBSCRIPTION_SOURCE_BY_ENV_SLOT.items()):
+        source = schema.SOURCE_BY_INDEX[number]
+        if skip and ("subscription", number) in skip:
+            warn(f"source={source} skipped reason=within_24h")
+            result.skipped.append(f"subscription:{source}")
+            continue
+        info = settings_by_index.get(str(slot))
         if info is None:
             warn(f"source={source} skipped reason=no_url")
             continue
@@ -141,7 +152,7 @@ def _collect_subscription(env_values: Dict[str, str], timeout: int,
             warn(f"source={source} failed class={type(exc).__name__.lower()}")
             continue
         result.per_channel[f"subscription:{source}"] = len(parsed)
-        nodes.extend(CollectedNode(config=node, source=source, source_number=index)
+        nodes.extend(CollectedNode(config=node, source=source, source_number=number)
                      for node in parsed)
         warn(f"source={source} collected={len(parsed)}")
     return nodes
@@ -151,11 +162,16 @@ def _collect_app(from_app: List[str], warn: Callable[[str], None],
                  result: CollectResult, *,
                  source1_pid: Optional[int],
                  source1_exe, source1_reader,
-                 vault_dir, hostname) -> List[CollectedNode]:
+                 vault_dir, hostname,
+                 skip: Optional[set] = None) -> List[CollectedNode]:
     nodes: List[CollectedNode] = []
     for name in from_app:
         source_number = app_extract.APP_SOURCE_NUMBER[name]
         source = schema.SOURCE_BY_INDEX[source_number]
+        if skip and ("app", source_number) in skip:
+            warn(f"source={source} app={name} skipped reason=within_24h")
+            result.skipped.append(f"app:{name}")
+            continue
         result.attempted += 1
         try:
             extracted = app_extract.extract_app(
@@ -189,16 +205,19 @@ def collect(env_values: Dict[str, str], *, timeout: int = 30,
             source1_reader: Optional[Any] = None,
             vault_dir=None,
             hostname: Optional[str] = None,
+            skip: Optional[set] = None,
             warn: Optional[Callable[[str], None]] = None) -> CollectResult:
     log = warn or (lambda _message: None)
     result = CollectResult()
     candidates: List[CollectedNode] = []
-    candidates.extend(_collect_subscription(env_values, timeout, fetcher, log, result))
+    candidates.extend(_collect_subscription(
+        env_values, timeout, fetcher, log, result, skip=skip))
     if from_app:
         candidates.extend(_collect_app(
             list(dict.fromkeys(from_app)), log, result,
             source1_pid=source1_pid, source1_exe=source1_exe,
             source1_reader=source1_reader, vault_dir=vault_dir, hostname=hostname,
+            skip=skip,
         ))
     result.nodes, result.duplicates = _merge(candidates)
     return result

@@ -1,22 +1,24 @@
 """Orchestration for both node_provider modes.
 
 Default (provide): read 「有效节点」 -> rebuild -> atomic write.
-``--collect``: extract nodes (subscription and/or app) -> full replacement of
-「节点测速总表」 identity/config columns.
+``--collect``: extract nodes (subscription and/or app) -> per-source
+replacement of 「节点测速总表」 identity/config columns, skipping any source
+attempted within the last 24 hours (recorded in 「采集状态」 by any machine).
 
 Side effects: Feishu network I/O and, unless ``--dry-run``, either one atomic
-YAML replacement or one Feishu table replacement.  No mihomo controller is
-contacted.
+YAML replacement or per-source Feishu row replacement plus a state upsert.  No
+mihomo controller is contacted.
 """
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import builder, collect as collect_mod, schema
+from . import builder, collect as collect_mod, collect_state, schema
 from .envfile import EnvFileError, read_env_file
-from .feishu import FeishuError, ensure_table, replace_all
+from .feishu import FeishuError, ensure_table, replace_source_rows
 from .logutil import Logger
 from .subscription import DEFAULT_FETCH_PROXY, fetch_subscription
 from .writer import OutputError, atomic_write
@@ -114,6 +116,20 @@ def run(settings: Settings, client, logger: Logger, now_ms: Optional[int] = None
     return EXIT_PARTIAL if result.invalid else EXIT_OK
 
 
+def _record_attempts(client, result, host: str, stamp: int,
+                     logger: Logger) -> None:
+    """Record every attempted channel; a missing state table only warns."""
+    try:
+        state_table_id = ensure_table(
+            client, schema.COLLECT_STATE_TABLE, logger.info)["table_id"]
+    except FeishuError as exc:
+        logger.warn(f"collect state table unavailable class={exc.kind}")
+        return
+    collect_state.record_attempts(
+        client, state_table_id, collect_state.attempt_entries(result),
+        host, stamp, logger.warn)
+
+
 def run_collect(settings: Settings, client, logger: Logger, *,
                 env_values: Optional[Dict[str, str]] = None,
                 fetcher=fetch_subscription,
@@ -142,6 +158,16 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         def fetcher(url, ua, timeout, _proxy=proxy):
             return fetch_subscription(url, ua, timeout, fetch_proxy=_proxy)
 
+    stamp = now_ms if now_ms is not None else collect_mod.now_ms()
+    host = hostname if hostname is not None else socket.gethostname()
+
+    # Sources attempted within the last 24 hours on any machine are skipped.
+    # Dry-run still performs this read so the reported plan matches a real run,
+    # but never creates the state table or writes to it.
+    skip: set = set()
+    if client is not None:
+        skip = collect_state.read_skip_set(client, stamp, logger.warn)
+
     result = collect_mod.collect(
         values,
         timeout=settings.timeout,
@@ -151,29 +177,63 @@ def run_collect(settings: Settings, client, logger: Logger, *,
         source1_reader=source1_reader,
         vault_dir=settings.vault_dir,
         hostname=hostname,
+        skip=skip,
         warn=logger.warn,
     )
     logger.info(result.summary())
+
+    # Record every attempt (success or failure) as soon as the fetch phase
+    # ends.  This does not depend on the total-table write below, and a failed
+    # state table only warns.  Dry-run never touches the state table.
+    if not settings.dry_run:
+        _record_attempts(client, result, host, stamp, logger)
+
     if not result.nodes:
+        if result.skipped:
+            # Rolling-24h cadence: everything due was already attempted; the
+            # remaining failures are now recorded too and skipped next hour.
+            logger.info("collect skipped all sources within_24h "
+                        f"failed={len(result.failed)}")
+            return EXIT_OK
         logger.error("no nodes collected from any channel")
         return EXIT_READ
 
-    stamp = now_ms if now_ms is not None else collect_mod.now_ms()
     records = collect_mod.build_records(result.nodes, stamp)
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(int(record["fields"]["源编号"]), []).append(record)
 
     if settings.dry_run:
-        logger.info(f"dry-run: no Feishu write; node_rows={len(records)}")
+        sources = ",".join(str(number) for number in sorted(grouped))
+        logger.info(f"dry-run: no Feishu write; node_rows={len(records)} "
+                    f"replace_sources=[{sources}]")
         return EXIT_OK
 
     try:
         nodes_table = ensure_table(client, schema.NODES_TABLE, logger.info)
-        created = replace_all(client, nodes_table["table_id"], records,
-                              logger.info, allow_empty=False)
     except FeishuError as exc:
         logger.error(f"table write failed class={exc.kind}")
         return EXIT_READ
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(f"table write failed class={type(exc).__name__}")
         return EXIT_READ
-    logger.info(f"collect written nodes={created}")
+
+    total_created = 0
+    for source_number in sorted(grouped):
+        source_records = grouped[source_number]
+        try:
+            created = replace_source_rows(
+                client, nodes_table["table_id"], source_number,
+                source_records, logger.info)
+        except FeishuError as exc:
+            logger.error(f"table write failed source={source_number} "
+                         f"class={exc.kind}")
+            return EXIT_READ
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(f"table write failed source={source_number} "
+                         f"class={type(exc).__name__}")
+            return EXIT_READ
+        total_created += created
+
+    logger.info(f"collect written nodes={total_created}")
     return EXIT_OK

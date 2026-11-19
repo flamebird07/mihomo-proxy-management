@@ -31,10 +31,17 @@ FT_CHECKBOX = 7
 DATE_PROPERTY: dict[str, Any] = {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}
 NUMBER_PROPERTY: dict[str, Any] = {"formatter": "0"}
 
-SOURCE_OPTIONS = ("飞兔", "星辰", "CoffeeCloud", "西瓜加速", "未知")
+SOURCE_OPTIONS = ("飞兔", "CoffeeCloud", "西瓜加速", "未知")
 REGION_GROUP_OPTIONS = ("美国", "新加坡", "日本", "其他", "未知")
 
-SOURCE_BY_INDEX = {1: "飞兔", 2: "星辰", 3: "CoffeeCloud", 4: "西瓜加速"}
+SOURCE_BY_INDEX = {1: "飞兔", 2: "CoffeeCloud", 3: "西瓜加速"}
+
+# Subscription env slot -> source number.  The env file keeps its original
+# slots: slot 1=飞兔, slot 2=星辰, slot 3=CoffeeCloud.  Per the 2026-11-19 user
+# decision the source numbering is renumbered (星辰 removed, CoffeeCloud=2,
+# 西瓜加速=3), but the env slots never change.  Slot 2 (星辰) is therefore
+# permanently excluded: that subscription is not subscribable.
+SUBSCRIPTION_SOURCE_BY_ENV_SLOT = {1: 1, 3: 2}
 
 NODES_TABLE_KEY = "nodes"
 NODES_TABLE_NAME = "节点测速总表"
@@ -101,6 +108,28 @@ VALID_TABLE: dict[str, Any] = {
 }
 
 TABLE_SPECS: tuple[dict[str, Any], ...] = (NODES_TABLE, VALID_TABLE)
+
+# Cross-machine daily-collect bookkeeping.  This table is owned exclusively by
+# node_provider --collect and is deliberately NOT part of TABLE_SPECS: the
+# contract with node_ops covers only the two tables above.
+COLLECT_STATE_KEY = "collect_state"
+COLLECT_STATE_TABLE_NAME = "采集状态"
+COLLECT_CHANNEL_SUBSCRIPTION = "subscription"
+COLLECT_CHANNEL_APP = "app"
+COLLECT_CHANNEL_OPTIONS = (COLLECT_CHANNEL_SUBSCRIPTION, COLLECT_CHANNEL_APP)
+
+COLLECT_STATE_TABLE: dict[str, Any] = {
+    "key": COLLECT_STATE_KEY,
+    "name": COLLECT_STATE_TABLE_NAME,
+    "fields": [
+        ("源编号", FT_NUMBER, NUMBER_PROPERTY),
+        _source_field(),
+        ("通道", FT_TEXT, None),
+        ("读取机器", FT_TEXT, None),
+        ("最近读取时间", FT_DATE_TIME, DATE_PROPERTY),
+        ("节点数", FT_NUMBER, NUMBER_PROPERTY),
+    ],
+}
 
 # (field name, type) in contract order - asserted against node_ops.
 VALID_FIELDS = tuple((name, ftype) for name, ftype, _prop in VALID_TABLE["fields"])

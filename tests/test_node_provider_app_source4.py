@@ -170,7 +170,7 @@ class Source4HappyPathTests(unittest.TestCase):
             nodes = app_extract.extract_app(
                 "source4", profile_dir=base, dpapi_unprotect=fake_dpapi)
         self.assertEqual(len(nodes), 2)
-        self.assertEqual(app_extract.APP_SOURCE_NUMBER["source4"], 4)
+        self.assertEqual(app_extract.APP_SOURCE_NUMBER["source4"], 3)
         self.assertIn("source4", app_extract.APP_CHOICES)
 
 

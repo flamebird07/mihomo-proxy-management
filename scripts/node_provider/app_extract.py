@@ -65,8 +65,9 @@ SHUTTLE_AAD_PREFIX = "shuttle-subscription-config-cache-v2"
 SHUTTLE_OS_CRYPT_PREFIX = b"v10"
 SHUTTLE_DPAPI_PREFIX = b"DPAPI"
 
-# app channel name -> numeric source id (1飞兔/2星辰/3CoffeeCloud/4西瓜加速)
-APP_SOURCE_NUMBER = {"source1": 1, "source3": 3, "source4": 4}
+# app channel name -> numeric source id (renumbered 1飞兔/2CoffeeCloud/
+# 3西瓜加速; 星辰 removed per 2026-11-19 user decision)
+APP_SOURCE_NUMBER = {"source1": 1, "source3": 2, "source4": 3}
 APP_CHOICES = tuple(APP_SOURCE_NUMBER)
 
 _CREDENTIAL_KEYS = ("password", "uuid", "auth", "auth-str", "private-key")

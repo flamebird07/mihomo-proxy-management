@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collect", action="store_true",
                         help="extract nodes and replace 「节点测速总表」 (default: provide)")
     parser.add_argument("--from-app", default="",
-                        help="app extraction channels, comma separated: source1,source3")
+                        help="app extraction channels, comma separated: "
+                             "source1,source3,source4")
     parser.add_argument("--sources-env", default=None,
                         help="subscription env file (KEY=VALUE) for --collect")
     parser.add_argument("--timeout", type=int, default=30,
