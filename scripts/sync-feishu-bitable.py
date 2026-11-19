@@ -1186,8 +1186,15 @@ class FeishuClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            # The HTTP body may echo request details; only the status is kept.
-            raise SyncError(f"http_{exc.code}") from None
+            # Surface only the API's own code/message (never request details):
+            # field-validation bodies are what makes a 400 diagnosable.
+            detail = ""
+            try:
+                payload = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+                detail = f"{payload.get('code', '')}:{payload.get('msg', '')}"[:160]
+            except Exception:
+                pass
+            raise SyncError(f"http_{exc.code}", detail) from None
         except (socket.timeout, TimeoutError):
             raise SyncError("timeout") from None
         except urllib.error.URLError as exc:
@@ -1361,17 +1368,24 @@ class FeishuClient:
         return created
 
     def update_records(self, table_id: str, items: list[dict]) -> int:
-        """batch_update existing rows: ``[{"record_id", "fields"}]``."""
+        """Update existing rows one by one: ``[{"record_id", "fields"}]``.
+
+        The tenant's ``records/batch_update`` endpoint rejects well-formed
+        bodies with 99992402 "fields is required" (verified 2026-11-20, the
+        request body was byte-exact against the documented shape), so updates
+        go through the per-record ``PUT /records/{id}`` endpoint, which the
+        same tenant accepts.  Row counts per tick are small (tens); the
+        per-call latency is acceptable.
+        """
         updated = 0
-        for start in range(0, len(items), 100):
-            chunk = items[start:start + 100]
+        for item in items:
             self.call(
                 "PUT",
-                f"/bitable/v1/apps/{self.app_token}/tables/{table_id}/records/batch_update",
-                body={"records": chunk},
+                f"/bitable/v1/apps/{self.app_token}/tables/{table_id}"
+                f"/records/{item['record_id']}",
+                body={"fields": item.get("fields") or {}},
             )
-            updated += len(chunk)
-            time.sleep(0.3)
+            updated += 1
         return updated
 
 
