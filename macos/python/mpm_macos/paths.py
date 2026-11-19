@@ -199,6 +199,18 @@ class Layout:
         return os.path.join(self.providers, "subscription.yaml")
 
     @property
+    def supplements_dir(self) -> str:
+        """Landing point for locally obtained node files (0700).
+
+        Every ``*.yaml`` here is merged into source 1 of the Feishu
+        节点测速总表 by the next node-pipeline tick, so any newly obtained
+        nodes (browser downloads, app exports, candidate pools) reach the
+        auto-assignment chain without extra plumbing.  Files stay; semantic
+        de-dupe and the per-source table replace keep them from piling up.
+        """
+        return os.path.join(self.providers, "supplements")
+
+    @property
     def valid_provider_file(self) -> str:
         """The valid-node file provider built by the node pipeline.
 
@@ -378,6 +390,7 @@ def managed_dirs(layout: Layout) -> list[tuple[str, int]]:
         (layout.state_dir, 0o700),
         (layout.feishu_state_dir, 0o700),
         (layout.node_state_dir, 0o700),
+        (layout.supplements_dir, 0o700),
         (layout.logs, 0o750),
         (layout.run_dir, 0o700),
     ]

@@ -58,6 +58,10 @@ def _ready(tmp_path: Path) -> paths_mod.Layout:
     _make_binary(layout)
     _make_installed_scripts(layout)
     _write_secret(layout)
+    # the deployed host always has the extracted nextin supplement
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(os.path.join(layout.providers, "nextin.yaml")).write_text(
+        "proxies: []\n", encoding="utf-8")
     return layout
 
 
@@ -132,8 +136,20 @@ def test_build_step_argv_uses_installed_paths_and_carries_no_secret_values(tmp_p
     assert collect[collect.index("--env-file") + 1] == layout.secret_file
     assert collect[collect.index("--fetch-proxy") + 1] == "http://127.0.0.1:7890"
     assert collect[collect.index("--from-app") + 1] == "source4"
+    # supplements landing dir files (sorted) + the legacy nextin.yaml
+    assert collect.count("--supplement-yaml") == 1
     assert collect[collect.index("--supplement-yaml") + 1] == os.path.join(
         layout.providers, "nextin.yaml")
+
+    # a file dropped into the landing dir is picked up on the next tick
+    os.makedirs(layout.supplements_dir, exist_ok=True)
+    dropped = os.path.join(layout.supplements_dir, "wmsxwd-download.yaml")
+    with open(dropped, "w", encoding="utf-8") as handle:
+        handle.write("proxies: []\n")
+    argv2 = node_pipeline.build_step_argv(layout, binary=layout.binary)[0]
+    dropped_index = argv2.index("--supplement-yaml")
+    assert argv2[dropped_index + 1] == dropped
+    assert argv2.count("--supplement-yaml") == 2  # dropped + legacy nextin
     assert collect[collect.index("--lock-file") + 1].startswith(layout.node_state_dir)
 
     ops = steps["ops"]

@@ -912,6 +912,17 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
   `proxy-auto-switch.py`、`gpt_switch_entry.py`、`gpt_stability_policy.py`、
   `named_mutex_lock.py` 到 `libexec/scripts/`；状态在 `state/node/`（锁、切换状态、
   轮记录）；日志 `logs/node-pipeline.log` / `node_ops.log` / `proxy-auto-switch.log`。
+* **新节点投递点**：`providers/supplements/*.yaml`（0700）——无论从什么渠道拿到新节点
+  （浏览器下载的订阅文件、App 导出、人工整理），转成 provider YAML 后丢进该目录，
+  下一个流水线 tick 自动全部并入飞书「节点测速总表」源 1（语义去重：抓到的优先，
+  本地补空隙；文件保留不删，靠按源替换保持新鲜）。转换命令：
+
+  ```sh
+  python3 scripts/convert_sub.py -i 下载的订阅文件.txt \
+      -o "/Library/Application Support/mihomo-proxy-management/providers/supplements/wmsxwd-$(date +%Y%m%d).yaml"
+  ```
+
+  `install` 会创建该目录；部署在 `state/node/` 之外的投递不受用户/属主限制（root 写入即可）。
 * 源 4（西瓜加速 App）通道与上游流水线 argv 保持一致（`--from-app source4`）：macOS 上
   无 DPAPI/ShuttleClient，通道按 `profile_missing` 优雅记失败并继续（每 app 通道独立容错，
   永不断轮）。

@@ -127,6 +127,19 @@ def prerequisites(layout: Layout) -> tuple[int, list[str]]:
     return EXIT_OK, messages
 
 
+def supplement_files(layout: Layout) -> list[str]:
+    """Existing supplement files: the landing directory + the extracted
+    ``nextin.yaml`` (legacy path).  Sorted for a stable argv; missing files
+    are skipped (node_provider would only warn)."""
+    import glob
+
+    files = sorted(glob.glob(os.path.join(layout.supplements_dir, "*.yaml")))
+    legacy = os.path.join(layout.providers, "nextin.yaml")
+    if os.path.isfile(legacy):
+        files.append(legacy)
+    return files
+
+
 def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
     """The four step argvs (paths only; no secret values on any command line)."""
     state = layout.node_state_dir
@@ -141,10 +154,13 @@ def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
          # attempted and degrades to a logged per-channel failure on hosts
          # without it (macOS: no DPAPI/ShuttleClient -> profile_missing).
          "--from-app", "source4",
-         # source-1 supplement (e.g. the extracted Nextin/wmsxwd nodes): the
-         # host's own nodes enter the shared table even when the slot-1
-         # subscription fetch is blocked.
-         "--supplement-yaml", os.path.join(layout.providers, "nextin.yaml"),
+         # Source-1 supplements: the host's own nodes enter the shared table
+         # even when the slot-1 subscription fetch is blocked.  Every file in
+         # providers/supplements/ (the landing point for locally obtained
+         # nodes: browser downloads, app exports) plus the extracted
+         # nextin.yaml is merged each tick; fetch-side dedupe keeps fetched
+         # nodes first and per-source table replace keeps them fresh.
+         *sum((["--supplement-yaml", path] for path in supplement_files(layout)), []),
          "--lock-file", os.path.join(state, "node_provider.lock")],
         [sys.executable, "-m", NODE_OPS_PACKAGE,
          "--env-file", secret,
