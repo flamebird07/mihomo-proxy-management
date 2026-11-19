@@ -627,16 +627,19 @@ def sync(client, table_id, log, helpers, region_table_id=None):
     hold = helpers.get('hold_writer_lock') if helpers else None
     lock_ctx = hold(log) if callable(hold) else contextlib.nullcontext()
     with lock_ctx:
-        existing = client.list_records(table_id)
-        client.batch_create(table_id, records)
-        old = [r['record_id'] for r in existing if r.get('fields', {}).get('测速路径') in (LABEL, 'Ninja Desktop')]
-        if old:
-            client.batch_delete(table_id, old)
-        saved = [r['fields'] for r in client.list_records(table_id) if r.get('fields', {}).get('测速路径') == LABEL]
+        # Write-discipline ruling: upsert only - never delete another
+        # channel's rows (this used to wipe Ninja Desktop rows too).  Old
+        # rows expire through the shared time windows inside upsert.
+        helpers['upsert_records'](client, table_id, records, log, table_key='nodes')
+        saved = [r['fields'] for r in client.list_records(table_id) if r['fields'].get('测速路径') == LABEL]
         expected = {r['fields']['节点名']: r['fields'] for r in records}
-        if len(saved) != len(nodes) or {r.get('节点名') for r in saved} != set(names):
-            raise RuntimeError('independent_feishu_count_mismatch')
+        by_name = {r.get('节点名') for r in saved}
+        for name in names:
+            if name not in by_name:
+                raise RuntimeError('independent_feishu_count_mismatch')
         for row in saved:
+            if row.get('节点名') not in expected:
+                continue  # lingering row inside its window: the tombstone owns it
             want = expected[row['节点名']]
             for key in ('实际地区', '同步时间', '测速目标', '存活', '地区检测时间'):
                 if row.get(key) != want.get(key):

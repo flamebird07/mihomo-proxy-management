@@ -25,18 +25,32 @@ def test_all_failed_and_numeric_strings():
     assert s1.latency_fields('900', '700', '800')['延迟ms']==700
 
 
-def test_scoped_replace_preserves_other_sources():
+def test_scoped_upsert_never_deletes_any_channel():
+    """Write-discipline ruling: the channel writer upserts only.  Other
+    channels AND its own old rows survive the write; only the shared time
+    windows ever delete."""
     class Client:
         def __init__(self):
             self.rows = [{'record_id':'other', 'fields':{'节点名':'same','测速路径':'源3独立兼容内核'}},
                          {'record_id':'old', 'fields':{'节点名':'same','测速路径':s1.LABEL}}]
-        def list_records(self, table):return self.rows[:]
-        def batch_create(self, table, records):
-            self.rows += [{'record_id':str(i),**r} for i,r in enumerate(records)]
-        def batch_delete(self, table, ids):
-            self.rows=[r for r in self.rows if r['record_id'] not in ids]
-    c=Client()
-    result=s1.replace_scope(c,'table',[{'fields':{'节点名':'new','测速路径':s1.LABEL,'存活':True,'同步时间':123}}])
-    assert len(result)==1
-    assert any(r['record_id']=='other' for r in c.rows)
-    assert not any(r['record_id']=='old' for r in c.rows)
+        def list_records(self, table):
+            return self.rows[:]
+    c = Client()
+    upserts = []
+    def fake_upsert(client, table, records, log, *, table_key):
+        upserts.append((table, table_key, records))
+        c.rows += [{'record_id': f'new{i}', **r} for i, r in enumerate(records)]
+        return {'created': len(records), 'updated': 0, 'deleted': 0}
+    class Log:
+        def info(self, _m): pass
+        def warn(self, _m): pass
+        def error(self, _m): pass
+    result = s1.replace_scope(
+        c, 'table',
+        [{'fields': {'节点名': 'new', '测速路径': s1.LABEL, '存活': True, '同步时间': 123}}],
+        table_key='nodes', log=Log(), upsert=fake_upsert)
+    assert upserts and upserts[0][1] == 'nodes'
+    assert any(r['record_id'] == 'other' for r in c.rows), "other channel kept"
+    assert any(r['record_id'] == 'old' for r in c.rows), "own old row kept (no delete)"
+    assert any(r['fields'].get('节点名') == 'new' for r in c.rows)
+    assert any(r.get('节点名') == 'new' for r in result)

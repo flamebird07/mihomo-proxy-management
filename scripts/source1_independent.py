@@ -121,29 +121,33 @@ def measure(nodes, helpers, log):
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def replace_scope(client, table, records):
-    old = [r['record_id'] for r in client.list_records(table)
-           if r.get('fields', {}).get('测速路径') == LABEL]
-    if records:
-        client.batch_create(table, records)
-    if old:
-        client.batch_delete(table, old)
+def replace_scope(client, table, records, *, table_key, log, upsert):
+    """Write-discipline ruling: upsert only - no payload-driven deletes.  Old
+    rows of this channel expire through the shared time windows; the readback
+    below is a SUBSET check (every payload row present and correct), so rows
+    still inside their window may linger alongside."""
+    upsert(client, table, records, log, table_key=table_key)
     saved = [r['fields'] for r in client.list_records(table)
              if r.get('fields', {}).get('测速路径') == LABEL]
     expected = {r['fields']['节点名']: r['fields'] for r in records}
-    if len(saved) != len(expected) or {r.get('节点名') for r in saved} != set(expected):
-        raise RuntimeError('source1_readback_names_mismatch')
-    for row in saved:
-        want = expected[row['节点名']]
-        for key in ('同步时间', '实际地区', '存活', 'GPT可用', 'Grok可用', '地区组', '测速目标', '地区检测时间'):
-            if key in want and row.get(key) != want[key]:
-                raise RuntimeError('source1_readback_mismatch:' + key)
-        if '连续通过轮数' in want and int(row.get('连续通过轮数', -1)) != want['连续通过轮数']:
-            raise RuntimeError('source1_streak_readback_mismatch')
-        for key in ('延迟ms', 'Grok延迟ms', 'chatgpt延迟ms', 'openai延迟ms'):
-            if key in want and float(row.get(key, -1)) != float(want[key]):
-                raise RuntimeError('source1_delay_readback_mismatch:' + key)
+    by_name = {r.get('节点名'): r for r in saved}
+    for name, want in expected.items():
+        row = by_name.get(name)
+        if row is None:
+            raise RuntimeError('source1_readback_names_mismatch')
+        _verify_row(row, want)
     return saved
+
+
+def _verify_row(row, want):
+    for key in ('同步时间', '实际地区', '存活', 'GPT可用', 'Grok可用', '地区组', '测速目标', '地区检测时间'):
+        if key in want and row.get(key) != want[key]:
+            raise RuntimeError('source1_readback_mismatch:' + key)
+    if '连续通过轮数' in want and int(row.get('连续通过轮数', -1)) != want['连续通过轮数']:
+        raise RuntimeError('source1_streak_readback_mismatch')
+    for key in ('延迟ms', 'Grok延迟ms', 'chatgpt延迟ms', 'openai延迟ms'):
+        if key in want and float(row.get(key, -1)) != float(want[key]):
+            raise RuntimeError('source1_delay_readback_mismatch:' + key)
 
 
 def sync(client, node_table, region_table, log, helpers):
@@ -186,7 +190,9 @@ def sync(client, node_table, region_table, log, helpers):
         helpers['ensure_fields'](client, node_table,
             [('Grok可用', helpers['FT_CHECKBOX'], None), ('检测说明', helpers['FT_TEXT'], None)], log)
         ensure_latency_fields(client, node_table, log, helpers)
-        saved = replace_scope(client, node_table, records)
+        saved = replace_scope(client, node_table, records,
+                               table_key='nodes', log=log,
+                               upsert=helpers['upsert_records'])
         helpers['ensure_fields'](client, region_table,
             [('测速路径', helpers['FT_TEXT'], None), ('地区组', helpers['FT_SINGLE_SELECT'],
              {'options': [{'name': n} for n in ('美国','新加坡','日本')]})], log)
@@ -194,7 +200,9 @@ def sync(client, node_table, region_table, log, helpers):
         for record in region_records:
             record['fields']['测速路径'] = LABEL
             record['fields']['代理组'] = '源1独立GPT候选'
-        region_saved = replace_scope(client, region_table, region_records)
+        region_saved = replace_scope(client, region_table, region_records,
+                                     table_key='gpt_regions', log=log,
+                                     upsert=helpers['upsert_records'])
         if {r['节点名'] for r in region_saved if r.get('GPT可用')} != set(candidates):
             raise RuntimeError('source1_candidates_readback_mismatch')
     atomic_json(history_path, history)

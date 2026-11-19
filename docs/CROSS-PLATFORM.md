@@ -69,9 +69,24 @@
    时钟不可读 → 保留（fail-closed）。Ninja/独立路径行维持其独立的 60 分钟新鲜度窗口。
    「有效节点」表是测速侧的派生输出，整表重建（它就是速率/可用性本身）。
 
-落地位置：sync 链 `upsert_records`；总表 `node_provider.feishu.upsert_source_rows` +
-`tombstone_stale_rows`；测量回写 `node_ops.feishu.upsert_node_rows` + 墓碑；测试锚
-`tests/test_write_discipline.py`。
+落地位置：sync 链 `upsert_records`（表1/表2/表3 及 ninja 流）；独立通道
+`source1_independent.replace_scope` / `source3_compatible`（原本连 Ninja 行都删，已改）；
+总表 `node_provider.feishu.upsert_source_rows` + `tombstone_stale_rows`；测量回写
+`node_ops.feishu.upsert_node_rows` + 墓碑；测试锚 `tests/test_write_discipline.py`
+（host-neutral，Windows 上同样运行）+ 各写入点的通道测试。
+
+### Windows 端接入清单（拉取 main 即生效）
+
+**自动继承（共享文件，无需 Windows 侧改动）**：表1/2/3 与总表全部 upsert 化、
+时钟语义（有效速率才推进）、7 天墓碑、ninja/独立通道不再删除（旧 Ninja 行由
+60 分钟独立窗口自然过期——首轮 upsert 后最多残留 1 小时属预期）、source3 不再
+误删 Ninja 行。
+
+**Windows 侧自检**：① 计划任务 argv 未变，无需改；② 跑全套测试（裁定由
+`test_write_discipline.py` 等强制，违反即红）；③ 观察首轮日志的
+`upsert ... tombstoned=N` 行确认窗口行为；④ 若有 Windows 专属适配问题（路径、
+计划任务、Ninja 会话读取等）由 Windows 侧自行修——但**不得改变写入纪律本身**：
+任何"改回替换/按载荷删除"的提交都会被裁定测试拒绝。
 
 - **采集 24h 滚动去重**（S7）：任一机器抓过某源（成功或失败都记录），另一台 24h 内自动跳过——
   状态在飞书「采集状态」表；测速/发布不受影响，照常每小时。

@@ -3858,20 +3858,24 @@ def sync_ninja_nodes(client: FeishuClient, table_id: str, log: Logger) -> None:
             name = record["fields"]["节点名"]
             if name in geo_times:
                 record["fields"]["地区检测时间"] = geo_times[name]
-        client.batch_create(table_id, records)
-        old_ids = [row["record_id"] for row in existing
-                   if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
-        if old_ids:
-            client.batch_delete(table_id, old_ids)
+        # Write-discipline ruling: upsert only.  Old Ninja rows not in this
+        # payload are NOT deleted - they expire through the independent-path
+        # freshness window inside upsert_records (time-driven, never payload).
+        upsert_records(client, table_id, records, log, table_key="nodes")
         saved = [row["fields"] for row in client.list_records(table_id)
                  if row.get("fields", {}).get("测速路径") == "Ninja Desktop"]
-        if ({row.get("节点名") for row in saved} != set(names)
-                or len(saved) != len(names)
-                or any(row.get("同步时间") != stamp or row.get("测速目标") != DEFAULT_TARGET
-                       or row.get("实际地区") != regions.get(row["节点名"], "未知")
-                       or row.get("地区检测时间") != geo_times.get(row["节点名"])
-                       or bool(row.get("存活")) != bool(delays[row["节点名"]]) for row in saved)):
-            raise SyncError("ninja_readback_mismatch")
+        by_name = {row.get("节点名"): row for row in saved}
+        # Subset readback: every payload node must exist and match exactly;
+        # extra rows may linger until their window closes.
+        for name in names:
+            row = by_name.get(name)
+            if (row is None
+                    or row.get("同步时间") != stamp
+                    or row.get("测速目标") != DEFAULT_TARGET
+                    or row.get("实际地区") != regions.get(name, "未知")
+                    or row.get("地区检测时间") != geo_times.get(name)
+                    or bool(row.get("存活")) != bool(delays[name])):
+                raise SyncError("ninja_readback_mismatch")
         log.info(f"Ninja Feishu readback nodes={len(saved)} alive={sum(bool(row.get('存活')) for row in saved)}")
 
 
