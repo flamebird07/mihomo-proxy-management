@@ -534,6 +534,14 @@ class CorpseCleanupTests(unittest.TestCase):
             stale = sync.find_stale_corpse_dirs([root], max_age_s=1800.0)
             self.assertEqual([p.name for p in stale], ["mihomo-feishu-old"])
 
+    def test_macos_cleanup_does_not_scan_or_signal_system_processes(self):
+        with patch.object(sync.sys, "platform", "darwin"), \
+             patch.object(sync.subprocess, "run") as run, \
+             patch.object(sync.os, "kill") as kill:
+            self.assertEqual(sync._kill_corpse_processes(RecordingLog()), 0)
+        run.assert_not_called()
+        kill.assert_not_called()
+
     def test_cleanup_removes_stale_keeps_production(self):
         import tempfile as _tempfile
         with _tempfile.TemporaryDirectory() as root:

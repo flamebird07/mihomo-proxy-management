@@ -29,10 +29,17 @@ LABEL = f"com.{PROJECT}.core"
 #: must never be disabled at boot - but it must never restart either (no
 #: ``KeepAlive``), or a failed switch would flap the network.
 BOOT_LABEL = f"com.{PROJECT}.boot-switch"
+#: Third system job: fires the Feishu speedtest sync (``--speedtest-write``,
+#: 表2/表3) every ``StartInterval`` seconds.  Like the boot entry it must never
+#: restart itself (no ``KeepAlive``): a failing tick is simply retried on the
+#: next interval, and a restart policy would only pile up overlapping runs.
+FEISHU_SYNC_LABEL = f"com.{PROJECT}.feishu-sync"
+XIGUA_IPPOOL_LABEL = f"com.{PROJECT}.xigua-ippool"
 BINARY_NAME = "mihomo"
 RUNNER_NAME = "runner"
 PLIST_NAME = f"{LABEL}.plist"
 BOOT_PLIST_NAME = f"{BOOT_LABEL}.plist"
+FEISHU_SYNC_PLIST_NAME = f"{FEISHU_SYNC_LABEL}.plist"
 
 SUPPORT_DIR_NAME = PROJECT
 RUN_DIR_NAME = PROJECT
@@ -57,6 +64,15 @@ class Layout:
     def boot_plist(self) -> str:
         """The boot-switch job: the only LaunchDaemon that runs at boot."""
         return os.path.join(self.plist_dir, BOOT_PLIST_NAME)
+
+    @property
+    def feishu_sync_plist(self) -> str:
+        """The Feishu speedtest sync job (StartInterval-driven, no boot run)."""
+        return os.path.join(self.plist_dir, FEISHU_SYNC_PLIST_NAME)
+
+    @property
+    def xigua_ippool_plist(self) -> str:
+        return os.path.join(self.plist_dir, f"{XIGUA_IPPOOL_LABEL}.plist")
 
     # ---- executables / read-only data ---------------------------------
     @property
@@ -110,6 +126,10 @@ class Layout:
         return os.path.join(self.template_dir, BOOT_PLIST_NAME + ".template")
 
     @property
+    def feishu_sync_plist_template(self) -> str:
+        return os.path.join(self.template_dir, FEISHU_SYNC_PLIST_NAME + ".template")
+
+    @property
     def config_template(self) -> str:
         return os.path.join(self.template_dir, "config.yaml.template")
 
@@ -120,6 +140,16 @@ class Layout:
     @property
     def convert_sub(self) -> str:
         return os.path.join(self.scripts_dir, "convert_sub.py")
+
+    @property
+    def sync_script(self) -> str:
+        """Installed copy of ``scripts/sync-feishu-bitable.py``.
+
+        The Feishu sync daemon imports it by path; it must sit next to the
+        installed ``convert_sub.py`` because the script imports its sibling
+        through ``sys.path``.
+        """
+        return os.path.join(self.scripts_dir, "sync-feishu-bitable.py")
 
     # ---- support (mihomo home + project state) ------------------------
     @property
@@ -202,6 +232,11 @@ class Layout:
         return os.path.join(self.state_dir, "staging")
 
     @property
+    def feishu_state_dir(self) -> str:
+        """Feishu sync state (tables map, run mirror, GPT history, lock, caches)."""
+        return os.path.join(self.state_dir, "feishu")
+
+    @property
     def logs(self) -> str:
         return os.path.join(self.support, "logs")
 
@@ -220,6 +255,14 @@ class Layout:
     @property
     def log_boot_err(self) -> str:
         return os.path.join(self.logs, "boot-switch.err.log")
+
+    @property
+    def log_feishu_out(self) -> str:
+        return os.path.join(self.logs, "feishu-sync.out.log")
+
+    @property
+    def log_feishu_err(self) -> str:
+        return os.path.join(self.logs, "feishu-sync.err.log")
 
     # ---- runtime ------------------------------------------------------
     @property
@@ -245,6 +288,8 @@ class Layout:
             self.run_dir,
             self.plist,
             self.boot_plist,
+            self.feishu_sync_plist,
+            self.xigua_ippool_plist,
         ]
 
     def to_target_path(self, path: str) -> str:
@@ -292,6 +337,7 @@ def managed_dirs(layout: Layout) -> list[tuple[str, int]]:
         (layout.support, 0o755),
         (layout.providers, 0o700),
         (layout.state_dir, 0o700),
+        (layout.feishu_state_dir, 0o700),
         (layout.logs, 0o750),
         (layout.run_dir, 0o700),
     ]
@@ -301,6 +347,8 @@ __all__ = [
     "BINARY_NAME",
     "BOOT_LABEL",
     "BOOT_PLIST_NAME",
+    "FEISHU_SYNC_LABEL",
+    "FEISHU_SYNC_PLIST_NAME",
     "LABEL",
     "PLIST_NAME",
     "PROJECT",

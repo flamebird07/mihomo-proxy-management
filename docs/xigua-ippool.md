@@ -57,6 +57,25 @@ wrapper 逐阶段保存退出码，并按“池失败优先、其次飞书、最
 
 ## 每 5 分钟运行
 
+### 在 macOS 执行一轮
+
+```sh
+python3 scripts/run-xigua-ippool.py \
+  --source-provider /path/to/xigua-source.yaml \
+  --runtime-root /path/to/private/xigua-ippool
+```
+
+默认只采集和写入阶段文件，使用本机 Mihomo 的 7890 端口，可用 `--proxy-port` 指定端口。
+要发布健康池，显式提供 `--final-provider`、`--core` 和至少两个不同的 HTTPS `--target`。
+要同步飞书，提供现有的 `--env-file`。缺少成熟 IP 或未通过健康门槛时保留上一版节点文件。
+
+把待采集节点以 root 所有、权限 `0600` 的文件安装到
+`/Library/Application Support/mihomo-proxy-management/providers/xigua-source.yaml`，
+再运行项目安装命令，即可注册每五分钟运行一次的任务。任务仅在本项目的 Mihomo 占用代理
+端口时采集，使用独立的西瓜健康池和原有飞书凭据。移除来源文件并重跑安装会取消该任务。
+
+### Windows 计划任务
+
 先用 `-WhatIf` 检查参数，确认后再注册；安装脚本本身不会由部署流程自动执行：
 
 ```powershell

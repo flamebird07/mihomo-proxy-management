@@ -205,6 +205,59 @@ proxy-groups:
     tolerance: 50
     timeout: 5000
 
+  # ---- GROKBOT: 美国 → 新加坡 → 日本，末位 AUTO-FOREIGN 兜底 ----
+  # x.ai / grok.com 在大陆不能直连：区域池全空或全死时必须落到
+  # AUTO-FOREIGN（任意存活节点），绝不允许静默降级成 DIRECT。
+  - name: GROKBOT-US
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)美国|美國|\bUS\b|USA|United States|🇺🇸'
+    url: https://grok.com/cdn-cgi/trace
+    expected-status: 200
+    interval: 300
+    timeout: 8000
+    lazy: false
+    max-failed-times: 3
+
+  - name: GROKBOT-SG
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)新加坡|\bSG\b|Singapore|🇸🇬'
+    url: https://grok.com/cdn-cgi/trace
+    expected-status: 200
+    interval: 300
+    timeout: 8000
+    lazy: false
+    max-failed-times: 3
+
+  - name: GROKBOT-JP
+    type: fallback
+    use:
+      - subscription
+    filter: '(?i)日本|\bJP\b|Japan|🇯🇵'
+    url: https://grok.com/cdn-cgi/trace
+    expected-status: 200
+    interval: 300
+    timeout: 8000
+    lazy: false
+    max-failed-times: 3
+
+  - name: GROKBOT
+    type: fallback
+    proxies:
+      - GROKBOT-US
+      - GROKBOT-SG
+      - GROKBOT-JP
+      - AUTO-FOREIGN
+    url: https://grok.com/cdn-cgi/trace
+    expected-status: 200
+    interval: 300
+    timeout: 8000
+    lazy: false
+    max-failed-times: 3
+
   - name: VIETNAM
     type: select
     use:
@@ -220,6 +273,7 @@ proxy-groups:
       - PROXY
       - AUTO-FOREIGN
       - CODEBUDDY
+      - GROKBOT
       - US-FAST
       - VIETNAM
       - DIRECT
@@ -241,8 +295,8 @@ rules:
   - GEOSITE,anthropic,US-FAST
   - GEOSITE,github,US-FAST
   - GEOSITE,google,PROXY
-  - DOMAIN-SUFFIX,x.ai,US-FAST
-  - DOMAIN-SUFFIX,grok.com,US-FAST
+  - DOMAIN-SUFFIX,x.ai,GROKBOT
+  - DOMAIN-SUFFIX,grok.com,GROKBOT
   - DOMAIN-SUFFIX,chatgpt.com,US-FAST
 
   # Cursor 五域

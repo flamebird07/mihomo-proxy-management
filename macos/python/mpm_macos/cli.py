@@ -84,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("restart", "stop, confirm stopped, start, verify"),
         ("status", "launchd/process/mode/proxy/controller status"),
         ("health", "controller readiness, provider health and live nodes"),
+        (
+            "groups",
+            "per-group region match counts, alive members and current selection",
+        ),
     ):
         common(name, text)
     start = sub.choices["start"]
@@ -120,7 +124,18 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--drill-fail",
         action="store_true",
-        help="force the probe to fail (rollback drill)",
+        help="force the post-switch probe to fail (rollback drill)",
+    )
+
+    update_sources = common(
+        "update-sources",
+        "fetch all configured subscription sources and merge a candidate pool "
+        "(never replaces the live provider)",
+    )
+    update_sources.add_argument(
+        "--min-nodes",
+        type=int,
+        help="minimum merged candidates (default: the converter's own floor)",
     )
 
     uninstall = common("uninstall", "remove the LaunchDaemon and program files")
@@ -179,6 +194,12 @@ def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Rep
         return lifecycle.status(ctx)
     if command == "health":
         return lifecycle.health(ctx)
+    if command == "groups":
+        return lifecycle.groups(ctx)
+    if command == "update-sources":
+        return lifecycle.update_sources(
+            ctx, min_nodes=getattr(args, "min_nodes", None), quiet=bool(args.quiet)
+        )
     if command == "switch":
         action = getattr(args, "action", "status")
         drill = True if getattr(args, "drill_fail", False) else None
@@ -253,7 +274,7 @@ def emit(ctx: lifecycle.Context, report: lifecycle.Report, *, as_json: bool) -> 
             ctx.say(f"STATUS: {report.status}")
     if report.status == "FAILED":
         return int(report.exit_code or ExitCode.FAILURE)
-    return 0
+    return int(report.exit_code or 0)
 
 
 def main(

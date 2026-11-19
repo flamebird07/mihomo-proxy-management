@@ -72,6 +72,9 @@ REGION_FILTERS = {"US": US_FILTER, "SG": SG_FILTER, "JP": JP_FILTER}
 
 US_FAST_URL = "https://www.gstatic.com/generate_204"
 GPT_URL = "https://chatgpt.com/cdn-cgi/trace"
+# GROKBOT groups and rules live in the shared template (same as production
+# 2209); macOS only audits them here.
+GROKBOT_URL = "https://grok.com/cdn-cgi/trace"
 
 #: mihomo's provider ``interval`` is in **seconds**; the operator input is in
 #: minutes and one hour is the floor (a 60-second refresh hammered the
@@ -90,8 +93,22 @@ GPT_RULES = (
 )
 
 PROXY_MEMBERS = ["AUTO-FOREIGN", "US-FAST", "DIRECT"]
-GLOBAL_MEMBERS = ["PROXY", "AUTO-FOREIGN", "CODEBUDDY", "GPT", "US-FAST", "VIETNAM", "DIRECT"]
+GLOBAL_MEMBERS = [
+    "PROXY",
+    "AUTO-FOREIGN",
+    "CODEBUDDY",
+    "GROKBOT",
+    "GPT",
+    "US-FAST",
+    "VIETNAM",
+    "DIRECT",
+]
 GPT_MEMBERS = ["GPT-US", "GPT-SG", "GPT-JP"]
+GROKBOT_MEMBERS = ["GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP", "AUTO-FOREIGN"]
+GROKBOT_RULES = (
+    "DOMAIN-SUFFIX,x.ai,GROKBOT",
+    "DOMAIN-SUFFIX,grok.com,GROKBOT",
+)
 
 _PLACEHOLDER = re.compile(r"__[A-Z0-9_]+__")
 
@@ -126,6 +143,7 @@ def render(
     interval_minutes: int = 60,
     mode: str = "tun",
     provider_path: str = "./providers/subscription.yaml",
+    source1_supplement_path: str | None = None,
 ) -> str:
     """Return the full ``config.yaml`` text for ``mode``."""
     if mode not in MODES:
@@ -207,6 +225,15 @@ def render(
         profile["store-fake-ip"] = False
 
     _apply_proxy_groups(document)
+    if source1_supplement_path:
+        providers["source1-local"] = {
+            "type": "file",
+            "path": source1_supplement_path,
+            "health-check": dict(health_check),
+        }
+        for group in document["proxy-groups"]:
+            if group.get("use") == [PROVIDER_NAME]:
+                group["use"].append("source1-local")
     _apply_rules(document)
 
     text = yaml.safe_dump(document, allow_unicode=True, sort_keys=False, width=120)
@@ -338,7 +365,7 @@ def _apply_proxy_groups(document: dict[str, Any]) -> None:
 
 
 def _apply_rules(document: dict[str, Any]) -> None:
-    """Route OpenAI/ChatGPT through GPT before any US-FAST/PROXY match."""
+    """Apply the macOS GPT route and the documented US route for Muse."""
     rules = document.get("rules")
     if not isinstance(rules, list):
         raise RenderError("config template is missing rules")
@@ -350,6 +377,8 @@ def _apply_rules(document: dict[str, Any]) -> None:
     cleaned: list[str] = []
     for rule in text_rules:
         if rule in GPT_RULES:
+            continue
+        if rule.lower().startswith("domain-suffix,muse.ai,"):
             continue
         if rule == "GEOSITE,openai,US-FAST":
             if anchor is None:
@@ -363,7 +392,7 @@ def _apply_rules(document: dict[str, Any]) -> None:
             (i for i, rule in enumerate(cleaned) if rule.startswith("GEOSITE,openai,")),
             0,
         )
-    cleaned[anchor:anchor] = list(GPT_RULES)
+    cleaned[anchor:anchor] = [*GPT_RULES, "DOMAIN-SUFFIX,muse.ai,US-FAST"]
     document["rules"] = cleaned
 
 
@@ -455,10 +484,25 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     for rule in CURSOR_RULES:
         require(rule in rules, f"missing rule {rule}")
     require(CODEBUDDY_RULE in rules, f"missing rule {CODEBUDDY_RULE}")
+    muse_rule = "DOMAIN-SUFFIX,muse.ai,US-FAST"
+    require(rules.count(muse_rule) == 1, "Muse must route through US-FAST")
+    require(
+        all(rules.index(muse_rule) < i for i, rule in enumerate(rules)
+            if rule.startswith("MATCH,")),
+        "Muse routing must precede the default route",
+    )
 
     provider = (document.get("proxy-providers") or {}).get(PROVIDER_NAME)
     require(isinstance(provider, dict), f"missing proxy provider '{PROVIDER_NAME}'")
     require(bool(provider.get("path")), "provider path must be kept (offline cache fallback)")
+    groups = _groups(document)
+    provider_group_sources = [PROVIDER_NAME]
+    supplement = document["proxy-providers"].get("source1-local")
+    if supplement is not None:
+        require(isinstance(supplement, dict), "source 1 supplement must be a mapping")
+        require(supplement.get("type") == "file" and bool(supplement.get("path")),
+                "source 1 supplement must use a local file")
+        provider_group_sources.append("source1-local")
     interval = provider.get("interval")
     require(
         isinstance(interval, int) and interval >= PROVIDER_MIN_INTERVAL,
@@ -477,7 +521,6 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
         "profile.store-selected must be false (no remembered dead node)",
     )
 
-    groups = _groups(document)
     for name in ("CURSOR", "CURSOR-US", "CURSOR-JP", "CODEBUDDY"):
         require(name in groups, f"missing proxy group {name}")
     require(
@@ -506,7 +549,7 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
             f"{group_name} must be a fallback group",
         )
         require(
-            groups[group_name].get("use") == [PROVIDER_NAME],
+            groups[group_name].get("use") == provider_group_sources,
             f"{group_name} must draw from the '{PROVIDER_NAME}' provider",
         )
 
@@ -515,15 +558,12 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     require(isinstance(proxy, dict), "missing proxy group PROXY")
     require(proxy.get("type") == "select", "PROXY must stay a select group")
     require("use" not in proxy, "PROXY must not list raw provider nodes (no use)")
-    require(
-        proxy.get("proxies") == PROXY_MEMBERS,
-        f"PROXY must list {PROXY_MEMBERS}",
-    )
+    require(proxy.get("proxies") == PROXY_MEMBERS, f"PROXY must list {PROXY_MEMBERS}")
 
     us_fast = groups.get("US-FAST")
     require(isinstance(us_fast, dict), "missing proxy group US-FAST")
     require(us_fast.get("type") == "fallback", "US-FAST must be a fallback group")
-    require(us_fast.get("use") == [PROVIDER_NAME], "US-FAST must use the provider")
+    require(us_fast.get("use") == provider_group_sources, "US-FAST must use the provider")
     require(us_fast.get("filter") == US_FILTER, "US-FAST filter must be the strict US filter")
     require(us_fast.get("url") == US_FAST_URL, f"US-FAST url must be {US_FAST_URL}")
     require(us_fast.get("interval") == 180, "US-FAST interval must be 180")
@@ -535,7 +575,7 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
         group = groups.get(name)
         require(isinstance(group, dict), f"missing proxy group {name}")
         require(group.get("type") == "fallback", f"{name} must be a fallback group")
-        require(group.get("use") == [PROVIDER_NAME], f"{name} must use the provider")
+        require(group.get("use") == provider_group_sources, f"{name} must use the provider")
         require(
             group.get("filter") == REGION_FILTERS[region],
             f"{name} filter must be the strict {region} filter",
@@ -555,6 +595,32 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     require(gpt.get("interval") == 300, "GPT interval must be 300")
     require(gpt.get("max-failed-times") == 3, "GPT max-failed-times must be 3")
 
+    # GROKBOT comes from the shared template; the audit keeps it from drifting.
+    # The region subgroups' filter/fallback/use are enforced by the
+    # policy.expected_filters() loop above (GROKBOT-US/SG/JP).
+    grokbot = groups.get("GROKBOT")
+    require(isinstance(grokbot, dict), "missing proxy group GROKBOT")
+    require(grokbot.get("type") == "fallback", "GROKBOT must be a fallback group")
+    require(
+        grokbot.get("proxies") == GROKBOT_MEMBERS,
+        f"GROKBOT must list {GROKBOT_MEMBERS} (AUTO-FOREIGN last, never DIRECT)",
+    )
+    require(grokbot.get("url") == GROKBOT_URL, f"GROKBOT url must be {GROKBOT_URL}")
+    require(grokbot.get("expected-status") == 200, "GROKBOT expected-status must be 200")
+    require(grokbot.get("interval") == 300, "GROKBOT interval must be 300")
+    require(grokbot.get("timeout") == 8000, "GROKBOT timeout must be 8000")
+    require(grokbot.get("lazy") is False, "GROKBOT must not be lazy")
+    require(grokbot.get("max-failed-times") == 3, "GROKBOT max-failed-times must be 3")
+    for name in ("GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP"):
+        subgroup = groups.get(name)
+        require(isinstance(subgroup, dict), f"missing proxy group {name}")
+        require(subgroup.get("url") == GROKBOT_URL, f"{name} url must be {GROKBOT_URL}")
+        require(subgroup.get("expected-status") == 200, f"{name} expected-status must be 200")
+        require(subgroup.get("interval") == 300, f"{name} interval must be 300")
+        require(subgroup.get("timeout") == 8000, f"{name} timeout must be 8000")
+        require(subgroup.get("lazy") is False, f"{name} must not be lazy")
+        require(subgroup.get("max-failed-times") == 3, f"{name} max-failed-times must be 3")
+
     order = [
         group.get("name")
         for group in document.get("proxy-groups") or []
@@ -569,6 +635,19 @@ def audit(text: str, *, mode: str, secret: str | None = None) -> None:
     global_group = groups.get("GLOBAL")
     require(isinstance(global_group, dict), "missing proxy group GLOBAL")
     require("GPT" in (global_group.get("proxies") or []), "GLOBAL must include GPT")
+    require("GROKBOT" in (global_group.get("proxies") or []), "GLOBAL must include GROKBOT")
+
+    for rule in GROKBOT_RULES:
+        require(rule in rules, f"missing rule {rule}")
+    grokbot_rule_index = min(rules.index(rule) for rule in GROKBOT_RULES)
+    cn_index = next(
+        (i for i, rule in enumerate(rules) if rule.startswith("GEOSITE,cn,")),
+        len(rules),
+    )
+    require(
+        grokbot_rule_index < cn_index,
+        "GROKBOT rules must precede the GEOSITE,cn direct rule",
+    )
 
     for rule in GPT_RULES:
         require(rule in rules, f"missing rule {rule}")
@@ -605,6 +684,34 @@ def provider_node_names(text: str) -> list[str]:
         if isinstance(item, dict) and isinstance(item.get("name"), str):
             names.append(item["name"])
     return names
+
+
+def group_specs(text: str) -> list[dict[str, Any]]:
+    """Name/type/filter/proxies of every rendered proxy group (read-only).
+
+    ``groups`` (the diagnostic command) consumes this; it renders and writes
+    nothing.  ``uses_provider`` marks the groups using the main subscription whose
+    ``filter`` decides which region pool they draw from.
+    """
+    yaml = _yaml()
+    document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        return []
+    specs: list[dict[str, Any]] = []
+    for group in document.get("proxy-groups") or []:
+        if not (isinstance(group, dict) and isinstance(group.get("name"), str)):
+            continue
+        specs.append(
+            {
+                "name": group["name"],
+                "type": str(group.get("type", "")),
+                "filter": group.get("filter") if isinstance(group.get("filter"), str) else None,
+                "proxies": [str(item) for item in group.get("proxies") or []],
+                "uses_provider": PROVIDER_NAME in (group.get("use") or []),
+                "uses_supplement": "source1-local" in (group.get("use") or []),
+            }
+        )
+    return specs
 
 
 def load_convert_module(path: str):
@@ -703,6 +810,9 @@ __all__ = [
     "GPT_MEMBERS",
     "GPT_RULES",
     "GPT_URL",
+    "GROKBOT_MEMBERS",
+    "GROKBOT_RULES",
+    "GROKBOT_URL",
     "JINRITEMAI_RULE",
     "MIXED_PORT",
     "MODES",
@@ -720,6 +830,7 @@ __all__ = [
     "audit",
     "convert_provider",
     "ensure_geodata",
+    "group_specs",
     "load_convert_module",
     "load_template",
     "provider_interval_seconds",

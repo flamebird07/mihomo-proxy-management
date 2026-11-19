@@ -17,12 +17,12 @@ from mpm_common.errors import FailClosed
 from mpm_common.executor import Executor
 from mpm_common.sanitize import HOST
 
-from .paths import BOOT_LABEL, LABEL
+from .paths import BOOT_LABEL, FEISHU_SYNC_LABEL, LABEL, XIGUA_IPPOOL_LABEL
 
 DOMAIN = "system"
 
 #: The only labels this project may operate on.
-ALLOWED_LABELS = (LABEL, BOOT_LABEL)
+ALLOWED_LABELS = (LABEL, BOOT_LABEL, FEISHU_SYNC_LABEL, XIGUA_IPPOOL_LABEL)
 
 #: ``wait_running``/``wait_stopped`` poll ``WAIT_ATTEMPTS`` times every
 #: ``WAIT_INTERVAL`` seconds, i.e. at most ``WAIT_ATTEMPTS * WAIT_INTERVAL``

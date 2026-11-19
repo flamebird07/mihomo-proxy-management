@@ -1037,7 +1037,8 @@ def resolve_min_nodes(value: Any) -> int:
 
 
 def collect_sources(settings: Dict[str, str], timeout: int, skip_unknown: bool,
-                    warn: Callable[[str], None] = _default_warn) -> Tuple[List[Dict[str, Any]], int]:
+                    warn: Callable[[str], None] = _default_warn, *,
+                    source1_supplement: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
     candidates, failed = [], 0
     for index in range(1, 4):
         stats = Stats()
@@ -1057,6 +1058,18 @@ def collect_sources(settings: Dict[str, str], timeout: int, skip_unknown: bool,
             failed += 1
             source_warn(f"source failed (code={exc.exit_code}); excluded")
         warn(f"source#{index}: {stats.summary()}")
+        if index == 1 and source1_supplement:
+            try:
+                with open(source1_supplement, encoding="utf-8-sig") as handle:
+                    nodes, local_stats = convert_content(
+                        handle.read(), skip_unknown=skip_unknown, warn=source_warn
+                    )
+            except (OSError, UnicodeError):
+                raise ConvertError("cannot read source 1 supplement", EXIT_BAD_INPUT) from None
+            if not nodes:
+                raise ConvertError("source 1 supplement produced no candidates", EXIT_BAD_INPUT)
+            candidates.extend(nodes)
+            source_warn(f"local supplement: {local_stats.summary()}")
     merged = merge_proxies(candidates)
     warn(f"merged={len(merged)} duplicates={len(candidates) - len(merged)} failed_sources={failed}")
     return merged, failed
@@ -1220,6 +1233,7 @@ Examples:
     group.add_argument("--sources-env", action="store_true", help="Read three sources from process environment variables")
 
     parser.add_argument("--min-nodes", help="Positive minimum merged candidates (default: 1; multi-source uses MIN_CANDIDATE_NODES)")
+    parser.add_argument("--source1-supplement", help="Add a local node file to source 1 in multi-source mode")
     parser.add_argument("-o", "--output", help="Output YAML file path")
     parser.add_argument("--merge", help="Merge into an existing YAML config file")
     parser.add_argument("--list", action="store_true", help="Preview only node ordinals and safe types; never write output")
@@ -1244,12 +1258,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise ConvertError("multi-source mode requires --output or --list", EXIT_USAGE)
         if multi_source and args.user_agent:
             raise ConvertError("use per-source SUBSCRIPTION_UA_1/2/3 in multi-source mode", EXIT_USAGE)
+        if args.source1_supplement and not multi_source:
+            raise ConvertError("--source1-supplement requires multi-source mode", EXIT_USAGE)
         settings = read_sources_env(args.sources_env_file) if args.sources_env_file else (
             {key: os.environ[key] for key in SOURCE_KEYS if key in os.environ} if args.sources_env else {})
         minimum = resolve_min_nodes(args.min_nodes if args.min_nodes is not None else settings.get("MIN_CANDIDATE_NODES"))
         failed_sources = 0
         if multi_source:
-            proxies, failed_sources = collect_sources(settings, args.timeout, args.skip_unknown)
+            proxies, failed_sources = collect_sources(
+                settings, args.timeout, args.skip_unknown,
+                source1_supplement=args.source1_supplement,
+            )
         else:
             if args.url or args.url_env or args.url_stdin:
                 url = _resolve_url(args)

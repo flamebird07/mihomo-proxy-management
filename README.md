@@ -21,7 +21,8 @@ Debian 12, systemd - see `docs/LINUX.md`) are supported; other platforms are bes
 - 运行时下载 mihomo / wintun / Geo 数据，无需把二进制提交进 git
 - 自动注册计划任务，开机自启 + 崩溃自动重启
 - TUN 模式透明代理，无需配置系统代理
-- 内置 `AUTO-FOREIGN` / `US-FAST` / `VIETNAM` / `GLOBAL` 智能分组
+- 内置 `AUTO-FOREIGN` / `US-FAST` / `GROKBOT`（x.ai/grok.com 专用，US→SG→JP→AUTO-FOREIGN
+  兜底，绝不禁用为直连）/ `VIETNAM` / `GLOBAL` 智能分组
 - 订阅转换脚本 `scripts/convert_sub.py`：支持 ss / trojan / vless / tuic / **anytls** / **hysteria2**；AnyTLS 按 mihomo 原生 `type: anytls`（`password`/`sni`/`client-fingerprint`）原样保留，**不伪装成 vless**
 - `start / stop / restart / status / test / update-subscription / uninstall` 一套脚本
 
@@ -225,6 +226,12 @@ FEISHU_BITABLE_APP_TOKEN=...    # 多维表 app token（多维表 URL 中的 app
 app token 解析优先级：命令行 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` >
 env 文件同名键。缺失时只报键名与来源并以非 0 退出（dry-run 等不访问飞书的路径不受影响）；
 日志与错误信息不打印任何 token 值。真实值只填在本机 env 文件，不要提交进仓库。
+
+macOS 部署（见 `macos/README.md` 第 7 节）用同一个脚本做定时测速同步：
+`com.mihomo-proxy-management.feishu-sync` LaunchDaemon（默认每 10 分钟
+`--speedtest-write`，写表2/表3）凭据放在 0600 的
+`/Library/Application Support/mihomo-proxy-management/state/subscription.env`
+（install 支持 `MPM_FEISHU_*` 环境变量；缺凭据只告警重试，不影响核心服务）。
 
 ### 修改代理组 / Editing proxy groups
 

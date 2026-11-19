@@ -54,6 +54,9 @@ FILTERS = {
     "CODEBUDDY-TW": r"(?i)台湾|台灣|\bTW\b|Taiwan|🇹🇼",
     "CODEBUDDY-SG": r"(?i)新加坡|\bSG\b|Singapore|🇸🇬",
     "CODEBUDDY-JP": r"(?i)日本|\bJP\b|Japan|🇯🇵",
+    "GROKBOT-US": r"(?i)美国|美國|\bUS\b|USA|United States|🇺🇸",
+    "GROKBOT-SG": r"(?i)新加坡|\bSG\b|Singapore|🇸🇬",
+    "GROKBOT-JP": r"(?i)日本|\bJP\b|Japan|🇯🇵",
 }
 
 
@@ -234,6 +237,43 @@ class TemplateStructureTests(unittest.TestCase):
                     member in self.groups or member in BUILTIN_POLICIES,
                     "%r looks like a literal node name" % member,
                 )
+
+    # ---- GROKBOT --------------------------------------------------------
+    def test_grokbot_group_shape(self):
+        """x.ai/grok.com must never fall to DIRECT: AUTO-FOREIGN is the last member."""
+        group = self.groups["GROKBOT"]
+        self.assertEqual(group["type"], "fallback")
+        self.assertEqual(
+            group["proxies"],
+            ["GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP", "AUTO-FOREIGN"],
+        )
+        self.assertEqual(group["interval"], 300)
+        self.assertIs(group["lazy"], False)
+        self.assertEqual(group["timeout"], 8000)
+        self.assertEqual(group["max-failed-times"], 3)
+
+    def test_grokbot_probe_urls_use_grok_com(self):
+        for name in ("GROKBOT", "GROKBOT-US", "GROKBOT-SG", "GROKBOT-JP"):
+            url = str(self.groups[name].get("url") or "")
+            self.assertRegex(url, r"^https://([a-z0-9-]+\.)*grok\.com(/[^\?]*)?$", url)
+            self.assertEqual(self.groups[name].get("expected-status"), 200)
+
+    def test_grokbot_routes_x_ai_and_grok_com(self):
+        rules = self.rules
+        self.assertIn("DOMAIN-SUFFIX,x.ai,GROKBOT", rules)
+        self.assertIn("DOMAIN-SUFFIX,grok.com,GROKBOT", rules)
+        self.assertNotIn("DOMAIN-SUFFIX,x.ai,US-FAST", rules)
+        self.assertNotIn("DOMAIN-SUFFIX,grok.com,US-FAST", rules)
+        cn = self.rule_index("GEOSITE,cn")
+        self.assertIsNotNone(cn, "GEOSITE,cn rule missing")
+        grok = min(
+            rules.index("DOMAIN-SUFFIX,x.ai,GROKBOT"),
+            rules.index("DOMAIN-SUFFIX,grok.com,GROKBOT"),
+        )
+        self.assertLess(grok, cn, "grok rules must precede the CN direct rule")
+
+    def test_grokbot_in_global(self):
+        self.assertIn("GROKBOT", self.groups["GLOBAL"]["proxies"])
 
 
 if __name__ == "__main__":

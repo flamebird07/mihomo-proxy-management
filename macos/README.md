@@ -27,11 +27,13 @@ macos/python/mpm_macos/
   probe.py            切换后的 60 秒 HTTP 探测（国内必通、国外至少一项）
   switch.py           mpm-switch：Nextin <-> mihomo，失败自动回滚到 Nextin
   boot.py             开机入口（boot-switch LaunchDaemon）：等登录用户/默认路由 -> 复用 switch 的 root 流程
-  lifecycle.py        install/configure/start/stop/restart/status/health/uninstall
+  feishu_sync.py      飞书测速同步入口（feishu-sync LaunchDaemon，StartInterval 驱动）
+  lifecycle.py        install/configure/start/stop/restart/status/health/groups/uninstall
   runner.py           持有 core 锁、启动前冲突检测、可选 caffeinate -i、信号转发、退出码映射
   cli.py              命令入口（无业务逻辑）
 macos/templates/com.mihomo-proxy-management.core.plist.template
 macos/templates/com.mihomo-proxy-management.boot-switch.plist.template
+macos/templates/com.mihomo-proxy-management.feishu-sync.plist.template
 macos/bin/mihomo-proxy-management      薄入口（安装时注入包路径）
 macos/bin/mpm-switch                   切换入口（安装到 /usr/local/bin/mpm-switch）
 macos/scripts/*.sh                     薄包装（真实逻辑在 Python）
@@ -57,12 +59,14 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 ```text
 /Library/LaunchDaemons/com.mihomo-proxy-management.core.plist
 /Library/LaunchDaemons/com.mihomo-proxy-management.boot-switch.plist
+/Library/LaunchDaemons/com.mihomo-proxy-management.feishu-sync.plist
 /usr/local/bin/mihomo-proxy-management
 /usr/local/bin/mpm-switch
 /usr/local/libexec/mihomo-proxy-management/current/mihomo
 /usr/local/libexec/mihomo-proxy-management/current/runner
 /usr/local/libexec/mihomo-proxy-management/scripts/{install,start,stop,restart,status,health-check,uninstall}.sh
 /usr/local/libexec/mihomo-proxy-management/scripts/convert_sub.py
+/usr/local/libexec/mihomo-proxy-management/scripts/sync-feishu-bitable.py
 /usr/local/share/mihomo-proxy-management/python/{mpm_common,mpm_macos}
 /usr/local/share/mihomo-proxy-management/templates/
 /Library/Application Support/mihomo-proxy-management/config.yaml          (0600)
@@ -71,8 +75,11 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 /Library/Application Support/mihomo-proxy-management/state/subscription.env (0600)
 /Library/Application Support/mihomo-proxy-management/state/deployment.json  (0600)
 /Library/Application Support/mihomo-proxy-management/state/network-proxy-backup.json (0600)
+/Library/Application Support/mihomo-proxy-management/state/feishu/          (0700，飞书同步状态)
 /Library/Application Support/mihomo-proxy-management/logs/{core.out.log,core.err.log}
 /Library/Application Support/mihomo-proxy-management/logs/{boot-switch.out.log,boot-switch.err.log}
+/Library/Application Support/mihomo-proxy-management/logs/{feishu-sync.out.log,feishu-sync.err.log}
+/Library/Application Support/mihomo-proxy-management/logs/feishu-bitable-sync.log
 /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
 ```
 
@@ -381,6 +388,12 @@ override 完全不参与，验证不可能被导向别的文件。两个 plist�
 | `CODEBUDDY-SG` | fallback | `(?i)新加坡\|\bSG\b\|Singapore\|🇸🇬` | CODEBUDDY 新加坡（生产出现 1 次） |
 | `CODEBUDDY-JP` | fallback | `(?i)日本\|\bJP\b\|Japan\|🇯🇵` | CODEBUDDY 日本（生产最后一位） |
 | `CODEBUDDY` | fallback | `[DIRECT, CODEBUDDY-HK, CODEBUDDY-TW, CODEBUDDY-SG, CODEBUDDY-JP]`，interval 60 | DIRECT → 香港 → 台湾 → 新加坡 → 日本 |
+| `GROKBOT-US` / `GROKBOT-SG` / `GROKBOT-JP` | fallback，url `https://grok.com/cdn-cgi/trace`，expected-status 200，interval 300，timeout 8000，lazy false，max-failed-times 3 | 生产 GROKBOT 组的区域候选（严格 US/SG/JP 过滤，与 GPT 子组同一套常量） |
+| `GROKBOT` | fallback | `[GROKBOT-US, GROKBOT-SG, GROKBOT-JP, AUTO-FOREIGN]`，同 url/interval | 生产 GROKBOT 组：x.ai/grok.com 专用。**末位必须是 AUTO-FOREIGN 而非 DIRECT**——x.ai 在大陆不能直连，三个区域池全空/全死时由任意存活节点兜底。曾用路由 `x.ai → US-FAST`：US-FAST 空池时 mihomo 把组静默降级为 COMPATIBLE（≈直连），这就是 grok bot 连不上的根因（2026-11-17） |
+
+GROKBOT 组直接来自共享模板（与生产一致），macOS 渲染器不重写它，只由 `audit()` 锁定不变量
+（成员顺序、url、expected-status、AUTO-FOREIGN 兜底）；`policy` 对 GROKBOT 区域零匹配只**警告**
+（有 AUTO-FOREIGN 兜底，不 fatal）。`GLOBAL` 与 Windows 一样包含 GROKBOT 供手动切换。
 
 ### macOS 专用覆盖（模板不动）
 
@@ -414,12 +427,39 @@ override 完全不参与，验证不可能被导向别的文件。两个 plist�
 `COMPATIBLE`（等同直连），不报错、也不告警。因此 macOS 渲染时由 policy 校验对
 CURSOR 无匹配直接报错；Windows `install.ps1` 不做该校验（行为不变）。
 
+### 接入 Nextin 本地节点
+
+在仓库根目录运行以下命令，将已提取的节点文件安装到 macOS 运行目录并重新生成配置。
+
+```sh
+sudo install -o root -g wheel -m 600 providers/nextin.yaml \
+  '/Library/Application Support/mihomo-proxy-management/providers/nextin.yaml'
+sudo sh macos/scripts/install.sh --no-start
+```
+
+Nextin 文件用于补充源 1。原有 `subscription` 继续按订阅刷新，现有策略组也读取本地补充节点。飞书把两批节点合并到源 1 的测速池，默认每 600 秒运行一次。
+
 ### 与 Windows 共用的 `scripts/health-check-provider.py`
 
 Windows 计划任务（`scripts/refresh-production.ps1`、`scripts/run-xigua-ippool.ps1`）
 仍以**原路径** `scripts\health-check-provider.py` 调用，命令行参数、退出码与 stdout
 格式都没有变（拆分只是把逻辑抽成可导入函数）。`tests/test_health_check_cli_compat.py`
 用 main 版快照对新版做 `--help` 与 mock 运行的逐字段对照。
+
+macOS 安装版也包含该脚本。用安装时的 Python 解释器运行以下命令，对候选池执行与
+Windows 刷新任务一致的三目标检查，结果写入独立的健康池。
+
+```sh
+support='/Library/Application Support/mihomo-proxy-management'
+libexec='/usr/local/libexec/mihomo-proxy-management'
+sudo /usr/local/libexec/mpm-python-venv/bin/python3 "$libexec/scripts/health-check-provider.py" \
+  --core "$libexec/current/mihomo" \
+  --candidate "$support/providers/candidate.yaml" \
+  --output "$support/providers/three-sources-all-targets.yaml" \
+  --target https://www.gstatic.com/generate_204 \
+  --target https://chatgpt.com/cdn-cgi/trace \
+  --target https://muse.ai/ --minimum-matching 1
+```
 
 规则顺序（mihomo 命中第一条即停，**不要重排**）：
 
@@ -444,7 +484,9 @@ TUN 判定链（缺一不可）：
 4. LaunchDaemon running；
 5. `127.0.0.1:9090/version` 可用（带 secret 认证）；
 6. provider healthcheck **已触发**且至少一个节点存活；并且 `AUTO-FOREIGN` 与 `GPT` 两个组
-   都有存活节点（`/proxies` 的 `alive`）；
+   都有存活节点（`/proxies` 的 `alive`）。`GROKBOT` 不需要单独进健康门：它的最后一位
+   fallback 成员是 `AUTO-FOREIGN`，`AUTO-FOREIGN` 存活即 GROKBOT 存活；多加一个名字只会
+   多一种失败形态，不会多一分覆盖；
 7. 注入式探针观察到**新增的 `utun*`** 或默认路由切到 `utun*`（仅“存在 utun”不算成功，
    其他 VPN 也会创建 utun）。
 
@@ -714,6 +756,8 @@ mpm-switch mihomo --drill-fail
 | 安装 `/Library/LaunchDaemons/...core.plist` | 是 | 是 |
 | `launchctl disable system/<core>`（安装结束即执行，core 开机不自启） | 是 | 是 |
 | 安装 `/Library/LaunchDaemons/...boot-switch.plist` 并 `enable`（开机入口，一次性运行） | 是 | 是 |
+| 安装 `/Library/LaunchDaemons/...feishu-sync.plist` 并 `enable`+`bootstrap`（飞书测速同步，install 内自动完成） | 是（执行 install 即确认） | 是 |
+| 提供 FEISHU_* 凭据（install 时 `MPM_FEISHU_*` env，或从 Windows `~/.hermes/.env` 抄值后补进 0600 文件重跑 install） | 是 | 是 |
 | 非重启验收：`switch boot` / `launchctl kickstart -k system/<boot-switch>`（含 `--drill-fail`） | 是 | 是 |
 | 真实重启验收（登录后自动走 mihomo、失败回退 Nextin）——**本次未做** | 是 | 是 |
 | `mpm-switch mihomo`（弹密码框，自动断开 Nextin、启动并探测） | 是（执行命令即确认） | 是（osascript 弹窗） |
@@ -746,7 +790,84 @@ mpm-switch mihomo --drill-fail
 
 飞书脚本的取值顺序是 `--app-token` > 进程环境变量 > env 文件，错误信息不会打印值。
 
-## 7. 测试
+## 7. 飞书测速同步（feishu-sync LaunchDaemon）与分组诊断
+
+Windows 用两个计划任务同步飞书多维表：`MihomoFeishuBitableSync`（每 30 分钟全量，表1/2/3 +
+`proxy-auto-switch.py`）与 `MihomoNinjaGrokFeishuSync`（每 10 分钟 `--ninja-only` 写表2，
+依赖 Windows 版 Ninja Desktop）。macOS 没有任务计划器，也没有 Ninja Desktop，所以新增了
+第三个 system LaunchDaemon：
+
+```text
+com.mihomo-proxy-management.feishu-sync
+  ProgramArguments = <安装解释器> -m mpm_macos.feishu_sync
+  StartInterval    = MPM_FEISHU_SYNC_INTERVAL_SECONDS（默认 600 秒，夹在 [300, 86400]）
+  ProcessType      = Background；无 RunAtLoad、无 KeepAlive（故意省略）
+```
+
+* **做什么**：每个周期在进程内按路径加载**安装版**
+  `libexec/scripts/sync-feishu-bitable.py`（与 `convert_sub.py` 同目录，靠它的
+  `sys.path` 导入成立；`install` 负责复制），运行完整同步，更新
+  **表1 订阅源状态 / 表2 可测速节点 / 表3 GPT可用地区组**。
+* **测速不碰生产内核**：脚本自建临时 mihomo 内核（mixed-port 17890、controller 19090、
+  `tun.enable: false`），逐节点对 grok.com / chatgpt.com / api.openai.com 测延迟并经
+  节点出口查询实际地区；生产 7890/9090 只用于订阅抓取兜底与只读回退。
+* **凭据**：三个键 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_BITABLE_APP_TOKEN`
+  与核心秘密同住 0600 的 `state/subscription.env`（install 接受 `MPM_FEISHU_*` 环境变量，
+  也可从 Windows 机器的 `~/.hermes/.env` 抄值后手工补进文件再重跑 install）。
+  `save_secrets` 读-改-写：重跑 install **不会丢**已有的 FEISHU_* 值；凭据值永远不出现在
+  命令行参数里。**凭据缺失不阻塞安装**：周期任务报告缺哪些键（退出码 3）并在下个周期重试。
+* **派生键 `SUBSCRIPTION_URL_1`**：飞书脚本的订阅源约定是 `SUBSCRIPTION_URL_1..4`；
+  install 每次写秘密文件时用同一个 `SUBSCRIPTION_URL` 派生 `_1` 镜像，永远不会失同步。
+  只配一个源即可运行（其余源记 `url_missing`，不致命）。
+* **增加第二个订阅源（可选）**：例如 Nextin App 里订的 wmsxwd（wmsxwd-3.men）机场。
+  Nextin 是沙盒 App，终端读不到它的容器（TCC），订阅链接请从 wmsxwd 仪表盘复制后
+  **自己**写进 0600 秘密文件（值不经过对话/git，install 重跑也不会丢）：
+
+  ```sh
+  sudoedit "/Library/Application Support/mihomo-proxy-management/state/subscription.env"
+  # 加一行（订阅链接是凭证）：
+  #   SUBSCRIPTION_URL_2=https://.../subscribe?token=...
+  # 可选：SUBSCRIPTION_UA_2=ClashMeta/1.18.0
+  # 立即抓取三个源、合并候选池（0600，只作评估，绝不替换生产 provider）：
+  sudo /usr/local/bin/mihomo-proxy-management update-sources
+  ```
+
+  `update-sources` 复用安装版 `convert_sub.py` 的三源候选机制（0 全部成功 / 5 部分成功
+  但已写出候选 / 1 空池）；加源后飞书测速同步在下一个周期自动把来源 2 的节点一起
+  测速并写进表1/表2。`groups` 诊断在加源后重新跑一次 install/configure 才能看到新节点
+  进组（provider 由 mihomo 按间隔自动刷新）。
+* **失败语义**：无 RunAtLoad，bootstrap 不会触发首轮（install 后约一个周期才首次同步）；
+  无 KeepAlive，失败的周期靠下一个 interval 重试，不会风暴；launchd 对运行中的作业自动
+  跳过后续 tick，慢测速不会自我重叠。缺安装版 mihomo / 缺脚本 → 退出码 4（fail closed，
+  绝不用替代二进制测速）。plist 审计强制：入口必须是 `mpm_macos.feishu_sync`、
+  `StartInterval ≥ 300` 的整数、禁止 RunAtLoad/KeepAlive/shell/秘密/URL。
+* **验收**：
+
+```sh
+# 手动跑一个周期（或干跑检查前置条件与 argv，不测速不写表）
+sudo launchctl kickstart system/com.mihomo-proxy-management.feishu-sync
+sudo env PYTHONPATH=/usr/local/share/mihomo-proxy-management/python \
+     /usr/local/bin/python3 -m mpm_macos.feishu_sync --dry-run
+# 输出与运行结果
+tail /Library/Application\ Support/mihomo-proxy-management/logs/feishu-sync.out.log
+tail /Library/Application\ Support/mihomo-proxy-management/logs/feishu-bitable-sync.log
+```
+
+### `groups`：分组匹配/存活诊断
+
+回答「为什么出口总是香港 / 其他节点为什么不可用」：
+
+```sh
+sudo /usr/local/bin/mihomo-proxy-management groups [--json]
+```
+
+只读输出每个渲染组：类型、filter、**匹配节点数**（对 provider 节点名逐组计数）、控制器
+侧存活成员与当前选中项（`now`）。**匹配数为 0 的组会标出
+`no node matches: mihomo degrades this group to COMPATIBLE (direct)`**——空池组静默
+降级成直连正是 grok/US-FAST 类问题的来源；区域名对不上订阅命名时一眼可见。
+控制器不可达时只降级为匹配计数（状态 OK，不报错）。
+
+## 8. 测试
 
 ```sh
 # macOS 适配层单独跑
@@ -792,6 +913,17 @@ mpm-switch mihomo --drill-fail
   预检通过并跑完整切换（不再误报 `required command not found: mihomo`）；无可用二进制时
   fail closed（退出码 4）并回退 Nextin（core 不 bootstrap、保持 disabled、Nextin 已连接）；
   boot plist 注入绝对安装路径、审计拒绝相对 `MPM_MIHOMO_BINARY`；
+* `test_macos_feishu_sync.py`（飞书测速同步守护，全部 host-free）：interval 缺省/夹取、
+  argv 全部落在布局内且不含秘密值、前置检查三级（缺安装版二进制 / 缺已装脚本 /
+  缺 FEISHU_* 凭据，各自独立退出码与提示文案）、注入 loader 后 `run_sync` 的退出码透传
+  与失败报告、`--dry-run` 不加载不执行、feishu-sync plist 渲染+审计（拒绝
+  `RunAtLoad`/`KeepAlive`/小于 300 的 `StartInterval`/错入口/shell）、install 挂载
+  （复制 `sync-feishu-bitable.py`、写 plist、enable 读回、bootstrap、loaded-not-running）
+  与 uninstall 摘除、重跑 install 幂等且不丢凭据、`save_secrets` 保留 FEISHU_* 并派生
+  `SUBSCRIPTION_URL_1`、`load_secrets` 的 `MPM_FEISHU_*` 覆盖顺序；
+* `test_macos_groups.py`（`groups` 只读诊断）：区域匹配计数、空池的
+  COMPATIBLE 警告、控制器不可达时降级为纯匹配计数（状态仍 OK）、`now` 选中项、
+  渲染配置损坏 fail closed；
 * 健康门的总 deadline 单独测在 `tests/test_controller_health_deadline.py`
   （healthcheck 超时算“已触发”、轮询到 alive 即通过、deadline 到期无 alive 的准确信息、
   controller 真不可达、存活未知、provider 不可见、`/providers/proxies` 正常但 `/proxies`
