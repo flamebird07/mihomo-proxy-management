@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "scripts", "extract_nextin_subscription.py")
 spec = importlib.util.spec_from_file_location("extract_nextin_subscription", SCRIPT)
 extract = importlib.util.module_from_spec(spec)
+# dataclasses resolves string annotations via sys.modules[cls.__module__];
+# without registration Python 3.11 raises AttributeError at import time.
+sys.modules[spec.name] = extract
 spec.loader.exec_module(extract)
 
 pytestmark = pytest.mark.macos
@@ -68,6 +72,8 @@ def test_scan_finds_and_ranks_url_candidates(fake_container: Path):
     assert "3 node-like" in profiles[0].detail
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="chmod 000 read-blocking is POSIX-only")
 def test_scan_reports_blocked_paths_without_crashing(tmp_path: Path):
     secret_dir = tmp_path / "group.com.Tommy.Nextin"
     secret_dir.mkdir()
@@ -92,6 +98,8 @@ def test_main_dry_run_masks_urls_and_sets_exit_code(fake_container: Path, capsys
     assert "profile.yaml" in out
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="chmod 000 read-blocking is POSIX-only")
 def test_main_reports_blocked_container_with_hint(tmp_path: Path, capsys):
     blocked_root = tmp_path / "group.com.Tommy.Nextin"
     blocked_root.mkdir()
@@ -191,7 +199,8 @@ def test_apply_env_write_creates_the_file_when_missing(tmp_path: Path):
     assert changes == ["SUBSCRIPTION_URL_2=https://wmsxwd.example.invalid/api/v1/client/subscribe?token=***"]
     text = env_path.read_text(encoding="utf-8")
     assert FAKE_URL_WMSXWD in text
-    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    if sys.platform != "win32":  # Windows cannot express 0600 mode bits
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
 
 # ---- --export ---------------------------------------------------------------
@@ -212,4 +221,5 @@ def test_export_copies_the_best_profile_with_mode_0600(tmp_path: Path, capsys):
     assert exit_code == 0
     text = target.read_text(encoding="utf-8")
     assert "香港-01" in text
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    if sys.platform != "win32":  # Windows cannot express 0600 mode bits
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600

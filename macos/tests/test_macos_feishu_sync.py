@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -436,6 +437,8 @@ def test_load_secrets_reads_feishu_keys_from_env_and_file(tmp_path):
     )
     assert secrets.feishu_app_id == "cli_env"
     assert secrets.feishu_bitable_app_token == "fake_file_token"
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="secret 0600 permission gate is POSIX-only")
 def test_xigua_schedule_is_opt_in_and_removed_with_its_source(tmp_path, monkeypatch):
     ctx = make_context(tmp_path)
     layout = ctx.layout
