@@ -237,4 +237,9 @@ def run(settings: Settings, log: Logger,
         )
     except Exception as exc:
         raise RunError(f"table write failed ({type(exc).__name__})", exit_code=5) from None
+    if summary.wrote_nodes < len(node_records):
+        # Partial write (slow Feishu rows): the round's measurements that DID
+        # land keep their clock; the rest retry next round. Not a failure.
+        log.warn(f"node write partial wrote={summary.wrote_nodes} "
+                 f"of={len(node_records)}")
     return summary

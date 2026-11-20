@@ -398,6 +398,17 @@ def upsert_source_rows(client: FeishuClient, table_id: str, source_number: int,
         if rid and _as_number(fields.get("源编号")) == source_number:
             by_key[(_row_source(fields), _row_name(fields))] = row
 
+    def _retry(action):
+        """One retry with backoff: the Feishu API has slow windows where a
+        single call times out (observed live on collect writes)."""
+        import time as _time
+
+        try:
+            return action()
+        except FeishuError:
+            _time.sleep(2)
+            return action()
+
     created = 0
     updated = 0
     for record in records:
@@ -406,12 +417,12 @@ def upsert_source_rows(client: FeishuClient, table_id: str, source_number: int,
         matched = by_key.pop(key, None)
         if matched is None:
             fields.setdefault("同步时间", now_ms)
-            client.batch_create(table_id, [{"fields": fields}])
+            _retry(lambda: client.batch_create(table_id, [{"fields": fields}]))
             created += 1
         else:
             # Identity refresh only: never touch 同步时间 here.
             fields.pop("同步时间", None)
-            client.update_record(table_id, matched["record_id"], fields)
+            _retry(lambda: client.update_record(table_id, matched["record_id"], fields))
             updated += 1
     log(f"records upsert source={source_number} created={created} updated={updated}")
     return created + updated

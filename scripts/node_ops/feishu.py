@@ -321,20 +321,43 @@ def upsert_node_rows(client, table_id: str, records: List[dict],
         fields = row.get("fields") or {}
         if rid:
             by_key[(_cell_text(fields.get("来源")), _cell_text(fields.get("节点名")))] = row
+    def _retry(action, what: str):
+        """Run a write, retrying twice with backoff on transient Feishu
+        errors (the API has slow windows where single PUTs time out)."""
+        import time as _time
+
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                return action()
+            except FeishuError as exc:
+                last = exc
+                if attempt < 2:
+                    _time.sleep(1 + 2 * attempt)
+        raise last if last else RuntimeError(what)
+
     updated = 0
     created = 0
+    failed = 0
     for record in records:
         fields = {k: v for k, v in (record.get("fields") or {}).items() if v is not None}
         key = (_cell_text(fields.get("来源")), _cell_text(fields.get("节点名")))
         matched = by_key.pop(key, None)
-        if matched is not None:
-            client.update_record(table_id, matched["record_id"], fields)
-            updated += 1
-        else:
-            fields.setdefault("同步时间", now_ms)
-            client.batch_create(table_id, [{"fields": fields}])
-            created += 1
-    log(f"records upsert updated={updated} created={created}")
+        try:
+            if matched is not None:
+                _retry(lambda: client.update_record(table_id, matched["record_id"], fields),
+                       "update")
+                updated += 1
+            else:
+                fields.setdefault("同步时间", now_ms)
+                _retry(lambda: client.batch_create(table_id, [{"fields": fields}]),
+                       "create")
+                created += 1
+        except Exception:  # noqa: BLE001 - one slow row must not kill the round
+            failed += 1
+    log(f"records upsert updated={updated} created={created} failed={failed}")
+    if failed and not (updated or created):
+        raise FeishuError("api_error", "upsert_all_rows_failed")
     return updated + created
 
 

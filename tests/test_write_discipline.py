@@ -180,5 +180,77 @@ class BuilderClockTests(unittest.TestCase):
                          "failed rate must not advance the tombstone clock")
 
 
+class ResilienceTests(unittest.TestCase):
+    """Slow-API windows must degrade a round, not kill it."""
+
+    class _Flaky:
+        def __init__(self, fail_first):
+            self.fail_first = fail_first
+            self.update_calls = 0
+
+        def list_records(self, _table_id):
+            return [{"record_id": "r1", "fields": {"来源": "飞兔", "节点名": "n1",
+                                                   "同步时间": 1}}]
+
+        def update_record(self, _table_id, _rid, _fields):
+            self.update_calls += 1
+            if self.update_calls <= self.fail_first:
+                from node_ops.feishu import FeishuError
+                raise FeishuError("timeout", "slow api")
+            return None
+
+        def batch_create(self, _table_id, records):
+            return [f"new{i}" for i, _ in enumerate(records)]
+
+    def test_ops_update_retries_transient_failures(self):
+        import subprocess as _sp  # noqa: F401
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "node_ops"))
+        node_ops_feishu = importlib.import_module("node_ops.feishu")
+        client = self._Flaky(fail_first=2)  # fails twice, succeeds on 3rd
+        lines = []
+
+        def log(message):
+            lines.append(message)
+
+        wrote = node_ops_feishu.upsert_node_rows(
+            client, "tbl", [{"fields": {"来源": "飞兔", "节点名": "n1",
+                                        "存活": True, "同步时间": 99}}],
+            now_ms=100, log=log)
+        self.assertEqual(wrote, 1)
+        self.assertEqual(client.update_calls, 3, "two retries then success")
+
+    def test_ops_partial_failure_keeps_the_round(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "node_ops"))
+        node_ops_feishu = importlib.import_module("node_ops.feishu")
+
+        class HalfDead(self._Flaky):
+            def update_record(self, table_id, rid, fields):
+                self.update_calls += 1
+                if rid == "r1":
+                    from node_ops.feishu import FeishuError
+                    # retries exhaust, row lost - but the round survives
+                    raise FeishuError("timeout", "always slow")
+                return None
+
+            def list_records(self, _table_id):
+                return [
+                    {"record_id": "r1", "fields": {"来源": "飞兔", "节点名": "n1",
+                                                   "同步时间": 1}},
+                    {"record_id": "r2", "fields": {"来源": "飞兔", "节点名": "n2",
+                                                   "同步时间": 1}},
+                ]
+
+        client = HalfDead(fail_first=0)
+        lines = []
+
+        wrote = node_ops_feishu.upsert_node_rows(
+            client, "tbl",
+            [{"fields": {"来源": "飞兔", "节点名": "n1", "存活": True}},
+             {"fields": {"来源": "飞兔", "节点名": "n2", "存活": True}}],
+            now_ms=100, log=lines.append)
+        self.assertEqual(wrote, 1, "the healthy row still lands")
+        self.assertTrue(any("failed=1" in line for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()
