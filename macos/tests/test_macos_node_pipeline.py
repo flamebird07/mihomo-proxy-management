@@ -361,6 +361,74 @@ def test_node_pipeline_plist_audit_rejects_drift(sandbox_templates, mutation):
         )
 
 
+# ---- stale ops lock + provider refresh ------------------------------------------
+
+
+def test_stale_ops_lock_removed_when_no_process(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.node_state_dir, exist_ok=True)
+    lock = os.path.join(layout.node_state_dir, "node_ops.lock")
+    Path(lock).write_text("{}")
+    os.utime(lock, (0, 0))  # far older than 60s
+    monkeypatch.setattr(node_pipeline, "_node_ops_alive", lambda: False)
+    lines: list[str] = []
+    assert node_pipeline.clear_stale_ops_lock(layout, say=lines.append) is True
+    assert not os.path.exists(lock)
+    assert any("stale" in line for line in lines)
+
+
+def test_stale_ops_lock_kept_while_process_alive_or_fresh(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.node_state_dir, exist_ok=True)
+    lock = os.path.join(layout.node_state_dir, "node_ops.lock")
+    Path(lock).write_text("{}")  # fresh: age < 60s
+    monkeypatch.setattr(node_pipeline, "_node_ops_alive", lambda: True)
+    assert node_pipeline.clear_stale_ops_lock(layout, say=lambda _m: None) is False
+    assert os.path.exists(lock)
+    os.utime(lock, (0, 0))
+    assert node_pipeline.clear_stale_ops_lock(layout, say=lambda _m: None) is False, (
+        "a live process keeps even an old lock (fail-closed)")
+    assert os.path.exists(lock)
+
+
+def test_provider_refresh_only_on_content_change(tmp_path):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.node_state_dir, exist_ok=True)
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(layout.valid_provider_file).write_text("proxies: []\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def reload_provider(_secret: str):
+        calls.append("reload")
+        return 204
+
+    assert node_pipeline.maybe_refresh_provider(
+        layout, say=lambda _m: None, reload_provider=reload_provider) is True
+    assert calls == ["reload"]
+    # unchanged content: no second reload
+    assert node_pipeline.maybe_refresh_provider(
+        layout, say=lambda _m: None, reload_provider=reload_provider) is False
+    assert calls == ["reload"]
+    # changed content: reload again, hash persisted after success
+    Path(layout.valid_provider_file).write_text("proxies:\n  - name: x\n", encoding="utf-8")
+    assert node_pipeline.maybe_refresh_provider(
+        layout, say=lambda _m: None, reload_provider=reload_provider) is True
+    assert calls == ["reload", "reload"]
+
+
+def test_provider_refresh_failure_is_retried_next_tick(tmp_path):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.node_state_dir, exist_ok=True)
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(layout.valid_provider_file).write_text("proxies: []\n", encoding="utf-8")
+    lines: list[str] = []
+    assert node_pipeline.maybe_refresh_provider(
+        layout, say=lines.append, reload_provider=lambda _s: None) is False
+    assert any("retried" in line for line in lines)
+    marker = os.path.join(layout.node_state_dir, "provider.sha256")
+    assert not os.path.exists(marker), "hash persisted only after success"
+
+
 # ---- install / uninstall wiring -------------------------------------------------
 
 

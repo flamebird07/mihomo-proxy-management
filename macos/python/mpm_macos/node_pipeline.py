@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import time
 import sys
 from typing import Callable
 
@@ -140,6 +141,113 @@ def supplement_files(layout: Layout) -> list[str]:
     if os.path.isfile(legacy):
         files.append(legacy)
     return files
+
+
+def _node_ops_alive() -> bool:
+    """Whether any node_ops process is running (pgrep; no /proc on macOS)."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", NODE_OPS_PACKAGE],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True  # cannot prove it is dead: never touch the lock
+    return bool((result.stdout or "").strip())
+
+
+def clear_stale_ops_lock(layout: Layout, *, say: Callable[[str], None] = print) -> bool:
+    """Remove an orphaned node_ops lockfile (no process, lock older than 60s).
+
+    ``launchctl kickstart -k`` kills the pipeline parent but not the running
+    node_ops child; a child killed mid-probe leaves its O_EXCL lockfile
+    behind, and every later tick fails with "another node_ops instance is
+    running" until the 24h staleness window.  The daemon proves staleness
+    (no matching process + age) before unlinking; an unprovable state keeps
+    the lock (fail-closed).
+    """
+    lock_path = os.path.join(layout.node_state_dir, "node_ops.lock")
+    if not os.path.isfile(lock_path):
+        return False
+    try:
+        age = time.time() - os.path.getmtime(lock_path)
+    except OSError:
+        return False
+    if age < 60 or _node_ops_alive():
+        return False
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        return False
+    say("node-pipeline: stale node_ops lock removed "
+        f"(no process, age {int(age)}s)")
+    return True
+
+
+def _provider_hash(layout: Layout) -> str | None:
+    import hashlib
+
+    try:
+        with open(layout.valid_provider_file, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def maybe_refresh_provider(layout: Layout, *,
+                           say: Callable[[str], None] = print,
+                           reload_provider: Callable[[str], int | None] | None = None,
+                           ) -> bool:
+    """Hot-reload the node-valid file provider when its content changed.
+
+    mihomo never re-reads a ``type: file`` provider on its own; without this
+    the running core would keep the pool from the first tick forever.  The
+    hash is only persisted after a successful reload, so a failed reload is
+    retried on the next tick.
+    """
+    if not os.path.isfile(layout.valid_provider_file):
+        return False
+    marker = os.path.join(layout.node_state_dir, "provider.sha256")
+    current = _provider_hash(layout)
+    if current is None:
+        return False
+    try:
+        previous = open(marker, encoding="utf-8").read().strip()
+    except OSError:
+        previous = ""
+    if current == previous:
+        return False
+
+    if reload_provider is None:
+        def reload_provider(_secret: str) -> int | None:
+            import urllib.error
+            import urllib.request
+
+            values = _read_secret_values(layout.secret_file)
+            secret = (values.get("SECRET") or "").strip()
+            request = urllib.request.Request(
+                f"{LIVE_CONTROLLER}/providers/proxies/node-valid",
+                data=b"",
+                headers={"Authorization": f"Bearer {secret}"} if secret else {},
+                method="PUT",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status
+            except (OSError, urllib.error.URLError):
+                return None
+
+    secret_present = bool((_read_secret_values(layout.secret_file) or {}).get("SECRET"))
+    status = reload_provider(secret_present)
+    if status not in (200, 204):
+        say("node-pipeline: node-valid provider reload unavailable "
+            "(retried next tick): " + HOST.text(f"{status}"))
+        return False
+    os.makedirs(layout.node_state_dir, mode=0o700, exist_ok=True)
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write(current + "\n")
+    say("node-pipeline: node-valid provider reloaded "
+        f"http={status} (pool refreshed without dropping connections)")
+    return True
 
 
 def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
@@ -330,8 +438,10 @@ def main(
         print(f"node-pipeline dry-run: exit={code}")
         return code
 
+    clear_stale_ops_lock(layout)
     steps_code = run_steps(layout)
     apply_presence(layout, context_factory=lambda: ctx)
+    maybe_refresh_provider(layout)
     return steps_code
 
 
