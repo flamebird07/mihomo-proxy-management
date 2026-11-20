@@ -107,10 +107,16 @@ def build_node_records(entries: Iterable[NodeEntry], result: ProbeResult,
             "测速目标": target_label,
             "地区检测时间": region_ms,
         })
-        if not delay:
-            # Tombstone clock = last valid rate (write-discipline ruling): a
-            # failed probe updates the measurements but must not extend the
-            # row's life.  The in-place upsert keeps the previous clock.
+        # Tombstone clock = last valid rate (write-discipline ruling).
+        # _identity_fields preserves an existing row's columns VERBATIM -
+        # including 同步时间 - so the clock must be set explicitly:
+        #   valid rate  -> THIS round's stamp (the row stays alive)
+        #   failed rate -> no clock in the payload at all, so the in-place
+        #                  update leaves the previous clock untouched (the
+        #                  row keeps aging toward the 7-day tombstone).
+        if delay:
+            fields["同步时间"] = sync_ms
+        else:
             fields.pop("同步时间", None)
         records.append({"fields": fields})
     return records

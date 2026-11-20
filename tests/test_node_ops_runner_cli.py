@@ -175,8 +175,15 @@ class PipelineTests(unittest.TestCase):
                        if call[0] == "update_record" and call[1] == "tbl-n"]
         self.assertEqual(len(node_writes), 1)
         fields = node_writes[0][3]
+        # Write-discipline ruling: identity columns are preserved verbatim
+        # EXCEPT 同步时间 - the last-valid-rate clock advances with the
+        # round's stamp when the probe produced a rate.
         for key in schema.NODES_IDENTITY_FIELDS:
+            if key == "同步时间":
+                continue
             self.assertEqual(fields[key], original["fields"][key], key)
+        self.assertGreater(fields["同步时间"], original["fields"].get("同步时间", 0),
+                           "valid rate advances the tombstone clock")
         self.assertEqual(fields["源编号"], 1)
         self.assertEqual(fields["延迟ms"], 100)
         self.assertEqual(fields["实际地区"], "美国/加利福尼亚")

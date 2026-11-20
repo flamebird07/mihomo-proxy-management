@@ -116,8 +116,15 @@ class RecordBuildingTests(unittest.TestCase):
         rows = records.build_node_records([self.entry], self.result, 1_700_000_000_000,
                                           1_700_000_000_000, previous_rows=[old])
         fields = rows[0]["fields"]
+        # Write-discipline ruling: 同步时间 is the measuring side's
+        # last-valid-rate clock, NOT a verbatim identity column - a valid
+        # rate stamps this round; every other identity field stays verbatim.
         for key in schema.NODES_IDENTITY_FIELDS:
+            if key == "同步时间":
+                continue
             self.assertEqual(fields[key], old["fields"][key], key)
+        self.assertEqual(fields["同步时间"], 1_700_000_000_000,
+                         "valid rate advances the tombstone clock")
         self.assertEqual(fields["延迟ms"], 120)
         self.assertEqual(fields["chatgpt延迟ms"], 800)
         self.assertEqual(fields["openai延迟ms"], -1)

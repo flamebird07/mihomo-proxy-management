@@ -265,5 +265,45 @@ class ResilienceTests(unittest.TestCase):
         self.assertTrue(any("failed=1" in line for line in lines))
 
 
+
+class MasterClockTests(unittest.TestCase):
+    def test_matched_row_clock_advances_on_valid_rate(self):
+        """Regression (2026-11-20): _identity_fields preserves an existing
+        row's 同步时间 verbatim, so without an explicit stamp the clock NEVER
+        advanced on updates and every alive node would hit the 7-day
+        tombstone. A valid rate must stamp THIS round; a failed rate must
+        omit the clock so the previous value survives the in-place update."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "node_ops"))
+        records_mod = importlib.import_module("node_ops.records")
+        from node_ops.model import NodeEntry
+
+        def entry(name):
+            return NodeEntry(name=name, source="西瓜加速", source_number=3,
+                             probe_name=name,
+                             config={"name": name, "type": "trojan",
+                                     "server": "203.0.113.1", "port": 443})
+
+        class Result:
+            delays = {"alive": 321, "dead": 0}
+            regions = {}
+            chatgpt = {}
+            openai = {}
+
+        previous = {
+            ("西瓜加速", "alive"): {"节点名": "alive", "来源": "西瓜加速", "源编号": 3,
+                                    "同步时间": 111},
+            ("西瓜加速", "dead"): {"节点名": "dead", "来源": "西瓜加速", "源编号": 3,
+                                   "同步时间": 111},
+        }
+        rows = records_mod.build_node_records(
+            [entry("alive"), entry("dead")], Result(), sync_ms=999,
+            region_ms=999, previous_rows=[{"fields": f} for f in previous.values()])
+        by_name = {r["fields"]["节点名"]: r["fields"] for r in rows}
+        self.assertEqual(by_name["alive"]["同步时间"], 999,
+                         "valid rate advances the clock past the preserved 111")
+        self.assertNotIn("同步时间", by_name["dead"],
+                         "failed rate must not carry a clock")
+
+
 if __name__ == "__main__":
     unittest.main()
