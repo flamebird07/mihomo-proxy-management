@@ -2,7 +2,7 @@
 
 > **读者**：Windows 侧与 macOS 侧的开发者/Agent。两端**异步开发**，本文件是双方必须
 > 共同维护的"接口契约"——改动任何一侧的共享逻辑，先读这里，改完更新这里。
-> 最后更新：2026-11-19（feat/macos-compat PR #3）。
+> 最后更新：2026-11-20（Windows 接入自检 + 测试基线；前版 2026-11-19 feat/macos-compat PR #3）。
 
 ## 1. 一句话架构
 
@@ -108,3 +108,7 @@
    的移植：**改步骤顺序/新增步骤时两边同步**（两个文件头部互相指认）。
 6. 测试基线：mac 侧 `pytest` 允许的失败=4 个本分支历史 + 5 个上游 Windows 宿主假设
    （列表见 PR #3）；出现清单外失败先 `git stash` 对照再归因。
+   Windows 侧基线（2026-11-20，f4ead73 + 适配修复）：全套 **1230 passed / 279 skipped /
+   0 failed**。POSIX 专属语义（chmod 000 读阻断、0600 权限位断言、secret 权限门）在
+   win32 跳过；`extract_nextin_subscription.apply_env_write` 的 root 检查已 host-safe
+   化（Windows 无 euid 视为非特权），Mac 行为不变。

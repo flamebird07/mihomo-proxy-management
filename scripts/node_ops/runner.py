@@ -235,6 +235,11 @@ def run(settings: Settings, log: Logger,
             client, nodes_table["table_id"], stale_node_window_minutes(),
             stamp, log.info,
         )
+    except feishu.FeishuError as exc:
+        # kind/detail carry the API code only (client security contract: no
+        # credentials) - surface them so a failed write round is diagnosable.
+        detail = f"{exc.kind}:{exc.detail}" if exc.detail else exc.kind
+        raise RunError(f"table write failed ({detail})", exit_code=5) from None
     except Exception as exc:
         raise RunError(f"table write failed ({type(exc).__name__})", exit_code=5) from None
     if summary.wrote_nodes < len(node_records):

@@ -255,6 +255,12 @@ def scan(roots: list[str], *, airport_hint: str = AIRPORT_HINT) -> tuple[list[Ca
 # ---- write mode ------------------------------------------------------------
 
 
+def _is_root() -> bool:
+    """POSIX root check; Windows has no euid - treat as unprivileged."""
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid and geteuid() == 0)
+
+
 def apply_env_write(env_path: str, updates: dict[str, str]) -> list[str]:
     """Set keys in a KEY=VALUE env file, preserving everything else (0600).
 
@@ -262,11 +268,11 @@ def apply_env_write(env_path: str, updates: dict[str, str]) -> list[str]:
     key are removed (the project's env readers reject duplicates).
     """
     if os.path.isfile(env_path):
-        if os.geteuid() != 0 and not os.access(env_path, os.W_OK):
+        if not _is_root() and not os.access(env_path, os.W_OK):
             raise PermissionError(env_path)
     else:
         parent = os.path.dirname(env_path) or "."
-        if os.path.isdir(parent) and os.geteuid() != 0 and not os.access(parent, os.W_OK):
+        if os.path.isdir(parent) and not _is_root() and not os.access(parent, os.W_OK):
             raise PermissionError(parent)
     existing_lines: list[str] = []
     if os.path.isfile(env_path):

@@ -137,6 +137,19 @@ class UpsertDisciplineTests(unittest.TestCase):
         client, counts = self.upsert(rows, [])
         self.assertEqual(counts["deleted"], 1, "independent rows age on their own clock")
 
+    def test_independent_path_rows_match_their_own_upsert(self):
+        """Regression: independent-path rows were excluded from the match
+        index, so every ninja/source1/source3 round appended a duplicate
+        generation (created=N updated=0) instead of updating its own rows."""
+        rows = [_row("n1", "cc-1", "CoffeeCloud", path="Ninja Desktop",
+                     age_ms=10 * 60 * 1000)]  # fresh inside the 60-min window
+        payload = {"fields": {"节点名": "cc-1", "来源": "CoffeeCloud",
+                              "测速路径": "Ninja Desktop", "延迟ms": 90,
+                              "存活": True, "同步时间": NOW_MS}}
+        client, counts = self.upsert(rows, [payload])
+        self.assertEqual(counts, {"created": 0, "updated": 1, "deleted": 0})
+        self.assertEqual(len(client.rows), 1, "no duplicate generation")
+
     def test_create_without_clock_starts_the_tombstone_now(self):
         rows = []
         client, _ = self.upsert(rows, [_payload("brand-new", "飞兔", valid=False)])

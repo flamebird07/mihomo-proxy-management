@@ -3535,15 +3535,17 @@ def upsert_records(client: FeishuClient, table_id: str, records: list[dict],
         if not rid:
             continue
         label = path_label(fields.get("测速路径"))
-        if nodes_table and is_independent_path(label):
-            parsed, _warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
-            if parsed is not None and (now_ms - parsed) > independent_ms:
-                stale_ids.append(rid)  # ninja lifecycle, unchanged
-            continue
+        independent = nodes_table and is_independent_path(label)
+        window_ms = independent_ms if independent else tombstone_ms
         parsed, _warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
-        if parsed is not None and (now_ms - parsed) > tombstone_ms:
-            stale_ids.append(rid)  # 7-day time tombstone
+        if parsed is not None and (now_ms - parsed) > window_ms:
+            # independent paths keep their shorter ninja lifecycle; all
+            # other rows use the 7-day tombstone.  Time-driven only.
+            stale_ids.append(rid)
             continue
+        # Surviving rows MUST stay matchable: independent-path channels
+        # upsert their own rows too - excluding them here made every round
+        # append duplicates (created=N updated=0) instead of updating.
         existing_by_key.setdefault(row_key(fields), row)
 
     updates: list[dict] = []
