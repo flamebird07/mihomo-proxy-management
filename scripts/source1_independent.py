@@ -150,6 +150,13 @@ def _verify_row(row, want):
             raise RuntimeError('source1_delay_readback_mismatch:' + key)
 
 
+def _verify_candidates(region_saved, candidates):
+    # Dropped candidates leave stale True rows to the tombstone; only missing candidates fail.
+    saved_true = {r.get('节点名') for r in region_saved if r.get('GPT可用')}
+    if not set(candidates) <= saved_true:
+        raise RuntimeError('source1_candidates_readback_mismatch')
+
+
 def sync(client, node_table, region_table, log, helpers):
     nodes = yaml.safe_load((ROOT/'all-nodes.private.yaml').read_text(encoding='utf-8'))['proxies']
     names = [n['name'] for n in nodes]
@@ -203,8 +210,7 @@ def sync(client, node_table, region_table, log, helpers):
         region_saved = replace_scope(client, region_table, region_records,
                                      table_key='gpt_regions', log=log,
                                      upsert=helpers['upsert_records'])
-        if {r['节点名'] for r in region_saved if r.get('GPT可用')} != set(candidates):
-            raise RuntimeError('source1_candidates_readback_mismatch')
+        _verify_candidates(region_saved, candidates)
     atomic_json(history_path, history)
     by_name = {n['name']: n for n in nodes}
     candidate_file = ROOT/'gpt-candidates.private.yaml'

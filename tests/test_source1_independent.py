@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]/'scripts'))
+import pytest
 import source1_independent as s1
 
 
@@ -54,3 +55,16 @@ def test_scoped_upsert_never_deletes_any_channel():
     assert any(r['record_id'] == 'old' for r in c.rows), "own old row kept (no delete)"
     assert any(r['fields'].get('节点名') == 'new' for r in c.rows)
     assert any(r.get('节点名') == 'new' for r in result)
+
+
+def test_candidates_readback_tolerates_lingering_true_rows():
+    saved = [{'节点名': 'cand', 'GPT可用': True},
+             {'节点名': 'dropped', 'GPT可用': True}]
+    s1._verify_candidates(saved, ['cand'])
+
+
+def test_candidates_readback_fails_when_candidate_row_missing():
+    saved = [{'节点名': 'other', 'GPT可用': True},
+             {'节点名': 'cand', 'GPT可用': False}]
+    with pytest.raises(RuntimeError, match='source1_candidates_readback_mismatch'):
+        s1._verify_candidates(saved, ['cand'])
