@@ -51,3 +51,34 @@ class PriorityTests(unittest.TestCase):
     def test_no_eligible_means_no_direct_fallback(self):
         self.assertEqual(module.eligible_candidates(['美国'], {'美国': '未知'},
             {'美国': True}, {'美国': 20}, {'美国': 1}, lambda _: None, 2), [])
+
+
+class ReadbackTests(unittest.TestCase):
+    def test_failed_probe_row_keeps_its_previous_clock(self):
+        records = [{'fields': {'节点名': 'dead', '存活': False, '实际地区': '未知'}}]
+        saved = [{'节点名': 'dead', '存活': False, '实际地区': '未知', '同步时间': 111}]
+        module._verify_node_rows(saved, records)
+
+    def test_present_field_mismatch_still_raises(self):
+        records = [{'fields': {'节点名': 'n', '存活': True, '同步时间': 222}}]
+        saved = [{'节点名': 'n', '存活': True, '同步时间': 111}]
+        with self.assertRaisesRegex(RuntimeError, 'independent_feishu_field_mismatch:同步时间'):
+            module._verify_node_rows(saved, records)
+
+    def test_lingering_row_and_missing_name(self):
+        records = [{'fields': {'节点名': 'n', '存活': True}}]
+        module._verify_node_rows([{'节点名': 'n', '存活': True},
+                                  {'节点名': 'old', '存活': False}], records)
+        with self.assertRaisesRegex(RuntimeError, 'independent_feishu_count_mismatch'):
+            module._verify_node_rows([{'节点名': 'old'}], records)
+
+    def test_region_tolerates_first_round_passer_but_not_missing_candidate(self):
+        saved = [{'节点名': 'cand', 'GPT可用': True, '同步时间': 9},
+                 {'节点名': 'streak1', 'GPT可用': True, '同步时间': 9}]
+        module._verify_region_rows(saved, ['cand'], 9)
+        with self.assertRaisesRegex(RuntimeError, 'independent_gpt_readback_mismatch'):
+            module._verify_region_rows([{'节点名': 'streak1', 'GPT可用': True, '同步时间': 9}],
+                                       ['cand'], 9)
+        with self.assertRaisesRegex(RuntimeError, 'independent_gpt_readback_mismatch'):
+            module._verify_region_rows([{'节点名': 'cand', 'GPT可用': True, '同步时间': 8}],
+                                       ['cand'], 9)

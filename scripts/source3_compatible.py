@@ -587,6 +587,30 @@ def runtime(nodes, log=None, *,
     return state, call
 
 
+def _verify_node_rows(saved, records):
+    expected = {r['fields']['节点名']: r['fields'] for r in records}
+    by_name = {r.get('节点名') for r in saved}
+    for name in expected:
+        if name not in by_name:
+            raise RuntimeError('independent_feishu_count_mismatch')
+    for row in saved:
+        want = expected.get(row.get('节点名'))
+        if want is None:
+            continue  # lingering row inside its window: the tombstone owns it
+        for key in ('实际地区', '同步时间', '测速目标', '存活', '地区检测时间'):
+            # Failed-rate payloads omit the clock; the row keeps its previous one.
+            if key in want and row.get(key) != want[key]:
+                raise RuntimeError('independent_feishu_field_mismatch:' + key)
+
+
+def _verify_region_rows(region_saved, candidates, stamp):
+    saved_true = {r.get('节点名') for r in region_saved if r.get('GPT可用')}
+    if not set(candidates) <= saved_true:
+        raise RuntimeError('independent_gpt_readback_mismatch')
+    if any(r.get('同步时间') != stamp for r in region_saved):
+        raise RuntimeError('independent_gpt_readback_mismatch')
+
+
 def sync(client, table_id, log, helpers, region_table_id=None):
     nodes = yaml.safe_load((ROOT / 'nodes.yaml').read_text(encoding='utf-8'))['proxies']
     if not nodes or len({n['name'] for n in nodes}) != len(nodes):
@@ -632,18 +656,7 @@ def sync(client, table_id, log, helpers, region_table_id=None):
         # rows expire through the shared time windows inside upsert.
         helpers['upsert_records'](client, table_id, records, log, table_key='nodes')
         saved = [r['fields'] for r in client.list_records(table_id) if r['fields'].get('测速路径') == LABEL]
-        expected = {r['fields']['节点名']: r['fields'] for r in records}
-        by_name = {r.get('节点名') for r in saved}
-        for name in names:
-            if name not in by_name:
-                raise RuntimeError('independent_feishu_count_mismatch')
-        for row in saved:
-            if row.get('节点名') not in expected:
-                continue  # lingering row inside its window: the tombstone owns it
-            want = expected[row['节点名']]
-            for key in ('实际地区', '同步时间', '测速目标', '存活', '地区检测时间'):
-                if row.get(key) != want.get(key):
-                    raise RuntimeError('independent_feishu_field_mismatch:' + key)
+        _verify_node_rows(saved, records)
         if region_table_id:
             helpers['ensure_fields'](client, region_table_id,
                 [('测速路径', helpers['FT_TEXT'], None),
@@ -662,9 +675,7 @@ def sync(client, table_id, log, helpers, region_table_id=None):
                 client.batch_delete(region_table_id, previous)
             region_saved = [r['fields'] for r in client.list_records(region_table_id)
                             if r.get('fields', {}).get('测速路径') == LABEL]
-            if ({r['节点名'] for r in region_saved if r.get('GPT可用')} != set(candidates)
-                    or any(r.get('同步时间') != stamp for r in region_saved)):
-                raise RuntimeError('independent_gpt_readback_mismatch')
+            _verify_region_rows(region_saved, candidates, stamp)
     atomic_json(history_path, history)
     report = {'path': LABEL, 'nodes': len(saved), 'alive': sum(bool(r['存活']) for r in saved),
         'regions': sum(r['实际地区'] != '未知' for r in saved), 'chatgpt': sum(bool(v) for v in chatgpt.values()),
