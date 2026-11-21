@@ -86,6 +86,8 @@ def entries_from_rows(rows: List[dict], log: Logger) -> tuple[List[NodeEntry], i
     """
     entries: List[NodeEntry] = []
     skipped = 0
+    duplicates = 0
+    seen: set[tuple[str, str]] = set()
     for row in rows:
         fields = row.get("fields") if isinstance(row, dict) else None
         if not isinstance(fields, dict):
@@ -102,9 +104,17 @@ def entries_from_rows(rows: List[dict], log: Logger) -> tuple[List[NodeEntry], i
         if not name:
             skipped += 1
             continue
+        source = records.field_text(fields.get("来源")).strip() or "未知"
+        # One entry per upsert key: feeding duplicated rows back into the
+        # write would recreate the copies faster than the tombstone retires
+        # them (R[来源, 节点名]).
+        if (source, name) in seen:
+            duplicates += 1
+            continue
+        seen.add((source, name))
         entries.append(NodeEntry(
             name=name,
-            source=records.field_text(fields.get("来源")).strip() or "未知",
+            source=source,
             config=config,
             probe_name="",
             source_number=records.source_number_from_row(fields),
@@ -115,6 +125,8 @@ def entries_from_rows(rows: List[dict], log: Logger) -> tuple[List[NodeEntry], i
         entry.probe_name = probe_name
     if skipped:
         log.warn(f"rows skipped reason=invalid_config count={skipped}")
+    if duplicates:
+        log.warn(f"rows skipped reason=duplicate_key count={duplicates}")
     return entries, skipped
 
 

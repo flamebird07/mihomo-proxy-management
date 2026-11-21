@@ -125,6 +125,29 @@ class EntryTests(unittest.TestCase):
         self.assertEqual([entry.probe_name for entry in entries],
                          ["same", "same [2]"])
 
+    def test_same_key_duplicate_rows_collapse_to_one_entry(self):
+        rows = [dict(node_row("dup", "CoffeeCloud", 2), record_id="r1"),
+                dict(node_row("dup", "CoffeeCloud", 2), record_id="r2"),
+                dict(node_row("dup", "CoffeeCloud", 2), record_id="r3"),
+                dict(node_row("solo", "飞兔", 1), record_id="r4")]
+        entries, skipped = entries_from_rows(rows, Logger(None))
+        self.assertEqual(skipped, 0)
+        self.assertEqual([(e.name, e.source) for e in entries],
+                         [("dup", "CoffeeCloud"), ("solo", "飞兔")])
+
+    def test_duplicate_rows_never_recreate_master_rows(self):
+        client = FakeClient(node_rows=[
+            dict(node_row("dup", "CoffeeCloud", 2), record_id="r1"),
+            dict(node_row("dup", "CoffeeCloud", 2), record_id="r2"),
+        ])
+        summary = run(settings(), Logger(None), client=client,
+                      prober=FakeProber())
+        self.assertEqual(summary.collected, 1)
+        master_creates = [call for call in client.calls
+                          if call[0] == "batch_create" and call[1] == "tbl-n"]
+        self.assertEqual(master_creates, [])
+        self.assertEqual(summary.wrote_nodes, 1)
+
 
 class PipelineTests(unittest.TestCase):
     def test_dry_run_writes_nothing(self):
