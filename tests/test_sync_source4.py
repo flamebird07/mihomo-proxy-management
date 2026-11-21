@@ -197,5 +197,79 @@ class UrlMissingTests(unittest.TestCase):
         self.assertEqual(result.error, "url_missing")
 
 
+class PipelineTableSourceTests(unittest.TestCase):
+    """表2 可测速节点 is the node database: 西瓜 nodes come from the pipeline
+    master table (app extraction), and the cache never shadows them."""
+
+    class FakeClient:
+        def __init__(self, rows, tables=None):
+            self.rows = rows
+            self.tables = tables or [
+                {"name": "节点测速总表", "table_id": "tbl-master"},
+                {"name": "可测速节点", "table_id": "tbl-nodes"},
+            ]
+
+        def list_tables(self):
+            return list(self.tables)
+
+        def list_records(self, table_id):
+            self.last_table = table_id
+            return self.rows
+
+    def test_master_rows_are_read_for_source_four(self):
+        rows = [
+            {"record_id": "r1", "fields": {
+                "来源": "西瓜加速", "节点名": "HK-1",
+                "节点配置JSON": '{"name":"HK-1","type":"vless","server":"s1",'
+                                '"port":443,"uuid":"u"}'}},
+            {"record_id": "r2", "fields": {
+                "来源": [{"type": "text", "text": "西瓜加速"}],
+                "节点名": [{"type": "text", "text": "JP-2"}],
+                "节点配置JSON": '{"name":"JP-2","type":"trojan","server":"s2",'
+                                '"port":443,"password":"p"}'}},
+            {"record_id": "r3", "fields": {
+                "来源": "飞兔", "节点名": "FT-1",
+                "节点配置JSON": '{"name":"FT-1","type":"ss","server":"s3","port":1}'}},
+            {"record_id": "r4", "fields": {
+                "来源": "西瓜加速", "节点名": "HK-1",
+                "节点配置JSON": '{"name":"HK-1","type":"vless","server":"s1",'
+                                '"port":443,"uuid":"u"}'}},
+            {"record_id": "r5", "fields": {
+                "来源": "西瓜加速", "节点名": "BAD",
+                "节点配置JSON": "{oops"}},
+        ]
+        client = self.FakeClient(rows)
+        nodes = sync.load_pipeline_source_nodes(client, RecordingLog())
+        self.assertEqual([node["name"] for node in nodes], ["HK-1", "JP-2"])
+        self.assertEqual([node["type"] for node in nodes], ["vless", "trojan"])
+        self.assertEqual(client.last_table, "tbl-master")
+
+    def test_missing_master_table_returns_empty_for_cache_fallback(self):
+        client = self.FakeClient([], tables=[{"name": "别的", "table_id": "x"}])
+        self.assertEqual(
+            sync.load_pipeline_source_nodes(client, RecordingLog()), [])
+
+    def test_master_read_failure_never_raises(self):
+        class Broken:
+            def list_tables(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(
+            sync.load_pipeline_source_nodes(Broken(), RecordingLog()), [])
+
+    def test_source_status_options_include_pipeline_marker(self):
+        spec = next(s for s in sync.TABLE_SPECS if s["key"] == "sources")
+        options = next(prop["options"] for name, _t, prop in spec["fields"]
+                       if name == "拉取结果")
+        self.assertIn("总表", [option["name"] for option in options])
+
+    def test_main_prefers_master_table_and_keeps_cache_fallback(self):
+        source = inspect.getsource(sync.main)
+        self.assertIn("pipeline_nodes = load_pipeline_source_nodes(client, log)",
+                      source)
+        self.assertIn("apply_source_cache(result, cache_read_paths[4], log)",
+                      source)
+
+
 if __name__ == "__main__":
     unittest.main()

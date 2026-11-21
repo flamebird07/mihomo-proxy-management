@@ -152,7 +152,7 @@ TABLE_SPECS: list[dict[str, Any]] = [
             ("源名称", FT_TEXT, None),
             ("源编号", FT_NUMBER, NUMBER_PROPERTY),
             ("HTTP状态", FT_NUMBER, NUMBER_PROPERTY),
-            ("拉取结果", FT_SINGLE_SELECT, {"options": [{"name": "成功"}, {"name": "失败"}, {"name": "缓存"}]}),
+            ("拉取结果", FT_SINGLE_SELECT, {"options": [{"name": "成功"}, {"name": "失败"}, {"name": "缓存"}, {"name": "总表"}]}),
             ("节点数", FT_NUMBER, NUMBER_PROPERTY),
             ("存活数", FT_NUMBER, NUMBER_PROPERTY),
             ("流量剩余", FT_TEXT, None),
@@ -2266,6 +2266,73 @@ def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> b
     return True
 
 
+#: 西瓜加速 has no subscription URL.  Its live node list is the provider
+#: pipeline's master table (app extraction -> node_provider collect), so 表2
+#: 可测速节点 is the node database on every host; the local cache is only the
+#: last resort when that table cannot be read.
+PIPELINE_NODES_TABLE_NAME = "节点测速总表"
+PIPELINE_SOURCE4_NAME = "西瓜加速"
+
+
+def _record_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "".join(
+            str(item.get("text", "")) if isinstance(item, dict) else str(item)
+            for item in value
+        ).strip()
+    return str(value).strip() if value is not None else ""
+
+
+def load_pipeline_source_nodes(client, log: Logger,
+                               source_name: str = PIPELINE_SOURCE4_NAME,
+                               table_name: str = PIPELINE_NODES_TABLE_NAME) -> list[dict]:
+    """Read one source's live node list from 「节点测速总表」 (read-only).
+
+    Rows are filtered by 来源, de-duplicated by 节点名 (the pipeline table may
+    still hold legacy copies) and projected onto their 节点配置JSON.  Any
+    failure degrades to an empty list so the caller can fall back to the
+    last-known-good cache; it never raises and never fails the round.
+    """
+    try:
+        tables = {t.get("name"): t.get("table_id") for t in client.list_tables()}
+        table_id = tables.get(table_name)
+        if not table_id:
+            log.warn(f"pipeline table missing name={table_name}")
+            return []
+        rows = client.list_records(table_id)
+    except Exception as exc:
+        log.warn(f"pipeline table read failed class={type(exc).__name__.lower()}")
+        return []
+    nodes: list[dict] = []
+    seen: set[str] = set()
+    skipped = 0
+    for row in rows:
+        fields = row.get("fields") if isinstance(row, dict) else None
+        if not isinstance(fields, dict):
+            skipped += 1
+            continue
+        if _record_text(fields.get("来源")) != source_name:
+            continue
+        raw = fields.get("节点配置JSON")
+        try:
+            config = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            skipped += 1
+            continue
+        if not isinstance(config, dict) or not config.get("type"):
+            skipped += 1
+            continue
+        name = _record_text(fields.get("节点名")) or str(config.get("name") or "").strip()
+        if not name or name in seen:
+            skipped += 1
+            continue
+        seen.add(name)
+        nodes.append({**config, "name": name})
+    log.info(f"pipeline source_nodes source={source_name} nodes={len(nodes)} "
+             f"skipped={skipped} table={table_name}")
+    return nodes
+
+
 # Info/plan rows shipped as "nodes" by some subscriptions (traffic quota, expiry,
 # official-site links…). They are never real proxies, so they must not enter the
 # geo probe pool nor the speedtest-eligible node table.
@@ -4131,13 +4198,19 @@ def main(argv: list[str] | None = None) -> int:
                 elif result.result == "失败" and result.error != "url_missing":
                     apply_source_cache(result, cache_read_paths[index], log)
             elif index == 4:
-                # 西瓜加速 has no subscription URL: source4-cache.yaml IS its node
-                # list, so url_missing here is expected and the cache fallback
-                # (拉取结果=缓存) must never fail the round.
-                if result.result == "成功":
-                    write_source_cache(index, result.nodes, log,
+                # 西瓜加速 has no subscription URL: its live node list is the
+                # provider pipeline's 「节点测速总表」 (app extraction).  表2 is
+                # the node database, so every usable 西瓜 node belongs here.
+                # url_missing from collect_source is expected; the local cache
+                # is only the last-known-good fallback.
+                pipeline_nodes = load_pipeline_source_nodes(client, log)
+                if pipeline_nodes:
+                    result.nodes = pipeline_nodes
+                    result.result = "总表"
+                    result.error = ""
+                    write_source_cache(index, pipeline_nodes, log,
                                        cache_dir=args.source_cache_dir,
-                                       guard_tokens=_guard_tokens_for(url))
+                                       guard_tokens=())
                 else:
                     apply_source_cache(result, cache_read_paths[4], log)
             page_urls = parse_page_urls(sources_env, index)
