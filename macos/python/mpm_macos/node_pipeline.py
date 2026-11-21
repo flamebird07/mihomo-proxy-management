@@ -155,6 +155,24 @@ def _node_ops_alive() -> bool:
     return bool((result.stdout or "").strip())
 
 
+def _default_interface() -> str:
+    """The physical default-route interface (route -n get default), so the
+    isolated probe core bypasses the host's own TUN via
+    NODE_OPS_INTERFACE_NAME (see node_ops/probe.py)."""
+    try:
+        result = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[-2] == "interface:":
+                return parts[-1]
+    except Exception:
+        pass
+    return ""
+
+
 def clear_stale_ops_lock(layout: Layout, *, say: Callable[[str], None] = print) -> bool:
     """Remove an orphaned node_ops lockfile (no process, lock older than 60s).
 
@@ -320,6 +338,7 @@ def run_steps(
     log_path = os.path.join(layout.logs, "node-pipeline.log")
 
     def _default_runner(argv: list[str]) -> int:
+        env = os.environ | {"NODE_OPS_INTERFACE_NAME": _default_interface()}
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"START {argv[1] if argv[1] != '-m' else argv[2]}\n")
             log.flush()
@@ -328,6 +347,7 @@ def run_steps(
                 cwd=layout.scripts_dir,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=env,
             )
             log.write(f"EXIT {process.returncode}\n")
             return process.returncode

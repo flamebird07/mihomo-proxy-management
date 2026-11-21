@@ -63,6 +63,20 @@ GEO_ENDPOINTS = (
 CORE_ENV = "NODE_OPS_MIHOMO_CORE"
 
 
+def _bind_interface() -> str:
+    """Interface name to bind probe sockets to, or "" for the default behavior.
+
+    On a host whose own mihomo TUN captures all traffic (macOS/Windows
+    production), an unbound isolated probe core is fake-ip'd and
+    double-proxied through whatever node the host core selected - when that
+    node degrades, EVERY probe fails and the pool can never recover
+    (self-referential trap, observed 2026-11-20/21).  Setting
+    ``NODE_OPS_INTERFACE_NAME`` (e.g. en0/Ethernet) makes the probe's node
+    connections and its DNS leave via the physical interface directly.
+    """
+    return os.environ.get("NODE_OPS_INTERFACE_NAME", "").strip()
+
+
 class ProbeError(Exception):
     def __init__(self, message: str, kind: str = "probe") -> None:
         super().__init__(message)
@@ -311,12 +325,21 @@ class IsolatedProber:
                 "ipv6": False,
                 "external-controller": f"127.0.0.1:{controller}",
                 "dns": {"enable": True, "enhanced-mode": "redir-host",
-                        "nameserver": ["8.8.8.8", "1.1.1.1"]},
+                        "nameserver": (["223.5.5.5", "119.29.29.29"]
+                                       if _bind_interface() else ["8.8.8.8", "1.1.1.1"])},
                 "tun": {"enable": False},
                 "proxies": _quote_numeric_like(nodes),
                 "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
                 "rules": ["MATCH,TEST"],
             }
+            bind = _bind_interface()
+            if bind:
+                # Bypass a host-level TUN (e.g. the production core on the
+                # same machine): bound sockets leave via the physical
+                # interface instead of being fake-ip'd and double-proxied
+                # through whatever node the host's own core selected.  With
+                # binding, DNS also uses mainland-reachable resolvers.
+                config["interface-name"] = bind
             config_path = runtime / "config.yaml"
             config_path.write_text(
                 yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
