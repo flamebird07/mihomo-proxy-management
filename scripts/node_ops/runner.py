@@ -208,7 +208,9 @@ def run(settings: Settings, log: Logger,
         result: ProbeResult = prober.probe(_probe_configs(entries),
                                            names=[entry.probe_name for entry in entries])
     except Exception as exc:
-        raise RunError(f"probe failed ({type(exc).__name__})", exit_code=4) from None
+        # The ProbeError kinds are fixed classes (no_free_ports / core_exited /
+        # core_not_ready / ...): keep them in the log or diagnosis is blind.
+        raise RunError(f"probe failed ({type(exc).__name__}: {exc})", exit_code=4) from None
 
     evaluations = evaluate_nodes(
         entries,
