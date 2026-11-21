@@ -275,6 +275,13 @@ def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
         [sys.executable, "-m", NODE_OPS_PACKAGE,
          "--env-file", secret,
          "--core", binary,
+         # Probe budgets sized for a ~130-row master table (the upstream
+         # 600s defaults were tuned for ~100 nodes: with 129 entries the
+         # delay budget ran out mid-round, most nodes never got GPT-target
+         # measurements, and the gate wiped 有效节点 to zero - the publish
+         # gate kept the old provider, but the pool stopped growing).
+         "--total-budget", "1800",
+         "--ipinfo-budget", "1200",
          "--log-file", os.path.join(layout.logs, "node_ops.log"),
          "--lock-file", os.path.join(state, "node_ops.lock")],
         [sys.executable, "-m", NODE_PROVIDER_PACKAGE,
