@@ -304,6 +304,46 @@ class MasterClockTests(unittest.TestCase):
         self.assertNotIn("同步时间", by_name["dead"],
                          "failed rate must not carry a clock")
 
+class DegenerateKeyGuardTests(unittest.TestCase):
+    def test_all_empty_key_never_creates(self):
+        """A stale-host script passing the wrong row_key for the sources
+        table collapses every key to empty and used to mass-create
+        duplicates (2026-11-20 live incident, 10 rows for 4 sources)."""
+        class _Client:
+            def __init__(self, rows):
+                self.rows = rows
+                self.created = []
+            def list_records(self, _t):
+                return list(self.rows)
+            def batch_create(self, _t, records):
+                self.created.extend(records)
+                return len(records)
+            def update_records(self, _t, items):
+                return len(items)
+            def batch_delete(self, _t, ids):
+                return len(ids)
+        rows = [{"record_id": "s1", "fields": {"源名称": "飞兔",
+                                               "同步时间": NOW_MS - 60000}}]
+        client = _Client(rows)
+        payload = [{"fields": {"源名称": name}} for name in ("飞兔", "星辰", "CoffeeCloud")]
+        counts = sync.upsert_records(client, "tbl", payload, _Log(),
+                                     table_key="sources",
+                                     row_key=sync._node_row_key,  # WRONG key on purpose
+                                     now_ms=NOW_MS)
+        self.assertEqual(counts["created"], 0, "degenerate keys must not create rows")
+        self.assertEqual(len(client.rows), 1)
+
+    def test_duplicate_existing_rows_update_the_freshest(self):
+        rows = [_row("d1", "dup-new", "飞兔", age_ms=60 * 1000),
+                _row("d2", "dup-new", "飞兔", age_ms=5 * 24 * 60 * 60 * 1000)]
+        client, counts = UpsertDisciplineTests().upsert(
+            rows, [_payload("dup-new", "飞兔")])
+        self.assertEqual(counts["updated"], 1)
+        self.assertEqual(counts["created"], 0)
+        names = [row["fields"]["节点名"] for row in client.rows]
+        self.assertEqual(names.count("dup-new"), 2, "legacy duplicate lingers "
+                         "for the tombstone, never re-created")
+
 
 if __name__ == "__main__":
     unittest.main()

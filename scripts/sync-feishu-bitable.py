@@ -3527,6 +3527,16 @@ def upsert_records(client: FeishuClient, table_id: str, records: list[dict],
     independent_ms = int(independent_stale_minutes()) * 60 * 1000
     nodes_table = table_key == "nodes"
 
+    def _degenerate(key: tuple) -> bool:
+        """An all-empty key cannot be attributed to any source or node - a
+        caller using the wrong row_key for this table (a stale Windows
+        script produced exact-duplicate rows this way on 2026-11-20)."""
+        return all(not str(part).strip() for part in key)
+
+    def _row_clock(fields: dict) -> float:
+        parsed, _warning = parse_sync_ms(fields.get("同步时间"), now_ms=now_ms)
+        return parsed or 0.0
+
     existing_by_key: dict[tuple, dict] = {}
     stale_ids: list[str] = []
     for row in existing:
@@ -3546,7 +3556,14 @@ def upsert_records(client: FeishuClient, table_id: str, records: list[dict],
         # Surviving rows MUST stay matchable: independent-path channels
         # upsert their own rows too - excluding them here made every round
         # append duplicates (created=N updated=0) instead of updating.
-        existing_by_key.setdefault(row_key(fields), row)
+        key = row_key(fields)
+        if key in existing_by_key:
+            # legacy duplicates: update the freshest copy; the older one ages
+            # out through the tombstone like any unrefreshed row
+            if _row_clock(fields) > _row_clock(existing_by_key[key].get("fields") or {}):
+                existing_by_key[key] = row
+            continue
+        existing_by_key[key] = row
 
     updates: list[dict] = []
     creates: list[dict] = []
@@ -3559,6 +3576,12 @@ def upsert_records(client: FeishuClient, table_id: str, records: list[dict],
         matched = existing_by_key.pop(key, None)
         if matched is not None:
             updates.append({"record_id": matched["record_id"], "fields": fields})
+        elif _degenerate(key):
+            # A payload row with an all-empty key cannot be attributed to any
+            # source or node: a caller using the wrong row_key for this table
+            # (a stale Windows script produced exact duplicates this way on
+            # 2026-11-20).  Never create unattributable rows.
+            log.warn("upsert skip reason=degenerate_key table=" + table_key)
         else:
             # New row: the tombstone clock starts at creation.
             fields.setdefault("同步时间", now_ms)
