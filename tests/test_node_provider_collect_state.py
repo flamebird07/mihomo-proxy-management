@@ -145,6 +145,26 @@ class ReadSkipTests(unittest.TestCase):
         skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
         self.assertEqual(skip, set())
 
+    def test_app_attempt_from_another_host_is_not_skipped(self):
+        row = state_row(3, channel="app")
+        row["fields"]["读取机器"] = "guoshiweideMac-Mini.local"
+        client = StateClient([row])
+        skip = collect_state.read_skip_set(
+            client, NOW_MS, lambda _m: None, hostname="windows-host")
+        self.assertEqual(skip, set())
+
+    def test_app_attempt_from_same_host_is_skipped(self):
+        client = StateClient([state_row(3, channel="app")])  # machine-a
+        skip = collect_state.read_skip_set(
+            client, NOW_MS, lambda _m: None, hostname="machine-a")
+        self.assertEqual(skip, {("app", 3)})
+
+    def test_subscription_attempt_remains_shared_across_hosts(self):
+        client = StateClient([state_row(1)])  # machine-a
+        skip = collect_state.read_skip_set(
+            client, NOW_MS, lambda _m: None, hostname="machine-b")
+        self.assertEqual(skip, {("subscription", 1)})
+
     def test_missing_table_returns_empty(self):
         client = StateClient(tables=[{"name": "别的表", "table_id": "t"}])
         skip = collect_state.read_skip_set(client, NOW_MS, lambda _m: None)
@@ -273,6 +293,22 @@ class RecordAttemptsTests(unittest.TestCase):
         self.assertEqual([w[0] for w in client.writes], ["update_record"])
         self.assertEqual(client.writes[0][2], "state-1")
         self.assertEqual(client.writes[0][3]["节点数"], 9)
+
+    def test_app_attempt_from_other_host_creates_a_separate_row(self):
+        client = StateClient([state_row(3, channel="app", record_id="state-mac")])
+        collect_state.record_attempts(
+            client, "tbl-state", [(3, "西瓜加速", "app", 57)],
+            "windows-host", NOW_MS, lambda _m: None)
+        self.assertEqual([w[0] for w in client.writes], ["batch_create"])
+        self.assertEqual(client.writes[0][2][0]["fields"]["读取机器"], "windows-host")
+
+    def test_app_attempt_from_same_host_updates_its_own_row(self):
+        client = StateClient([state_row(3, channel="app", record_id="state-win")])
+        collect_state.record_attempts(
+            client, "tbl-state", [(3, "西瓜加速", "app", 57)],
+            "machine-a", NOW_MS, lambda _m: None)
+        self.assertEqual([w[0] for w in client.writes], ["update_record"])
+        self.assertEqual(client.writes[0][2], "state-win")
 
     def test_write_failure_does_not_raise(self):
         logger = Logger()
@@ -448,6 +484,16 @@ def settings(**kwargs):
 
 
 class RunCollectStateTests(unittest.TestCase):
+    def test_force_ignores_recent_state(self):
+        client = TableClient(state_rows=[state_row(1)])
+        code = run_collect(
+            settings(force=True), client, Logger(), env_values=ENV_ONE,
+            fetcher=fetcher_map({ENV_ONE["SUBSCRIPTION_URL_1"]: YAML_ONE}),
+            hostname="machine-a", now_ms=NOW_MS)
+        self.assertEqual(code, 0)
+        self.assertTrue(any(call[0] == "batch_create" and call[1] == "tbl-nodes"
+                            for call in client.calls))
+
     def test_all_sources_skipped_is_exit_ok_and_zero_write(self):
         client = TableClient(state_rows=[state_row(1)])
         logger = Logger()

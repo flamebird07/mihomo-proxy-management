@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Ninja Desktop vault directory (--from-app source3)")
     parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
                         help="node_provider collect lock file")
+    parser.add_argument("--force", action="store_true",
+                        help="ignore the rolling-24h collect state (manual re-run)")
     parser.add_argument("-o", "--output",
                         help="provider YAML path (directory must already exist)")
     parser.add_argument("--dry-run", action="store_true",
@@ -171,6 +173,7 @@ def main(argv: Optional[List[str]] = None, client_factory=FeishuClient,
         source1_pid=args.source1_pid,
         vault_dir=args.vault_dir,
         supplement_yaml=list(args.supplement_yaml),
+        force=args.force,
     )
 
     if not args.collect:

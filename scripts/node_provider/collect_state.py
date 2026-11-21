@@ -2,14 +2,17 @@
 
 Node collection runs on several machines and is scheduled hourly, but each
 source only needs to be attempted once per rolling 24-hour window.  Every
-attempt - successful or failed - is recorded in Feishu; any machine that sees
-an attempt less than 24 hours old skips that source.
+attempt - successful or failed - is recorded in Feishu; a machine that sees
+its own attempt (or any subscription attempt) less than 24 hours old skips
+that source.  App channels are host-local and are therefore keyed per host.
 
 Design rules:
   * state lives only in Feishu - no local state file exists;
   * reads are fail-open: if the table cannot be read, collect as usual;
   * writes are best-effort: a failed state write must never fail collection;
-  * state rows are keyed by (源编号, 通道); at most one row per key;
+  * subscription rows are keyed by (源编号, 通道) and shared by all machines;
+  * app rows add 读取机器 to the key: an app cache is local to one machine, so
+    one host's attempt must never suppress another host's app extraction;
   * 最近读取时间 is the last *attempt* time; a failed attempt records 节点数=0.
 """
 
@@ -57,12 +60,18 @@ def parse_time_ms(value: Any) -> Optional[int]:
 
 
 def read_skip_set(client, now_ms: int,
-                  log: Callable[[str], None]) -> Set[SkipKey]:
+                  log: Callable[[str], None],
+                  hostname: Optional[str] = None) -> Set[SkipKey]:
     """Return the (通道, 源编号) keys attempted less than 24 hours ago.
 
     The window rolls with wall-clock time: a stamp 23h59m old is skipped, one
     exactly 24h old is not, regardless of calendar-day boundaries.  Rows whose
     timestamp is missing, unparsable or non-positive are ignored.
+
+    Subscription rows are shared: any machine's recent attempt skips the fetch
+    everywhere.  App rows are host-local: only a row whose 读取机器 matches
+    *hostname* skips the extraction, so a failed attempt on a host without the
+    app (e.g. macOS) never suppresses another host's app collection.
 
     Fail-open: a missing table or any FeishuError yields an empty set, so
     collection proceeds (duplicate reads are preferable to stale data).
@@ -92,6 +101,10 @@ def read_skip_set(client, now_ms: int,
         channel = fields.get("通道")
         if channel not in schema.COLLECT_CHANNEL_OPTIONS:
             continue
+        if channel == schema.COLLECT_CHANNEL_APP:
+            reader = str(fields.get("读取机器") or "").strip()
+            if not hostname or reader != hostname:
+                continue
         source_number = parse_number(fields.get("源编号"))
         if source_number is None:
             continue
@@ -146,9 +159,13 @@ def attempt_entries(result: Any) -> List[Entry]:
 def record_attempts(client, table_id: str, entries: Iterable[Entry],
                     hostname: str, stamp: int,
                     log: Callable[[str], None]) -> None:
-    """Upsert one state row per (源编号, 通道) for successful and failed attempts.
+    """Upsert one state row per subscription (源编号, 通道) and per
+    app (源编号, 通道, 读取机器).
 
-    Never raises; a failed write is logged and collection continues.
+    App rows are host-scoped because the cache lives on one machine; keeping
+    each host's row separate prevents two hosts from overwriting each other's
+    rolling-24h clock.  Never raises; a failed write is logged and collection
+    continues.
     """
     entries = list(entries)
     if not entries:
@@ -158,7 +175,13 @@ def record_attempts(client, table_id: str, entries: Iterable[Entry],
     except FeishuError as exc:
         log(f"collect state read failed class={exc.kind}")
         return
-    existing: Dict[SkipKey, str] = {}
+
+    def _key(channel: str, source_number: int, reader: str) -> tuple:
+        if channel == schema.COLLECT_CHANNEL_APP:
+            return (channel, source_number, reader)
+        return (channel, source_number, "")
+
+    existing: Dict[tuple, str] = {}
     for row in rows:
         fields = row.get("fields") or {}
         channel = fields.get("通道")
@@ -166,7 +189,8 @@ def record_attempts(client, table_id: str, entries: Iterable[Entry],
         record_id = row.get("record_id")
         if channel in schema.COLLECT_CHANNEL_OPTIONS \
                 and source_number is not None and record_id:
-            existing[(channel, source_number)] = record_id
+            reader = str(fields.get("读取机器") or "").strip()
+            existing[_key(channel, source_number, reader)] = record_id
     for source_number, source, channel, count in entries:
         fields = {
             "源编号": source_number,
@@ -176,7 +200,7 @@ def record_attempts(client, table_id: str, entries: Iterable[Entry],
             "最近读取时间": stamp,
             "节点数": count,
         }
-        key = (channel, source_number)
+        key = _key(channel, source_number, hostname)
         try:
             record_id = existing.get(key)
             if record_id:

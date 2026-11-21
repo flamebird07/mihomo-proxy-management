@@ -386,6 +386,10 @@ def upsert_source_rows(client: FeishuClient, table_id: str, source_number: int,
     tombstone clock: 同步时间 on an existing row belongs to the measuring
     side and means "last valid rate".  New rows start the clock at creation
     (now_ms) so a node never measured still ages out after the window.
+
+    Matching deliberately ignores 源编号: source renumbering (e.g. 西瓜加速
+    4 -> 3) must migrate existing rows in place instead of creating a second
+    row for the same node.
     """
     if not records:
         log(f"records upsert skipped empty_payload source={source_number}")
@@ -395,7 +399,7 @@ def upsert_source_rows(client: FeishuClient, table_id: str, source_number: int,
     for row in existing:
         rid = row.get("record_id")
         fields = row.get("fields") or {}
-        if rid and _as_number(fields.get("源编号")) == source_number:
+        if rid:
             by_key[(_row_source(fields), _row_name(fields))] = row
 
     def _retry(action):

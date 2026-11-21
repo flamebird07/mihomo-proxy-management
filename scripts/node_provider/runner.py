@@ -78,6 +78,7 @@ class Settings:
     source1_pid: Optional[int] = None
     vault_dir: Optional[str] = None
     supplement_yaml: List[str] = field(default_factory=list)
+    force: bool = False
 
 
 def read_rows(client, settings: Settings, logger: Logger):
@@ -218,12 +219,13 @@ def run_collect(settings: Settings, client, logger: Logger, *,
     stamp = now_ms if now_ms is not None else collect_mod.now_ms()
     host = hostname if hostname is not None else socket.gethostname()
 
-    # Sources attempted within the last 24 hours on any machine are skipped.
+    # Sources attempted within the last 24 hours are skipped: subscription
+    # attempts are shared across machines, app attempts only within this host.
     # Dry-run still performs this read so the reported plan matches a real run,
     # but never creates the state table or writes to it.
     skip: set = set()
-    if client is not None:
-        skip = collect_state.read_skip_set(client, stamp, logger.warn)
+    if client is not None and not settings.force:
+        skip = collect_state.read_skip_set(client, stamp, logger.warn, hostname=host)
 
     result = collect_mod.collect(
         values,

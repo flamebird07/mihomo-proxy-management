@@ -414,6 +414,27 @@ class RunCollectTests(unittest.TestCase):
         self.assertEqual([row["fields"]["节点名"] for row in client.rows["tbl-n"]],
                          ["gone", fields["节点名"]])
 
+    def test_upsert_migrates_renumbered_source_in_place(self):
+        """A row created under an old 源编号 is updated, not duplicated."""
+        old = [{"record_id": "old1",
+                "fields": {"节点名": "us-01", "来源": "飞兔", "源编号": 4}}]
+        client = FakeClient(old_rows=old)
+        code = run_collect(
+            settings(dry_run=False), client, Logger(),
+            env_values={"SUBSCRIPTION_URL_1": ENV["SUBSCRIPTION_URL_1"]},
+            fetcher=fetcher_map({ENV["SUBSCRIPTION_URL_1"]: YAML_ONE}),
+            now_ms=1_700_000_000_000,
+        )
+        self.assertEqual(code, 0)
+        node_updates = [call for call in client.calls
+                        if call[0] == "update_record" and call[1] == "tbl-n"]
+        node_creates = [call for call in client.calls
+                        if call[0] == "batch_create" and call[1] == "tbl-n"]
+        self.assertEqual(len(node_updates), 1)
+        self.assertEqual(node_updates[0][2], "old1")
+        self.assertEqual(node_updates[0][3]["源编号"], 1)
+        self.assertEqual(node_creates, [])
+
     def test_secrets_and_node_passwords_never_logged(self):
         logger = Logger()
         run_collect(
