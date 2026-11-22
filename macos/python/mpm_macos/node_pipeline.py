@@ -409,27 +409,28 @@ def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
             + str(gpt.get("type")) + "); switch skipped")
         return None
     current = gpt.get("now")
-    members = [name for name in (gpt.get("all") or []) if name != current]
-
-    best_name, best_delay = None, None
-    for name in members:
-        try:
-            node = call(f"/proxies/{urllib.parse.quote(name, safe='')}")
-            if not node.get("alive"):
-                continue
-            delay = api_json(
-                "/proxies/" + urllib.parse.quote(name, safe="")
-                + "/delay?timeout=3000&url="
-                + urllib.parse.quote("https://chatgpt.com/cdn-cgi/trace", safe="")
-            ).get("delay")
-            if delay and delay > 0 and (best_delay is None or delay < best_delay):
-                best_name, best_delay = name, delay
-        except Exception:  # noqa: BLE001 - one dead member never aborts the pass
-            continue
-
-    if best_name is None:
+    # Group-level delay test: ONE call measures every leaf member (per-node
+    # paths 404 for provider-sourced nodes on this controller, and unicode
+    # names make raw paths unusable).  The map keys are the leaf nodes; the
+    # AUTO-FOREIGN subgroup does not appear.
+    target = "https://chatgpt.com/cdn-cgi/trace"
+    try:
+        delays = call("/group/GPT/delay?timeout=3000&url="
+                      + urllib.parse.quote(target, safe=""))
+    except Exception as exc:  # noqa: BLE001 - transient controller slowness
+        say("node-pipeline: group delay unavailable, keeping " + str(current)
+            + ": " + HOST.text(f"{type(exc).__name__}")[:80])
+        return None
+    if not isinstance(delays, dict):
+        say("node-pipeline: group delay returned no map; keeping " + str(current))
+        return None
+    alive = {name: delay for name, delay in delays.items()
+             if isinstance(delay, int) and delay > 0}
+    if not alive:
         say("node-pipeline: no alive GPT pool member; keeping " + str(current))
         return None
+    best_name = min(alive, key=alive.get)
+    best_delay = alive[best_name]
     if best_name == current:
         say(f"node-pipeline: GPT already on the fastest member ({best_name} "
             f"{best_delay}ms)")

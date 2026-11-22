@@ -429,30 +429,23 @@ def test_provider_refresh_failure_is_retried_next_tick(tmp_path):
 class _FakeAPI:
     """Minimal controller stand-in: proxies/GPT + per-name delay probe."""
 
-    def __init__(self, members, alive, delays, now="AUTO-FOREIGN", gtype="selector"):
+    def __init__(self, members, delays, now="AUTO-FOREIGN", gtype="selector"):
         self.members = members
-        self.alive_map = alive
         self.delays = delays
         self.now = now
         self.gtype = gtype
         self.puts: list[str] = []
 
     def json(self, path, method="GET", body=None):
-        import urllib.parse
-
         if path == "/proxies/GPT" and method == "PUT":
             self.puts.append((body or {}).get("name"))
             return {}
         if path == "/proxies/GPT":
             return {"type": self.gtype, "now": self.now, "all": list(self.members),
                     "alive": True}
-        if path.startswith("/proxies/") and "/delay" in path:
-            name = urllib.parse.unquote(path[len("/proxies/") :].split("/delay")[0])
-            return {"delay": self.delays.get(name)}
-        name = urllib.parse.unquote(path[len("/proxies/") :])
-        return {"name": name, "alive": self.alive_map.get(name, False),
-                "type": "Trojan"}
-        _ = method, body
+        if path.startswith("/group/GPT/delay"):
+            return dict(self.delays)
+        return {}
 
     def put(self, path, body):
         assert path == "/proxies/GPT"
@@ -490,10 +483,8 @@ def test_switch_gpt_picks_the_fastest_alive_member(tmp_path, monkeypatch):
     layout = _ready(tmp_path)
     fake = _FakeAPI(
         members=["AUTO-FOREIGN", "n-slow", "n-fast", "n-dead"],
-        alive={"n-slow": True, "n-fast": True},
-        delays={"n-slow": 800, "n-fast": 210, "n-dead": 300},
+        delays={"n-slow": 800, "n-fast": 210, "n-dead": 0},
     )
-    _patch_api(monkeypatch, fake)
     lines: list[str] = []
     chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
     assert chosen == "n-fast"
@@ -507,11 +498,9 @@ def test_switch_gpt_moves_off_current_to_a_faster_member(tmp_path, monkeypatch):
     layout = _ready(tmp_path)
     fake = _FakeAPI(
         members=["AUTO-FOREIGN", "n-current", "n-faster"],
-        alive={"n-faster": True},
-        delays={"n-faster": 120},
+        delays={"n-current": 500, "n-faster": 120},
         now="n-current",
     )
-    _patch_api(monkeypatch, fake)
     lines: list[str] = []
     chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
     assert chosen == "n-faster"
@@ -520,8 +509,7 @@ def test_switch_gpt_moves_off_current_to_a_faster_member(tmp_path, monkeypatch):
 
 def test_switch_gpt_skips_non_selector(tmp_path, monkeypatch):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(members=["AUTO-FOREIGN"], alive={}, delays={}, gtype="Fallback")
-    _patch_api(monkeypatch, fake)
+    fake = _FakeAPI(members=["AUTO-FOREIGN"], delays={}, gtype="Fallback")
     lines: list[str] = []
     assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
     assert any("not a selector" in line for line in lines)
@@ -529,8 +517,7 @@ def test_switch_gpt_skips_non_selector(tmp_path, monkeypatch):
 
 def test_switch_gpt_no_alive_member_keeps_selection(tmp_path, monkeypatch):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(members=["AUTO-FOREIGN", "n1"], alive={}, delays={})
-    _patch_api(monkeypatch, fake)
+    fake = _FakeAPI(members=["AUTO-FOREIGN", "n1"], delays={"n1": 0})
     lines: list[str] = []
     assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
     assert any("no alive" in line for line in lines)

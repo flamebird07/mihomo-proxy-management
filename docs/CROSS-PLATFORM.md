@@ -53,7 +53,7 @@
 | 有效节点 provider | `C:\mihomo\providers\node-valid.yaml` | `providers/node-valid.yaml`（在 `-d` 内，mihomo 拒绝 home 外路径） |
 | 渲染器 | `install.ps1`（模板原样） | `config.py`（叠加覆盖：GPT/US-FAST/GROKBOT 审计形、fake-ip 198.19/16、provider interval 秒化、source1-local/nextin 补充、**valid_nodes 分配模式**） |
 | 切换 | — | `mpm-switch`（osascript 密码框、Always On VPN 预检、失败回滚） |
-| GPT 组管理 | 30 分钟链里 proxy-auto-switch（GPT+MUSE+US-FAST 三组） | node-pipeline 进程内 `switch_gpt`：直测 node-valid 池成员的 chatgpt 延迟、PUT 最快存活者（mac 无 MUSE 组，proxy-auto-switch 会因缺组提前退出，故不调用） |
+| GPT 组管理 | 30 分钟链里 proxy-auto-switch（GPT+MUSE+US-FAST 三组） | node-pipeline 进程内 `switch_gpt`：一次 `GET /group/GPT/delay` 测全部池成员（单节点路径对 provider 节点 404、unicode 名裸路径被 urllib 拒绝——组级端点是唯一可靠形态），PUT 最快者（mac 无 MUSE 组，proxy-auto-switch 会因缺组提前退出，故不调用） |
 | 本地节点补充 | App 通道（AtlasCore/Ninja/西瓜进程内存/DPAPI 缓存） | `--supplement-yaml`：`providers/nextin.yaml` + `providers/supplements/*.yaml`（任意来源文件丢入即入库总表） |
 | 已知噪音 | — | node-pipeline 末步报 `missing_group MUSE` 退出 1：mac 模板无 MUSE 组，纯日志噪音，分配/切换不受影响 |
 
