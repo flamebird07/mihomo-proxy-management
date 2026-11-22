@@ -960,6 +960,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--alert-target", default=DEFAULT_ALERT_TARGET)
     parser.add_argument("--secret-env", default=r"C:\mihomo-proxy-management\config\subscription.env",
                         help="Optional file with controller SECRET")
+    parser.add_argument("--groups", default=",".join(SWITCH_GROUPS),
+                        help="comma-separated select groups to manage (default: "
+                             "GPT,MUSE,US-FAST); hosts without some groups pass a subset")
     parser.add_argument("--decision-mode", choices=("legacy", "shadow", "hysteresis"),
                         default="hysteresis",
                         help="legacy: old fastest-node behaviour; "
@@ -1110,6 +1113,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     log = Logger(args.log_file, verbose=args.verbose)
     log.info("failover start")
+    switch_groups = tuple(
+        g.strip() for g in (args.groups or "").split(",") if g.strip()
+    ) or SWITCH_GROUPS
     is_legacy = args.decision_mode == "legacy"
     if not is_legacy:
         log.info(f"decision-mode={args.decision_mode}")

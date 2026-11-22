@@ -33,6 +33,7 @@ paths only on command lines, values only in the 0600 secret file.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -306,18 +307,10 @@ def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
          "--output", layout.valid_provider_file,
          "--env-file", secret,
          "--lock-file", os.path.join(state, "node_provider.lock")],
-        [sys.executable, os.path.join(layout.scripts_dir, SWITCH_SCRIPT),
-         "--controller", LIVE_CONTROLLER,
-         "--secret-env", secret,
-         "--state-file", os.path.join(state, "proxy-failover-state.json"),
-         "--log-file", os.path.join(layout.logs, "proxy-auto-switch.log"),
-         "--alert-log", os.path.join(state, "proxy-failover-alerts.log"),
-         "--alert-target", os.path.join(state, "proxy-failover-alert-target.txt"),
-         "--rounds-jsonl", os.path.join(state, "proxy-failover-rounds.jsonl")],
     ]
 
 
-STEP_LABELS = ("collect", "ops", "provide", "switch")
+STEP_LABELS = ("collect", "ops", "provide")
 
 
 def run_steps(
@@ -325,6 +318,7 @@ def run_steps(
     *,
     runner: Callable[[list[str]], int] | None = None,
     say: Callable[[str], None] = print,
+    switch: Callable[[Layout], object] | None = None,
 ) -> int:
     """Run the four steps; every step runs even if a previous one failed.
 
@@ -359,7 +353,90 @@ def run_steps(
         if code != 0:
             failed.append(label)
             say(f"node-pipeline: step {label} failed (exit {code})")
+    # In-process GPT switch (replaces the upstream proxy-auto-switch step,
+    # which also manages MUSE - a group the mac config does not define - and
+    # aborted every round on it before reaching the stability entry).
+    try:
+        (switch or switch_gpt)(layout, say=say)
+    except Exception as exc:  # noqa: BLE001 - a failed switch never fails the round
+        say("node-pipeline: gpt switch failed: "
+            + HOST.text(f"{type(exc).__name__}: {exc}")[:200])
+        failed.append("switch")
     return EXIT_STEP_FAILED if failed else EXIT_OK
+
+
+def _controller_api(layout: Layout) -> tuple[str, str]:
+    values = _read_secret_values(layout.secret_file)
+    return LIVE_CONTROLLER, (values.get("SECRET") or "").strip()
+
+
+def _api_json(path: str, secret: str, method: str = "GET", body: dict | None = None):
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"{LIVE_CONTROLLER}{path}",
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {secret}"} if secret else {},
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+
+def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
+               api_json: Callable[..., dict] | None = None) -> str | None:
+    """Select the fastest alive node in the GPT group (in-process).
+
+    mac's assignment-mode GPT is a selector over the measured node-valid pool
+    (+ AUTO-FOREIGN).  This is the mac counterpart of upstream's GPT
+    stability entry, reduced to what a single host needs without the MUSE
+    machinery: probe every pool member through the controller's delay API
+    (chatgpt.com - the target OpenAI traffic actually uses), pick the lowest
+    alive delay, and PUT only when the selection changes.  The upstream
+    gpt_switch_entry's full 10-round stability policy remains the Windows
+    side's semantics; mac trades strictness for zero external dependencies.
+    """
+    import urllib.parse
+
+    _api, secret = _controller_api(layout)
+    call = api_json or (lambda path, method="GET", body=None:
+                        _api_json(path, secret, method, body))
+
+    gpt = call("/proxies/GPT")
+    if (gpt.get("type") or "").lower() != "selector":
+        say("node-pipeline: GPT is not a selector (engine="
+            + str(gpt.get("type")) + "); switch skipped")
+        return None
+    current = gpt.get("now")
+    members = [name for name in (gpt.get("all") or []) if name != current]
+
+    best_name, best_delay = None, None
+    for name in members:
+        try:
+            node = call(f"/proxies/{urllib.parse.quote(name, safe='')}")
+            if not node.get("alive"):
+                continue
+            delay = api_json(
+                "/proxies/" + urllib.parse.quote(name, safe="")
+                + "/delay?timeout=3000&url="
+                + urllib.parse.quote("https://chatgpt.com/cdn-cgi/trace", safe="")
+            ).get("delay")
+            if delay and delay > 0 and (best_delay is None or delay < best_delay):
+                best_name, best_delay = name, delay
+        except Exception:  # noqa: BLE001 - one dead member never aborts the pass
+            continue
+
+    if best_name is None:
+        say("node-pipeline: no alive GPT pool member; keeping " + str(current))
+        return None
+    if best_name == current:
+        say(f"node-pipeline: GPT already on the fastest member ({best_name} "
+            f"{best_delay}ms)")
+        return best_name
+    call("/proxies/GPT", method="PUT", body={"name": best_name})
+    say(f"node-pipeline: GPT -> {best_name} ({best_delay}ms, was {current})")
+    return best_name
 
 
 def apply_presence(

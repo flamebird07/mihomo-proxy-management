@@ -160,12 +160,6 @@ def test_build_step_argv_uses_installed_paths_and_carries_no_secret_values(tmp_p
     assert provide[provide.index("--output") + 1] == layout.valid_provider_file
     assert provide[provide.index("--output") + 1].startswith(layout.mihomo_home)
 
-    switch = steps["switch"]
-    assert switch[1].endswith("proxy-auto-switch.py")
-    assert switch[switch.index("--secret-env") + 1] == layout.secret_file
-    assert switch[switch.index("--state-file") + 1].startswith(layout.node_state_dir)
-    joined = " ".join(switch)
-    assert SECRET_VALUE not in joined and SECRET_URL not in joined
 
 
 # ---- run_steps ----------------------------------------------------------------
@@ -183,14 +177,14 @@ def test_run_steps_runs_every_step_even_when_one_fails(tmp_path):
     code = node_pipeline.run_steps(layout, runner=runner, say=lines.append)
 
     assert code == node_pipeline.EXIT_STEP_FAILED
-    assert seen == ["node_provider", "node_ops", "node_provider",
-                    os.path.join(layout.scripts_dir, "proxy-auto-switch.py")]
+    assert seen == ["node_provider", "node_ops", "node_provider"]
     assert any("ops failed" in line for line in lines)
 
 
 def test_run_steps_ok_when_all_pass(tmp_path):
     layout = _ready(tmp_path)
-    code = node_pipeline.run_steps(layout, runner=lambda _argv: 0, say=lambda _m: None)
+    code = node_pipeline.run_steps(layout, runner=lambda _argv: 0,
+                                   say=lambda _m: None, switch=lambda _l, **_k: None)
     assert code == node_pipeline.EXIT_OK
 
 
@@ -295,7 +289,7 @@ def test_main_dry_run_ok_prints_step_argv(tmp_path, capsys):
     assert code == node_pipeline.EXIT_OK
     out = capsys.readouterr().out
     assert "node-pipeline argv[collect]" in out
-    assert "node-pipeline argv[switch]" in out
+    assert "node-pipeline argv[provide]" in out
 
 
 # ---- plist ---------------------------------------------------------------------
@@ -427,6 +421,119 @@ def test_provider_refresh_failure_is_retried_next_tick(tmp_path):
     assert any("retried" in line for line in lines)
     marker = os.path.join(layout.node_state_dir, "provider.sha256")
     assert not os.path.exists(marker), "hash persisted only after success"
+
+
+# ---- switch_gpt -----------------------------------------------------------------
+
+
+class _FakeAPI:
+    """Minimal controller stand-in: proxies/GPT + per-name delay probe."""
+
+    def __init__(self, members, alive, delays, now="AUTO-FOREIGN", gtype="selector"):
+        self.members = members
+        self.alive_map = alive
+        self.delays = delays
+        self.now = now
+        self.gtype = gtype
+        self.puts: list[str] = []
+
+    def json(self, path, method="GET", body=None):
+        import urllib.parse
+
+        if path == "/proxies/GPT" and method == "PUT":
+            self.puts.append((body or {}).get("name"))
+            return {}
+        if path == "/proxies/GPT":
+            return {"type": self.gtype, "now": self.now, "all": list(self.members),
+                    "alive": True}
+        if path.startswith("/proxies/") and "/delay" in path:
+            name = urllib.parse.unquote(path[len("/proxies/") :].split("/delay")[0])
+            return {"delay": self.delays.get(name)}
+        name = urllib.parse.unquote(path[len("/proxies/") :])
+        return {"name": name, "alive": self.alive_map.get(name, False),
+                "type": "Trojan"}
+        _ = method, body
+
+    def put(self, path, body):
+        assert path == "/proxies/GPT"
+        self.puts.append(body["name"])
+
+
+def _patch_api(monkeypatch, fake):
+    import urllib.request
+
+    def fake_urlopen(request, timeout=None):
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        raise AssertionError("raw urlopen should not be used")
+        yield _Resp
+
+    # switch_gpt uses module-level api_json (urllib.request) in _api_json;
+    # patch node_pipeline's _api_json instead
+    monkeypatch.setattr(node_pipeline, "_api_json",
+                        lambda path, secret, method="GET", body=None: fake.json(path, method, body))
+    monkeypatch.setattr(node_pipeline, "_controller_api",
+                        lambda layout: ("http://127.0.0.1:9090", "secret"))
+
+
+def test_switch_gpt_picks_the_fastest_alive_member(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(
+        members=["AUTO-FOREIGN", "n-slow", "n-fast", "n-dead"],
+        alive={"n-slow": True, "n-fast": True},
+        delays={"n-slow": 800, "n-fast": 210, "n-dead": 300},
+    )
+    _patch_api(monkeypatch, fake)
+    lines: list[str] = []
+    chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
+    assert chosen == "n-fast"
+    assert fake.puts == ["n-fast"]
+    assert any("GPT -> n-fast (210ms" in line for line in lines)
+
+
+def test_switch_gpt_moves_off_current_to_a_faster_member(tmp_path, monkeypatch):
+    """The current selection is excluded from probing by design; a faster
+    alive member gets the PUT."""
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(
+        members=["AUTO-FOREIGN", "n-current", "n-faster"],
+        alive={"n-faster": True},
+        delays={"n-faster": 120},
+        now="n-current",
+    )
+    _patch_api(monkeypatch, fake)
+    lines: list[str] = []
+    chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
+    assert chosen == "n-faster"
+    assert fake.puts == ["n-faster"]
+
+
+def test_switch_gpt_skips_non_selector(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(members=["AUTO-FOREIGN"], alive={}, delays={}, gtype="Fallback")
+    _patch_api(monkeypatch, fake)
+    lines: list[str] = []
+    assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
+    assert any("not a selector" in line for line in lines)
+
+
+def test_switch_gpt_no_alive_member_keeps_selection(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(members=["AUTO-FOREIGN", "n1"], alive={}, delays={})
+    _patch_api(monkeypatch, fake)
+    lines: list[str] = []
+    assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
+    assert any("no alive" in line for line in lines)
 
 
 # ---- install / uninstall wiring -------------------------------------------------
