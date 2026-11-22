@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import subprocess
 import sys
 from typing import Any, Callable
 
@@ -190,6 +191,22 @@ def _read_secret_text(path: str) -> str:
         return ""
 
 
+def _default_interface() -> str:
+    """The physical default-route interface (route -n get default)."""
+    try:
+        result = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[-2] == "interface:":
+                return parts[-1]
+    except Exception:
+        pass
+    return ""
+
+
 def run_sync(
     layout: Layout,
     *,
@@ -205,6 +222,12 @@ def run_sync(
         return code
     binary = context_mod.resolve_runtime_binary(layout)
     os.makedirs(layout.feishu_state_dir, mode=0o700, exist_ok=True)
+    # The sync script's isolated probe core must bypass the host's own TUN
+    # (same contract as node_ops/probe.py, docs/CROSS-PLATFORM.md): without
+    # it the probes are fake-ip'd and double-proxied through whatever node
+    # the production core selected - when that node degrades, 表2 degrades to
+    # all -1 and 表3 wipes (observed 2026-11-21 22:00+).
+    os.environ.setdefault("NODE_OPS_INTERFACE_NAME", _default_interface())
     argv = build_sync_argv(layout, binary=binary)
     loader = load_module or load_sync_module
     try:

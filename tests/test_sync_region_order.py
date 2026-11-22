@@ -604,5 +604,89 @@ class Stage2BFlagTests(unittest.TestCase):
         self.assertEqual(params["ipinfo_dead_max"].default, 0)
 
 
+class ProbeBindingTests(unittest.TestCase):
+    def test_isolated_config_binds_interface_when_env_set(self):
+        """Chain A must bypass the host's own TUN like chain B does: with
+        NODE_OPS_INTERFACE_NAME set the generated temp config carries
+        interface-name + mainland DNS; without it, unchanged."""
+        import tempfile
+        from unittest import mock
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["config"] = open(argv[4], encoding="utf-8").read()
+                self.pid = 4242
+                self.poll = lambda: 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"NODE_OPS_INTERFACE_NAME": "en1"}
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(sync.subprocess, "Popen", FakeProc), \
+                 mock.patch.object(sync.time, "monotonic",
+                                   side_effect=[0, 0, 0, 0, 100, 100]), \
+                 mock.patch.object(sync.urllib.request,
+                                   "urlopen", side_effect=AssertionError):
+                try:
+                    sync.test_isolated("/bin/echo", ["n1"],
+                                       [{"name": "n1", "type": "ss",
+                                         "server": "203.0.113.1", "port": 8388,
+                                         "cipher": "aes-128-gcm", "password": "x"}],
+                                       17890, 19090, "https://grok.com/",
+                                       5000, 4, RecordingLog())
+                except (sync.SyncError, AssertionError):
+                    pass  # the round fails later; we only assert the config
+            self.assertIn("interface-name: en1", captured["config"])
+            self.assertIn("223.5.5.5", captured["config"])
+            self.assertNotIn("8.8.8.8", captured["config"])
+
+    def test_isolated_config_unchanged_without_env(self):
+        import tempfile
+        from unittest import mock
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["config"] = open(argv[4], encoding="utf-8").read()
+                self.pid = 4242
+                self.poll = lambda: 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch.dict(os.environ, {"NODE_OPS_INTERFACE_NAME": ""}), \
+                 mock.patch.object(sync.subprocess, "Popen", FakeProc):
+                try:
+                    sync.test_isolated("/bin/echo", ["n1"],
+                                       [{"name": "n1", "type": "ss",
+                                         "server": "203.0.113.1", "port": 8388,
+                                         "cipher": "aes-128-gcm", "password": "x"}],
+                                       17890, 19090, "https://grok.com/",
+                                       5000, 4, RecordingLog())
+                except (sync.SyncError, AssertionError):
+                    pass
+            self.assertNotIn("interface-name", captured["config"])
+            self.assertIn("8.8.8.8", captured["config"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -86,11 +86,13 @@
 隔离测速内核的出站会被宿主自己的 mihomo TUN 劫持：DNS 返回宿主的 fake-ip、
 节点连接被双重代理穿过宿主当前选中的节点——**宿主池退化时全部探测随之失败**
 （自指陷阱：池差→测不了→池好不了；2026-11-20/21 Mac 实测，197 行仅 6 存活）。
-修复：`node_ops/probe.py` 支持 `NODE_OPS_INTERFACE_NAME` 环境变量——设置后临时
-配置加 `interface-name`（探测 socket 绑物理网卡直连，绕开 TUN）且 DNS 换用
-大陆可达解析器（223.5.5.5/119.29.29.29）；未设置时行为不变（Windows 默认不受
-影响，若 Windows 也跑 TUN+测速可设 Ethernet 同款受益）。mac 守护自动探测默认
-路由接口（`route -n get default`）并注入。
+修复：`node_ops/probe.py` 与 sync 链 `test_isolated`（2026-11-22）都支持
+`NODE_OPS_INTERFACE_NAME` 环境变量——设置后临时配置加 `interface-name`（探测
+socket 绑物理网卡直连，绕开 TUN）且 DNS 换用大陆可达解析器
+（223.5.5.5/119.29.29.29）；未设置时行为不变（Windows 默认不受影响，若 Windows
+也跑 TUN+测速可设 Ethernet 同款受益）。mac 两个守护都自动探测默认路由接口
+（`route -n get default`）并注入：node-pipeline 走子进程 env，feishu-sync
+在进程内 `os.environ.setdefault` 后按路径调用（同文件加载链共享环境）。
 
 ### Windows 端接入清单（拉取 main 即生效）
 

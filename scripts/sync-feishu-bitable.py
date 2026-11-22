@@ -2931,6 +2931,20 @@ if yaml is not None:
     )
 
 
+def probe_bind_interface() -> str:
+    """Interface to bind the isolated probe core to, or "" for default.
+
+    Same contract as node_ops/probe.py NODE_OPS_INTERFACE_NAME: on a host
+    whose own mihomo TUN captures all traffic, an unbound isolated core is
+    fake-ip'd and double-proxied through whatever node the host core
+    selected - when that node degrades every measurement fails (observed
+    2026-11-21 22:00+: chain A all -1 while the bound chain B measured
+    alive=68 one hour earlier).  Set = bind sockets to the physical
+    interface and use mainland-reachable DNS resolvers.
+    """
+    return os.environ.get("NODE_OPS_INTERFACE_NAME", "").strip()
+
+
 def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: int,
                   controller_port: int, target: str, timeout_ms: int, workers: int,
                   log: Logger, source_of: dict[str, str] | None = None,
@@ -2954,16 +2968,25 @@ def test_isolated(core: str, names: list[str], proxies: list[dict], mixed_port: 
         "log-level": "warning",
         "ipv6": False,
         "external-controller": f"127.0.0.1:{controller}",
-        "dns": {"enable": True, "enhanced-mode": "redir-host", "nameserver": ["8.8.8.8", "1.1.1.1"]},
+        "dns": {"enable": True, "enhanced-mode": "redir-host",
+                "nameserver": (["223.5.5.5", "119.29.29.29"]
+                               if probe_bind_interface() else ["8.8.8.8", "1.1.1.1"])},
         "tun": {"enable": False},
         "proxies": _quote_numeric_like(proxies),
         "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
         "rules": ["MATCH,TEST"],
     }
     config_path = runtime / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    bind = probe_bind_interface()
+    if bind:
+        config["interface-name"] = bind
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+    else:
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         process = subprocess.Popen(
