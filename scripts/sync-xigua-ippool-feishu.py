@@ -24,11 +24,11 @@ sys.modules[_spec.name] = base
 _spec.loader.exec_module(base)
 
 TABLE_NAME = "西瓜IP池"
-DEFAULT_IPPOOL_STATE = r"C:\mihomo\state\xigua-ippool\ippool.json"
-DEFAULT_FINAL_PROVIDER = r"C:\mihomo\providers\xigua-ippool.yaml"
-DEFAULT_CURSOR = r"C:\mihomo\state\xigua-ippool\feishu-sync-state.json"
-DEFAULT_LOCK = r"C:\mihomo\state\xigua-ippool\feishu-sync.lock"
-DEFAULT_LOG = r"C:\mihomo\logs\xigua-ippool-feishu.log"
+DEFAULT_IPPOOL_STATE = base.portable_path(r"C:\mihomo\state\xigua-ippool\ippool.json")
+DEFAULT_FINAL_PROVIDER = base.portable_path(r"C:\mihomo\providers\xigua-ippool.yaml")
+DEFAULT_CURSOR = base.portable_path(r"C:\mihomo\state\xigua-ippool\feishu-sync-state.json")
+DEFAULT_LOCK = base.portable_path(r"C:\mihomo\state\xigua-ippool\feishu-sync.lock")
+DEFAULT_LOG = base.portable_path(r"C:\mihomo\logs\xigua-ippool-feishu.log")
 
 # Independent from the main sync writer mutex: the Xigua table is a separate
 # table, so it must not serialize behind Local\mihomo-feishu-bitable-sync.

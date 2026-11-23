@@ -33,12 +33,14 @@ from typing import Any, Callable, Iterable
 
 import yaml
 
+from portable_paths import portable_core
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--core", type=Path, default=Path(r"C:\mihomo\mihomo.exe"))
+    parser.add_argument("--core", type=Path, default=Path(portable_core(r"C:\mihomo\mihomo.exe")))
     parser.add_argument("--target", action="append", required=True)
     parser.add_argument("--required-name-regex", default=r"(?i)(美国|美國|\bUS\b|United States)")
     parser.add_argument("--minimum-matching", type=int, default=1)

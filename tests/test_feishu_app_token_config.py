@@ -523,12 +523,14 @@ class Source1EntrypointTests(unittest.TestCase):
         self.assertNotIn("env['FEISHU_APP_ID']", text)
 
     def run_entrypoint(self, env_text, process_token=None):
-        """Run __main__ in a temp cwd where the Windows default env path is a
-        relative filename; stub source3_compatible so the import works on POSIX.
+        """Run __main__ in a temp HOME whose ``~/.hermes/.env`` shadows the
+        default env file; stub source3_compatible so the import works on POSIX.
         The run must exit at the credential gate — never reaches Feishu/mihomo.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / sync.DEFAULT_ENV_FILE).write_text(env_text, encoding="utf-8")
+            env_dir = Path(tmp) / ".hermes"
+            env_dir.mkdir()
+            (env_dir / ".env").write_text(env_text, encoding="utf-8")
             child = (
                 "import sys, types, runpy\n"
                 "stub = types.ModuleType('source3_compatible')\n"
@@ -539,6 +541,7 @@ class Source1EntrypointTests(unittest.TestCase):
                 "run_name='__main__')\n"
             )
             environ = env_without_token()
+            environ["HOME"] = tmp  # Path.home() follows $HOME on POSIX
             if process_token is not None:
                 environ[ENV_KEY] = process_token
             return subprocess.run([sys.executable, "-c", child], cwd=tmp,

@@ -27,7 +27,8 @@ from .model import NodeEntry
 from .probe import IsolatedProber, ProbeResult, default_core_path
 
 DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
-DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
+DEFAULT_ENV_FILE = (r"C:\Users\Administrator\.hermes\.env"
+                    if os.name == "nt" else os.path.expanduser("~/.hermes/.env"))
 
 
 class RunError(Exception):

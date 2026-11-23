@@ -395,4 +395,10 @@ def default_core_path() -> str:
     env = os.environ.get(CORE_ENV, "").strip()
     if env:
         return env
-    return r"C:\mihomo\mihomo.exe"
+    if os.name == "nt":
+        return r"C:\mihomo\mihomo.exe"
+    for candidate in (shutil.which("mihomo"),
+                      "/usr/local/libexec/mihomo-proxy-management/current/mihomo"):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return "mihomo"

@@ -231,7 +231,7 @@ if __name__ == '__main__':
     import runpy
     h = runpy.run_path(str(Path(__file__).with_name('sync-feishu-bitable.py')))
     args = h['parse_args']([])
-    log = h['Logger']('C:/mihomo/logs/source1-independent.log')
+    log = h['Logger'](h['portable_path']('C:/mihomo/logs/source1-independent.log'))
     # Shared writer mutex is hold_writer_lock inside sync(), which uses
     # writer_mutex_name() / SYNC_MUTEX_NAME. Probes run unlocked.
     env = h['read_env_file'](args.env_file)

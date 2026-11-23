@@ -62,6 +62,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import convert_sub  # noqa: E402  (same directory, project-local converter)
+from portable_paths import portable_core, portable_path  # noqa: E402
 
 try:
     import yaml  # noqa: F401  (convert_sub already requires it)
@@ -77,24 +78,24 @@ except ImportError:  # pragma: no cover - convert_sub fails closed on its own
 # is resolved by resolve_app_token, never hardcoded.
 DEFAULT_APP_TOKEN = None
 APP_TOKEN_ENV_KEY = "FEISHU_BITABLE_APP_TOKEN"
-DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
-DEFAULT_STATE_FILE = r"C:\mihomo\feishu-bitable-tables.json"
-DEFAULT_SYNC_STATE_FILE = r"C:\mihomo\state\feishu-bitable-sync-state.json"
-DEFAULT_LOG_FILE = r"C:\mihomo\logs\feishu-bitable-sync.log"
+DEFAULT_ENV_FILE = portable_path(r"C:\Users\Administrator\.hermes\.env")
+DEFAULT_STATE_FILE = portable_path(r"C:\mihomo\feishu-bitable-tables.json")
+DEFAULT_SYNC_STATE_FILE = portable_path(r"C:\mihomo\state\feishu-bitable-sync-state.json")
+DEFAULT_LOG_FILE = portable_path(r"C:\mihomo\logs\feishu-bitable-sync.log")
 DEFAULT_SOURCES_ENV = str(SCRIPT_DIR.parent / "config" / "subscription.env")
-DEFAULT_CORE = r"C:\mihomo\mihomo.exe"
+DEFAULT_CORE = portable_core(r"C:\mihomo\mihomo.exe")
 DEFAULT_TARGET = "https://grok.com/"
 CHATGPT_TARGET = "https://chatgpt.com/cdn-cgi/trace"
 OPENAI_TARGET = "https://api.openai.com"
-DEFAULT_GPT_HISTORY_FILE = r"C:\mihomo\feishu-gpt-history.json"
+DEFAULT_GPT_HISTORY_FILE = portable_path(r"C:\mihomo\feishu-gpt-history.json")
 GPT_REQUIRED_CONSECUTIVE = 2
 SPEEDTEST_MAX_WORKERS = 4
 SPEEDTEST_TOTAL_BUDGET_S = 600.0
 DEFAULT_LIVE_CONTROLLER = "http://127.0.0.1:9090"
-DEFAULT_LIVE_ENV = r"C:\mihomo\subscription.env"
+DEFAULT_LIVE_ENV = portable_path(r"C:\mihomo\subscription.env")
 DEFAULT_FETCH_PROXY = "http://127.0.0.1:7890"
-DEFAULT_LOCK_FILE = r"C:\mihomo\feishu-bitable-sync.lock"
-DEFAULT_PROVIDER_DIR = r"C:\mihomo\providers"
+DEFAULT_LOCK_FILE = portable_path(r"C:\mihomo\feishu-bitable-sync.lock")
+DEFAULT_PROVIDER_DIR = portable_path(r"C:\mihomo\providers")
 
 # Fetch resilience: each transport path gets FETCH_MAX_ATTEMPTS tries with an
 # exponential backoff between them (10s, then 20s).
@@ -3849,7 +3850,10 @@ def ninja_geo_ports(config_path: Path, log: Logger) -> dict[str, int]:
 
 
 def fetch_geo_via_ninja_socks(port: int) -> str:
-    curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    if os.name == "nt":
+        curl = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+    else:
+        curl = Path(shutil.which("curl") or "curl")
     for url in GEO_ENDPOINTS:
         try:
             result = subprocess.run(
@@ -4058,7 +4062,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--controller-port", type=int, default=19090)
     parser.add_argument("--live-controller", default=DEFAULT_LIVE_CONTROLLER)
     parser.add_argument("--live-env", default=DEFAULT_LIVE_ENV)
-    parser.add_argument("--config", default=r"C:\mihomo\config.yaml")
+    parser.add_argument("--config", default=portable_path(r"C:\mihomo\config.yaml"))
     parser.add_argument("--gpt-history-file", default=DEFAULT_GPT_HISTORY_FILE,
                         help="Local boolean history for the GPT consecutive-pass gate")
     parser.add_argument("--fetch-proxy", default=DEFAULT_FETCH_PROXY)

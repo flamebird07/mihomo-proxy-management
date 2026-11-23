@@ -397,7 +397,7 @@ class SourceCacheTests(unittest.TestCase):
     def test_paths_default_to_live_provider_dir(self):
         self.assertEqual(
             str(sync.source_cache_path(2)),
-            os.path.join(r"C:\mihomo\providers", "source2-cache.yaml"),
+            os.path.join(sync.DEFAULT_PROVIDER_DIR, "source2-cache.yaml"),
         )
         self.assertEqual(str(sync.source_cache_path(3)), str(
             sync.Path(sync.DEFAULT_PROVIDER_DIR) / "source3-cache.yaml"))

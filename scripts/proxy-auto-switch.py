@@ -67,15 +67,17 @@ if not (_HERE / "gpt_switch_entry.py").exists():
 import gpt_switch_entry
 import named_mutex_lock
 from gpt_stability_policy import NodeSnapshot, PolicyConfig
+from portable_paths import portable_path as portable_default
 
 DEFAULT_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_TARGET = "https://chatgpt.com/robots.txt"
-DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
-DEFAULT_STATE_FILE = r"C:\mihomo\state\proxy-failover-state.json"
-DEFAULT_LOG_FILE = r"C:\mihomo\logs\proxy-failover.log"
-DEFAULT_ALERT_LOG = r"C:\mihomo\logs\proxy-failover-alert.log"
-DEFAULT_ALERT_TARGET = r"C:\mihomo\feishu-alert-target.json"
-DEFAULT_ROUNDS_JSONL = r"C:\mihomo\logs\proxy-failover-rounds.jsonl"
+
+DEFAULT_ENV_FILE = portable_default(r"C:\Users\Administrator\.hermes\.env")
+DEFAULT_STATE_FILE = portable_default(r"C:\mihomo\state\proxy-failover-state.json")
+DEFAULT_LOG_FILE = portable_default(r"C:\mihomo\logs\proxy-failover.log")
+DEFAULT_ALERT_LOG = portable_default(r"C:\mihomo\logs\proxy-failover-alert.log")
+DEFAULT_ALERT_TARGET = portable_default(r"C:\mihomo\feishu-alert-target.json")
+DEFAULT_ROUNDS_JSONL = portable_default(r"C:\mihomo\logs\proxy-failover-rounds.jsonl")
 SWITCH_GROUPS = ("GPT", "MUSE", "US-FAST")
 SKIP_MEMBERS = {"DIRECT", "REJECT", "COMPATIBLE", "PASS", "GLOBAL"}
 STATE_VERSION = 2
@@ -191,7 +193,7 @@ def read_env_file(path: str) -> dict[str, str]:
 def source3_bridge_region() -> str | None:
     """Use fresh measured egress and the independent two-round admission gate."""
     try:
-        state = json.loads(Path(r"C:\mihomo\source3-compatible\last-result.json").read_text(encoding="utf-8"))
+        state = json.loads(Path(portable_default(r"C:\mihomo\source3-compatible\last-result.json")).read_text(encoding="utf-8"))
         age = time.time() * 1000 - state["sync_ms"]
         if (not 0 <= age <= 20 * 60 * 1000 or not state.get("readback_verified")
                 or state.get("selected") not in state.get("candidates", [])
@@ -958,7 +960,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     parser.add_argument("--alert-log", default=DEFAULT_ALERT_LOG)
     parser.add_argument("--alert-target", default=DEFAULT_ALERT_TARGET)
-    parser.add_argument("--secret-env", default=r"C:\mihomo-proxy-management\config\subscription.env",
+    parser.add_argument("--secret-env", default=portable_default(
+                            r"C:\mihomo-proxy-management\config\subscription.env"),
                         help="Optional file with controller SECRET")
     parser.add_argument("--groups", default=",".join(SWITCH_GROUPS),
                         help="comma-separated select groups to manage (default: "
