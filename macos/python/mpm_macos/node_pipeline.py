@@ -381,7 +381,10 @@ def _api_json(path: str, secret: str, method: str = "GET", body: dict | None = N
         method=method,
     )
     with urllib.request.urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode())
+        raw = response.read().decode()
+    # PUT /proxies/<group> answers 204 No Content; json.loads("") would turn a
+    # successful switch into a bogus JSONDecodeError in the pipeline log.
+    return json.loads(raw) if raw.strip() else {}
 
 
 def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,

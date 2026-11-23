@@ -235,6 +235,11 @@ class Layout:
         return os.path.join(self.state_dir, "network-proxy-backup.json")
 
     @property
+    def tun_dns_backup(self) -> str:
+        """Original DNS servers of the default-route service (TUN fake-ip mode)."""
+        return os.path.join(self.state_dir, "tun-dns-backup.json")
+
+    @property
     def deployment_state(self) -> str:
         return os.path.join(self.state_dir, "deployment.json")
 

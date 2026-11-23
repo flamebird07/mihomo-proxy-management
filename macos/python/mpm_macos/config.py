@@ -77,6 +77,7 @@ SG_FILTER = policy.CODEBUDDY_REGIONS["SG"][1]
 REGION_FILTERS = {"US": US_FILTER, "SG": SG_FILTER, "JP": JP_FILTER}
 
 US_FAST_URL = "https://www.gstatic.com/generate_204"
+AUTO_FOREIGN_URL = "https://www.gstatic.com/generate_204"
 GPT_URL = "https://chatgpt.com/cdn-cgi/trace"
 # GROKBOT groups and rules live in the shared template (same as production
 # 2209); macOS only audits them here.
@@ -320,6 +321,23 @@ def _apply_proxy_groups(document: dict[str, Any], *, valid_nodes: bool = False) 
             "name": "PROXY",
             "type": "select",
             "proxies": list(PROXY_MEMBERS),
+        },
+    )
+    # Assignment mode hands AUTO-FOREIGN the measured valid-node pool.  The raw
+    # subscription/supplement pools can be entirely dead (2026-11-23: 40+35
+    # nodes, zero alive), and the start-time group health gate then fails and
+    # rolls the whole switch back to Nextin.  Without a valid pool the previous
+    # subscription-only shape is kept.
+    _replace_group(
+        groups,
+        {
+            "name": "AUTO-FOREIGN",
+            "type": "url-test",
+            "use": [VALID_PROVIDER_NAME] if valid_nodes else [PROVIDER_NAME],
+            "url": AUTO_FOREIGN_URL,
+            "interval": 300,
+            "tolerance": 100,
+            "timeout": 5000,
         },
     )
     _replace_group(

@@ -53,7 +53,6 @@ from mpm_common.controller_health import (
     HEALTH_INACTIVE,
     HEALTH_OK,
     HealthReport,
-    evaluate,
     evaluate_with_deadline,
     readiness,
 )
@@ -69,6 +68,7 @@ from . import feishu_sync as feishu_sync_mod
 from . import node_pipeline as node_pipeline_mod
 from . import plist as plist_mod
 from . import preflight as preflight_mod
+from . import tun_dns as tun_dns_mod
 from .launchdctl import Launchd
 from .locking import FileLock, is_held, read_metadata
 from .network_proxy import (
@@ -669,6 +669,7 @@ def _install_static(ctx: Context) -> list[str]:
         "run-xigua-ippool.py",
         # the node pipeline's assignment chain (upstream run-node-pipeline port)
         "proxy-auto-switch.py",
+        "portable_paths.py",
         "gpt_switch_entry.py",
         "gpt_stability_policy.py",
         "named_mutex_lock.py",
@@ -1768,6 +1769,34 @@ def _readiness(ctx: Context, secrets: Secrets) -> str:
 #: failure mode, not coverage).
 REQUIRED_HEALTHY_GROUPS = ("AUTO-FOREIGN", "GPT")
 
+#: A url-test group reports ``alive: false`` until its first round of delay
+#: tests finishes, which is *after* the provider verdict can already be OK.
+#: Checking the groups exactly once raced that first test round and rolled a
+#: healthy start back (2026-11-23).  Give them a short, deadline-bounded settle
+#: window instead of failing on the first sample.
+GROUP_SETTLE_SECONDS = 20.0
+GROUP_SETTLE_POLL_SECONDS = 1.0
+
+
+def _group_liveness_settled(
+    client: ControllerClient,
+    *,
+    deadline_seconds: float,
+    sleeper: Any,
+    clock: Any,
+) -> dict[str, bool | None]:
+    """Poll the routing groups until they are all live or the window expires."""
+    budget = max(0.0, float(deadline_seconds))
+    deadline = clock() + budget
+    while True:
+        groups = _group_liveness(client)
+        if all(value is True for value in groups.values()):
+            return groups
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return groups
+        sleeper(min(GROUP_SETTLE_POLL_SECONDS, remaining))
+
 
 def _group_liveness(client: ControllerClient) -> dict[str, bool | None]:
     """``alive`` flag of the routing groups (``None`` when not reported)."""
@@ -1788,6 +1817,18 @@ def _group_liveness(client: ControllerClient) -> dict[str, bool | None]:
     return result
 
 
+def _health_provider(ctx: Context) -> str:
+    """Provider that feeds AUTO-FOREIGN, i.e. the one the start gate must trust.
+
+    Assignment mode renders AUTO-FOREIGN over ``node-valid`` whenever that pool
+    exists; gating on ``subscription`` then kept auto-start hostage to a stale
+    source that is mostly dead (2026-11-23: 5 of 40 alive).
+    """
+    if os.path.isfile(ctx.layout.valid_provider_file):
+        return config_mod.VALID_PROVIDER_NAME
+    return config_mod.PROVIDER_NAME
+
+
 def _health_check(
     ctx: Context, secrets: Secrets, *, mode: str, deadline: float | None = None
 ) -> HealthReport:
@@ -1804,7 +1845,7 @@ def _health_check(
     client = ctx.controller(secrets.controller_secret)
     verdict = evaluate_with_deadline(
         client,
-        provider=config_mod.PROVIDER_NAME,
+        provider=_health_provider(ctx),
         mode=mode,
         running=True,
         deadline_seconds=(
@@ -1815,7 +1856,13 @@ def _health_check(
     )
     if not verdict.ok:
         return verdict
-    groups = _group_liveness(client)
+    budget = health_deadline_seconds(ctx.environ) if deadline is None else float(deadline)
+    groups = _group_liveness_settled(
+        client,
+        deadline_seconds=min(GROUP_SETTLE_SECONDS, budget),
+        sleeper=ctx.sleeper,
+        clock=ctx.clock,
+    )
     verdict.data["groups"] = {name: value for name, value in groups.items()}
     empty = [name for name, alive in groups.items() if not alive]
     if empty:
@@ -1835,6 +1882,23 @@ def _health_failure(verdict: HealthReport, *, mode: str) -> str:
 def _failure_reason(exc: BaseException) -> str:
     detail = exc.message if isinstance(exc, MpmError) else (str(exc) or type(exc).__name__)
     return HOST.text(detail)[:200]
+
+
+def _apply_tun_dns(ctx: Context, report: Report) -> None:
+    """Point the active service's DNS at the TUN gateway (best effort).
+
+    mDNSResponder binds DNS sockets to the network service, so a DHCP resolver
+    is queried outside the TUN and returns poisoned answers for blocked
+    domains.  A failure here only degrades blocked-site access, so it is a
+    warning rather than a reason to tear down a healthy core.
+    """
+    try:
+        service = tun_dns_mod.apply(ctx.executor, ctx.layout.tun_dns_backup)
+        report.add(
+            f"system DNS on '{service}' pointed at the TUN gateway ({tun_dns_mod.TUN_DNS})"
+        )
+    except Exception as exc:  # noqa: BLE001 - the core itself is healthy
+        report.warn("could not point system DNS at the TUN gateway: " + _failure_reason(exc))
 
 
 def _restore_proxy_if_any(ctx: Context) -> list[str]:
@@ -2023,6 +2087,10 @@ def start(
                 )
         except (MpmError, ControllerError, NetworkProxyError, OSError) as exc:
             return _failed_start(ctx, report, _failure_reason(exc), target_mode=target_mode)
+        if target_mode == "tun":
+            # A running core can still have lost its TUN DNS (DHCP renew,
+            # service switch): re-apply it so ``start`` stays idempotent.
+            _apply_tun_dns(ctx, report)
         report.status = "UNCHANGED"
         if state.degraded and target_mode == "mixed":
             report.status = "DEGRADED"
@@ -2094,6 +2162,12 @@ def start(
     if failure:
         return _failed_start(ctx, report, failure)
 
+    # mDNSResponder binds DNS sockets to the network service, so a DHCP
+    # resolver is queried outside the TUN and returns poisoned answers for
+    # blocked domains.  The previous servers are snapshotted and restored by
+    # ``stop``.
+    _apply_tun_dns(ctx, report)
+
     state.mode = "tun"
     state.degraded = False
     state.tun_ok = True
@@ -2152,6 +2226,12 @@ def stop(ctx: Context, *, quiet: bool = False) -> Report:
     restored = _restore_proxy_if_any(ctx)
     if restored:
         report.add("system proxy restored on: " + ", ".join(restored))
+    try:
+        services = tun_dns_mod.restore(ctx.executor, ctx.layout.tun_dns_backup)
+        if services:
+            report.add("system DNS restored on: " + ", ".join(services))
+    except Exception as exc:  # noqa: BLE001 - the core is already stopped safely
+        report.warn("could not restore system DNS: " + _failure_reason(exc))
     deployment = load_state(ctx.layout)
     if deployment is not None:
         deployment.degraded = False
@@ -2269,12 +2349,15 @@ def status(ctx: Context) -> Report:
     except FailClosed as exc:
         report.warn(f"controller secret not readable: {HOST.text(str(exc))[:120]}")
 
-    health = evaluate(
+    health = evaluate_with_deadline(
         client,
-        provider=config_mod.PROVIDER_NAME,
+        provider=_health_provider(ctx),
         mode=state.mode,
         running=launchd_state.running,
         degraded_reasons=state.reasons if state.degraded else [],
+        deadline_seconds=health_deadline_seconds(ctx.environ),
+        sleeper=ctx.sleeper,
+        clock=ctx.clock,
     )
     data["health"] = health.to_dict()
     data["version"] = health.data.get("version")
@@ -2298,12 +2381,15 @@ def health(ctx: Context) -> Report:
         client = ctx.controller(secrets.controller_secret)
     except FailClosed as exc:
         report.warn(f"controller secret not readable: {HOST.text(str(exc))[:120]}")
-    verdict = evaluate(
+    verdict = evaluate_with_deadline(
         client,
-        provider=config_mod.PROVIDER_NAME,
+        provider=_health_provider(ctx),
         mode=state.mode,
         running=launchd_state.running,
         degraded_reasons=state.reasons if state.degraded else [],
+        deadline_seconds=health_deadline_seconds(ctx.environ),
+        sleeper=ctx.sleeper,
+        clock=ctx.clock,
     )
     report.status = verdict.state
     report.data = verdict.to_dict()

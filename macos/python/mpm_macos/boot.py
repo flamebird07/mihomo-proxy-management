@@ -61,6 +61,7 @@ from mpm_common.sanitize import sanitize
 from . import conflict as conflict_mod
 from . import context as context_mod
 from . import lifecycle, probe as probe_mod, switch as switch_mod
+from . import tun_dns as tun_dns_mod
 
 CONSOLE_DEADLINE_ENV = "MPM_BOOT_CONSOLE_DEADLINE_SECONDS"
 NETWORK_DEADLINE_ENV = "MPM_BOOT_NETWORK_DEADLINE_SECONDS"
@@ -259,6 +260,23 @@ def boot_switch(
             "(install registered the job without running the switch)"
         )
         return report
+    # A previous session may have shut down (or crashed) while TUN mode owned
+    # the system DNS.  mihomo is not running now, so that DNS (the TUN gateway)
+    # answers nothing: pull the snapshot back before any path that can refuse
+    # the switch, otherwise the zero-side-effect exits below would leave the
+    # machine without resolvers.  Never touch it when launchd state is unknown.
+    try:
+        core_running = ctx.launchd().state().running
+    except Exception:  # noqa: BLE001 - unknown is not "stopped"
+        core_running = True
+    if not core_running:
+        try:
+            services = tun_dns_mod.restore(ctx.executor, ctx.layout.tun_dns_backup)
+            if services:
+                report.add("stale TUN DNS restored on: " + ", ".join(services))
+        except Exception as exc:  # noqa: BLE001 - refusal paths must still run
+            report.warn("could not restore stale TUN DNS: " + sanitize(str(exc))[:200])
+
     name = vpn_name or switch_mod.resolve_vpn_name(ctx.environ)
     read_console = console_reader or console_owner
     read_route = route_reader or route_ready
