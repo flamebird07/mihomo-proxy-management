@@ -16,13 +16,10 @@ nodes into the local machine's assignment.  Cross-platform contract:
    measurement columns and the 「有效节点」 table;
 3. ``node_provider --output``   - rebuild ``providers/node-valid.yaml`` (a
    mihomo file provider inside the ``-d`` home) from the valid table;
-4. ``proxy-auto-switch.py``     - the unified GPT stability entry picks the
-   stable node on the live controller (a non-selector GPT is rejected
-   cleanly as ``engine_not_selector``; missing groups log and skip);
-5. *apply*                       - when the valid provider appeared or
-   disappeared since the last render, re-render the config under the
-   lifecycle lock and reload the running core, flipping the GPT/US-FAST
-   groups between subscription mode and valid-node assignment mode.
+4. *apply*                      - re-render on a valid-provider presence
+   change and hot-reload the provider when its content changes;
+5. ``switch_gpt``               - verify GPT candidates in an isolated core
+   and update the live selector in US, SG, JP order.
 
 Everything runs from the **installed** tree (``libexec/scripts`` + the
 installed mihomo binary); a missing installed binary or package fails closed
@@ -35,14 +32,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
-import time
 import sys
+import time
+from contextlib import contextmanager
 from typing import Callable
 
 from mpm_common.sanitize import HOST
 
-from . import context as context_mod
+from . import config, context as context_mod
 from .paths import Layout
 
 PIPELINE_INTERVAL_ENV = "MPM_NODE_PIPELINE_INTERVAL_SECONDS"
@@ -212,6 +211,15 @@ def _provider_hash(layout: Layout) -> str | None:
         return None
 
 
+def _loaded_provider_hash(layout: Layout) -> str | None:
+    marker = os.path.join(layout.node_state_dir, "provider.sha256")
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
 def maybe_refresh_provider(layout: Layout, *,
                            say: Callable[[str], None] = print,
                            reload_provider: Callable[[str], int | None] | None = None,
@@ -229,11 +237,7 @@ def maybe_refresh_provider(layout: Layout, *,
     current = _provider_hash(layout)
     if current is None:
         return False
-    try:
-        previous = open(marker, encoding="utf-8").read().strip()
-    except OSError:
-        previous = ""
-    if current == previous:
+    if current == _loaded_provider_hash(layout):
         return False
 
     if reload_provider is None:
@@ -318,9 +322,8 @@ def run_steps(
     *,
     runner: Callable[[list[str]], int] | None = None,
     say: Callable[[str], None] = print,
-    switch: Callable[[Layout], object] | None = None,
 ) -> int:
-    """Run the four steps; every step runs even if a previous one failed.
+    """Build the provider; every step runs even if a previous one failed.
 
     Mirrors upstream ``run-node-pipeline.py`` semantics: the exit code is 1
     when any step failed, and each step's stdout/stderr lands in the shared
@@ -353,15 +356,6 @@ def run_steps(
         if code != 0:
             failed.append(label)
             say(f"node-pipeline: step {label} failed (exit {code})")
-    # In-process GPT switch (replaces the upstream proxy-auto-switch step,
-    # which also manages MUSE - a group the mac config does not define - and
-    # aborted every round on it before reaching the stability entry).
-    try:
-        (switch or switch_gpt)(layout, say=say)
-    except Exception as exc:  # noqa: BLE001 - a failed switch never fails the round
-        say("node-pipeline: gpt switch failed: "
-            + HOST.text(f"{type(exc).__name__}: {exc}")[:200])
-        failed.append("switch")
     return EXIT_STEP_FAILED if failed else EXIT_OK
 
 
@@ -371,13 +365,13 @@ def _controller_api(layout: Layout) -> tuple[str, str]:
 
 
 def _api_json(path: str, secret: str, method: str = "GET", body: dict | None = None):
-    import urllib.error
     import urllib.request
 
     request = urllib.request.Request(
         f"{LIVE_CONTROLLER}{path}",
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"Authorization": f"Bearer {secret}"} if secret else {},
+        headers={"Content-Type": "application/json",
+                 **({"Authorization": f"Bearer {secret}"} if secret else {})},
         method=method,
     )
     with urllib.request.urlopen(request, timeout=10) as response:
@@ -387,19 +381,80 @@ def _api_json(path: str, secret: str, method: str = "GET", body: dict | None = N
     return json.loads(raw) if raw.strip() else {}
 
 
+_AD_NODE_NAME = re.compile(r"★|官网|招募|防丢失|网不通|更新订阅|请咨询|客服")
+_GPT_UNSUPPORTED_NAME = re.compile(
+    r"香港|🇭🇰|\bHK\b|俄罗斯|🇷🇺|\bRU\b|伊朗|🇮🇷|\bIR\b|朝鲜|🇰🇵", re.IGNORECASE)
+_GPT_REGIONS = ("US", "SG", "JP")
+_GPT_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_GPT_BLOCK_MARKERS = (b"_cf_chl_opt",
+                      b"<title>just a moment", b"<title>attention required",
+                      b"unsupported_country_region_territory")
+
+
+def _gpt_http_body(port: int, url: str) -> bytes:
+    result = subprocess.run(
+        ["/usr/bin/curl", "--disable", "--silent", "--noproxy", "",
+         "--proxy", f"http://127.0.0.1:{port}", "--user-agent", _GPT_BROWSER_UA,
+         "--max-time", "6", "--max-filesize", "2097152",
+         "--compressed", "--include", "--suppress-connect-headers", url],
+        capture_output=True, timeout=8,
+    )
+    if result.returncode != 0:
+        return b""
+    headers, _, body = result.stdout.partition(b"\r\n\r\n")
+    status = headers.split(b"\r\n", 1)[0].split()
+    if status[1:2] != [b"200"] or b"\r\ncf-mitigated:" in headers.lower():
+        return b""
+    return body
+
+
+@contextmanager
+def _gpt_probe_session(layout: Layout, names: list[str]):
+    # Launchd puts the macOS package on PYTHONPATH. Load the same installed
+    # node_ops package that the preceding measurement step runs.
+    sys.path.insert(0, layout.scripts_dir)
+    try:
+        from node_ops.probe import IsolatedProber, select_and_verify
+    finally:
+        sys.path.pop(0)
+
+    with open(layout.valid_provider_file, encoding="utf-8") as handle:
+        provider = config._yaml().safe_load(handle)
+    candidates = set(names)
+    nodes = {node["name"]: node for node in provider["proxies"]
+             if isinstance(node, dict) and node.get("name") in candidates}
+    if not nodes:
+        yield lambda _name: None
+        return
+
+    core = context_mod.resolve_runtime_binary(layout)
+    if not core:
+        raise RuntimeError("installed mihomo binary missing")
+    with IsolatedProber(core).session(list(nodes.values()), list(nodes),
+                                     interface=_default_interface()) as (api, port):
+        def verify(name: str) -> str | None:
+            if name not in nodes or not select_and_verify(api, "TEST", name):
+                return None
+            try:
+                trace = _gpt_http_body(port, config.GPT_URL)
+                location = re.search(rb"(?m)^loc=([A-Z]{2})\r?$", trace)
+                region = location[1].decode() if location else ""
+                if region not in _GPT_REGIONS:
+                    return None
+                homepage = _gpt_http_body(port, "https://chatgpt.com/")
+            except subprocess.TimeoutExpired:
+                return None
+            if not homepage or any(marker in homepage.lower() for marker in _GPT_BLOCK_MARKERS):
+                return None
+            return region
+
+        yield verify
+
+
 def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
                api_json: Callable[..., dict] | None = None) -> str | None:
-    """Select the fastest alive node in the GPT group (in-process).
-
-    mac's assignment-mode GPT is a selector over the measured node-valid pool
-    (+ AUTO-FOREIGN).  This is the mac counterpart of upstream's GPT
-    stability entry, reduced to what a single host needs without the MUSE
-    machinery: probe every pool member through the controller's delay API
-    (chatgpt.com - the target OpenAI traffic actually uses), pick the lowest
-    alive delay, and PUT only when the selection changes.  The upstream
-    gpt_switch_entry's full 10-round stability policy remains the Windows
-    side's semantics; mac trades strictness for zero external dependencies.
-    """
+    """Select a verified GPT exit by region first and trace delay second."""
     import urllib.parse
 
     _api, secret = _controller_api(layout)
@@ -412,34 +467,58 @@ def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
             + str(gpt.get("type")) + "); switch skipped")
         return None
     current = gpt.get("now")
-    # Group-level delay test: ONE call measures every leaf member (per-node
-    # paths 404 for provider-sourced nodes on this controller, and unicode
-    # names make raw paths unusable).  The map keys are the leaf nodes; the
-    # AUTO-FOREIGN subgroup does not appear.
-    target = "https://chatgpt.com/cdn-cgi/trace"
+    provider_hash = _provider_hash(layout)
+    if provider_hash != _loaded_provider_hash(layout):
+        say("node-pipeline: node-valid reload pending; GPT switch deferred")
+        return None
     try:
-        delays = call("/group/GPT/delay?timeout=3000&url="
-                      + urllib.parse.quote(target, safe=""))
+        delays = call("/group/GPT/delay?timeout=3000&expected=200&url="
+                      + urllib.parse.quote(config.GPT_URL, safe=""))
     except Exception as exc:  # noqa: BLE001 - transient controller slowness
         say("node-pipeline: group delay unavailable, keeping " + str(current)
-            + ": " + HOST.text(f"{type(exc).__name__}")[:80])
+            + ": " + type(exc).__name__)
         return None
     if not isinstance(delays, dict):
         say("node-pipeline: group delay returned no map; keeping " + str(current))
         return None
-    alive = {name: delay for name, delay in delays.items()
-             if isinstance(delay, int) and delay > 0}
-    if not alive:
+    members = set(gpt.get("all") or ()) - {"AUTO-FOREIGN", "DIRECT", "COMPATIBLE"}
+    names = sorted(
+        (name for name, delay in delays.items()
+         if name in members and type(delay) is int and delay > 0
+         and not _AD_NODE_NAME.search(name) and not _GPT_UNSUPPORTED_NAME.search(name)),
+        key=lambda name: (delays[name], name != current, name),
+    )
+    if not names:
         say("node-pipeline: no alive GPT pool member; keeping " + str(current))
         return None
-    best_name = min(alive, key=alive.get)
-    best_delay = alive[best_name]
+
+    verified: dict[str, str] = {}
+    with _gpt_probe_session(layout, names) as verify:
+        for name in names:
+            region = verify(name)
+            if region in _GPT_REGIONS:
+                verified.setdefault(region, name)
+                if region == "US":
+                    break
+    best_region = next((region for region in _GPT_REGIONS if region in verified), None)
+    if best_region is None:
+        say("node-pipeline: no verified US/SG/JP GPT exit; keeping " + str(current))
+        return None
+    best_name = verified[best_region]
+    details = f"{best_name} ({best_region}, {delays[best_name]}ms)"
+    live = call("/proxies/GPT")
+    if ((live.get("type") or "").lower() != "selector" or live.get("now") != current
+            or best_name not in (live.get("all") or ())
+            or provider_hash != _provider_hash(layout)):
+        say("node-pipeline: GPT changed during verification; switch skipped")
+        return None
     if best_name == current:
-        say(f"node-pipeline: GPT already on the fastest member ({best_name} "
-            f"{best_delay}ms)")
+        say(f"node-pipeline: GPT keeping {details}")
         return best_name
     call("/proxies/GPT", method="PUT", body={"name": best_name})
-    say(f"node-pipeline: GPT -> {best_name} ({best_delay}ms, was {current})")
+    if call("/proxies/GPT").get("now") != best_name:
+        raise RuntimeError("GPT selection could not be verified")
+    say(f"node-pipeline: GPT -> {details} (was {current})")
     return best_name
 
 
@@ -479,6 +558,8 @@ def apply_presence(
             if report.status == "FAILED":
                 say("node-pipeline: re-render failed; apply deferred")
                 return False
+            if not _reload_core(layout, say=say):
+                return False
     except Exception as exc:  # noqa: BLE001 - any failure defers to the next tick
         say("node-pipeline: re-render error, apply deferred: " + HOST.text(str(exc))[:200])
         return False
@@ -492,14 +573,13 @@ def apply_presence(
             os.remove(marker)
         except OSError:
             pass
-    say("node-pipeline: config re-rendered (node-valid provider "
-        + ("active" if present else "removed") + "); reload the core to apply")
-    _reload_core(layout, say=say)
+    say("node-pipeline: config reloaded (node-valid provider "
+        + ("active" if present else "removed") + ")")
     return True
 
 
-def _reload_core(layout: Layout, *, say: Callable[[str], None] = print) -> None:
-    """Best-effort ``PUT /configs`` on the live controller (hot reload)."""
+def _reload_core(layout: Layout, *, say: Callable[[str], None] = print) -> bool:
+    """Return whether the live controller accepted the configuration reload."""
     import urllib.error
     import urllib.request
 
@@ -508,15 +588,18 @@ def _reload_core(layout: Layout, *, say: Callable[[str], None] = print) -> None:
     request = urllib.request.Request(
         f"{LIVE_CONTROLLER}/configs?force=true",
         data=b'{"path": "", "payload": ""}',
-        headers={"Authorization": f"Bearer {secret}"} if secret else {},
+        headers={"Content-Type": "application/json",
+                 **({"Authorization": f"Bearer {secret}"} if secret else {})},
         method="PUT",
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             say(f"node-pipeline: core reload http={response.status}")
+            return response.status in (200, 204)
     except (OSError, urllib.error.URLError) as exc:
-        say("node-pipeline: core reload unavailable (picked up on next start): "
-            + HOST.text(f"{type(exc).__name__}"))
+        say("node-pipeline: core reload unavailable (retried next tick): "
+            + type(exc).__name__)
+        return False
 
 
 def main(
@@ -550,6 +633,12 @@ def main(
     steps_code = run_steps(layout)
     apply_presence(layout, context_factory=lambda: ctx)
     maybe_refresh_provider(layout)
+    try:
+        switch_gpt(layout)
+    except Exception as exc:  # noqa: BLE001 - report switch failure without rolling back the provider
+        print("node-pipeline: GPT switch failed: "
+              + HOST.text(f"{type(exc).__name__}: {exc}")[:200])
+        return EXIT_STEP_FAILED
     return steps_code
 
 

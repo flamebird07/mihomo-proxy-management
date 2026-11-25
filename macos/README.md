@@ -884,17 +884,16 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
  3 python -m node_provider --output   有效节点表 -> providers/node-valid.yaml
                                       （mihomo home 内的 file provider，原子写，
                                       低于 min-nodes 保留上一版）
- 4 proxy-auto-switch.py               统一 GPT 稳定切换入口（gpt_switch_entry：
-                                      10 轮稳定门槛、读回校验；GPT 不是 selector 时
-                                      以 engine_not_selector 干净拒绝）
- 5 apply                              node-valid 首次出现/消失时，在 lifecycle 锁内
-                                      重渲染 config 并热重载 core（一次翻转只渲染一次）
+ 4 apply                              有效池首次出现或消失时重渲染配置并热重载 core，
+                                      池内容变化时刷新 file provider
+ 5 switch_gpt                         在刷新后读取 GPT 成员。按真实出口美国 → 新加坡 → 日本
+                                      逐级选择，同级取 trace 延迟最低的合格节点
 ```
 
 **有效节点分配模式（valid_nodes）**：渲染器检测 `providers/node-valid.yaml` 是否存在——
-存在时（第 5 步翻转后）`GPT` 变为 **select 组**（`use: [node-valid]`，成员是实测过关的
-节点 + 手动兜底 AUTO-FOREIGN——上游稳定入口只管理 selector 引擎），`US-FAST` 的
-`use` 切到 `node-valid`（严格美国 filter 不变）；文件不存在时回退纯订阅模式。mihomo
+存在时（第 4 步翻转后）`GPT` 使用 **select 组**（`use: [node-valid]`，成员是实测过关的
+节点和手动兜底 `AUTO-FOREIGN`），`US-FAST` 读取同一 Provider 并保留严格美国过滤。
+文件不存在时回到订阅模式。mihomo
 拒绝文件缺失的 file provider，所以渲染必须由存在性门控；audit 在两种模式下各自锁定
 组形。`configure`/`install` 自动带 `valid_nodes=os.path.isfile(node-valid.yaml)`。
 
@@ -902,9 +901,10 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
 
 * 凭据：与飞书测速同步同一套 `FEISHU_APP_ID/SECRET`（0600 秘密文件）；缺失时 tick 报告
   缺键并退出 4，下个周期重试——**不阻塞 install**，也不影响核心服务。
-* GPT 稳定切换的跨进程锁：上游 named_mutex 在 POSIX 只有进程内回退；本分支补了真正的
-  `flock` 文件锁（`_PosixFileMutex`，30s 预算，持锁进程死亡由内核释放；锁文件不删除，
-  避免 unlink 竞态分裂成两把锁）。Windows 仍走 kernel32。
+* GPT 切换：先用控制器的组级测速缩小候选范围，再通过隔离内核确认出口
+  `loc=US/SG/JP` 和 ChatGPT 主页 HTTP 200（浏览器 UA，排除 Cloudflare 挑战页）。
+  试探期间保持现有选路，提交后读回确认。没有候选通过，或 Provider 刷新失败时，
+  保留控制器当前选择。每轮按策略重选，人工选择可能被下一轮覆盖。
 * plist 走 interval 型审计（无 RunAtLoad/KeepAlive、StartInterval>=600 整数、入口必须是
   `mpm_macos.node_pipeline`、ProcessType Background）；install 注册（enable 读回 +
   bootstrap，重装先 bootout）、uninstall 摘除、status 显示 `node_pipeline` 状态。
@@ -935,7 +935,7 @@ sudo env PYTHONPATH=/usr/local/share/mihomo-proxy-management/python \
      /usr/local/bin/python3 -m mpm_macos.node_pipeline --dry-run   # 前置检查+argv
 sudo launchctl kickstart system/com.mihomo-proxy-management.node-pipeline
 tail "/Library/Application Support/mihomo-proxy-management/logs/node-pipeline.log"
-sudo /usr/local/bin/mihomo-proxy-management groups    # GPT now= 稳定入口选中的节点
+sudo /usr/local/bin/mihomo-proxy-management groups    # 查看 GPT 当前节点
 ```
 
 ## 8. 测试

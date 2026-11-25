@@ -255,18 +255,21 @@ def fetch_geo_via_mixed(mixed_port: int, timeout_s: float = IPINFO_TIMEOUT_S) ->
     return "未知"
 
 
-def _probe_region_once(api: str, mixed_port: int, name: str,
-                       timeout_s: float = IPINFO_TIMEOUT_S) -> str:
-    if not select_proxy(api, "TEST", name):
-        return "未知"
+def select_and_verify(api: str, group: str, name: str) -> bool:
+    if not select_proxy(api, group, name):
+        return False
     try:
         with urllib.request.urlopen(
-            f"{api}/proxies/{urllib.parse.quote('TEST', safe='')}", timeout=3
+            f"{api}/proxies/{urllib.parse.quote(group, safe='')}", timeout=3
         ) as response:
-            now = json.loads(response.read().decode("utf-8", "replace")).get("now")
-        if now != name:
-            return "未知"
+            return json.loads(response.read().decode("utf-8", "replace")).get("now") == name
     except Exception:
+        return False
+
+
+def _probe_region_once(api: str, mixed_port: int, name: str,
+                       timeout_s: float = IPINFO_TIMEOUT_S) -> str:
+    if not select_and_verify(api, "TEST", name):
         return "未知"
     return fetch_geo_via_mixed(mixed_port, timeout_s=timeout_s)
 
@@ -307,13 +310,35 @@ class IsolatedProber:
 
     def probe(self, nodes: List[Dict[str, Any]],
               names: Optional[List[str]] = None) -> ProbeResult:
+        names = names or [str(node.get("name")) for node in nodes]
+        with self.session(nodes, names) as (api, mixed):
+            values = test_delay_targets(
+                api, names, self.targets, self.timeout_ms,
+                self.workers, self.total_budget_s,
+            )
+            regions = lookup_regions(
+                api, mixed, names,
+                timeout_s=min(IPINFO_TIMEOUT_S, max(1.0, self.timeout_ms / 1000.0)),
+                budget_s=self.ipinfo_budget_s,
+            )
+            return ProbeResult(
+                delays=values.get("grok", {}),
+                chatgpt=values.get("chatgpt", {}),
+                openai=values.get("openai", {}),
+                regions=regions,
+            )
+
+    @contextlib.contextmanager
+    def session(self, nodes: List[Dict[str, Any]], names: List[str],
+                *, interface: Optional[str] = None):
+        """Expose the isolated TEST selector for probes that need HTTP bodies."""
         if yaml is None:
             raise ProbeError("pyyaml_missing")
         if not Path(self.core).exists():
             raise ProbeError("core_missing")
-        names = names or [str(node.get("name")) for node in nodes]
         if len(names) != len(nodes):
             raise ProbeError("name_count_mismatch", "usage")
+        bind = _bind_interface() if interface is None else interface
         mixed, controller = pick_ports(self.mixed_hint, self.controller_hint)
         runtime = Path(tempfile.mkdtemp(prefix="node_ops-"))
         try:
@@ -326,13 +351,12 @@ class IsolatedProber:
                 "external-controller": f"127.0.0.1:{controller}",
                 "dns": {"enable": True, "enhanced-mode": "redir-host",
                         "nameserver": (["223.5.5.5", "119.29.29.29"]
-                                       if _bind_interface() else ["8.8.8.8", "1.1.1.1"])},
+                                       if bind else ["8.8.8.8", "1.1.1.1"])},
                 "tun": {"enable": False},
                 "proxies": _quote_numeric_like(nodes),
                 "proxy-groups": [{"name": "TEST", "type": "select", "proxies": names}],
                 "rules": ["MATCH,TEST"],
             }
-            bind = _bind_interface()
             if bind:
                 # Bypass a host-level TUN (e.g. the production core on the
                 # same machine): bound sockets leave via the physical
@@ -366,27 +390,14 @@ class IsolatedProber:
                         time.sleep(0.3)
                 if not ready:
                     raise ProbeError("core_not_ready")
-                values = test_delay_targets(
-                    api, names, self.targets, self.timeout_ms,
-                    self.workers, self.total_budget_s,
-                )
-                regions = lookup_regions(
-                    api, mixed, names,
-                    timeout_s=min(IPINFO_TIMEOUT_S, max(1.0, self.timeout_ms / 1000.0)),
-                    budget_s=self.ipinfo_budget_s,
-                )
-                return ProbeResult(
-                    delays=values.get("grok", {}),
-                    chatgpt=values.get("chatgpt", {}),
-                    openai=values.get("openai", {}),
-                    regions=regions,
-                )
+                yield api, mixed
             finally:
                 process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait()
         finally:
             shutil.rmtree(runtime, ignore_errors=True)
 

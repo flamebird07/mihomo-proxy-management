@@ -33,7 +33,7 @@
   → node_ops 测总表(隔离内核, 空闲端口, 不碰生产) → 有效节点表
   → node_provider --output → 本机 file provider
   Windows 入口: scripts/run-node-pipeline.py
-  macOS 入口:   macos/python/mpm_macos/node_pipeline.py（含第 4 步稳定切换 + 翻转重渲染）
+  macOS 入口:   macos/python/mpm_macos/node_pipeline.py（先重渲染或刷新 Provider，再切换 GPT）
 ```
 
 **自动分配只消费链 B**（总表→有效节点→本机 provider）。链 A 的表 2 不喂分配。
@@ -53,9 +53,8 @@
 | 有效节点 provider | `C:\mihomo\providers\node-valid.yaml` | `providers/node-valid.yaml`（在 `-d` 内，mihomo 拒绝 home 外路径） |
 | 渲染器 | `install.ps1`（模板原样） | `config.py`（叠加覆盖：GPT/US-FAST/GROKBOT 审计形、fake-ip 198.19/16、provider interval 秒化、source1-local/nextin 补充、**valid_nodes 分配模式**） |
 | 切换 | — | `mpm-switch`（osascript 密码框、Always On VPN 预检、失败回滚） |
-| GPT 组管理 | 30 分钟链里 proxy-auto-switch（GPT+MUSE+US-FAST 三组） | node-pipeline 进程内 `switch_gpt`：一次 `GET /group/GPT/delay` 测全部池成员（单节点路径对 provider 节点 404、unicode 名裸路径被 urllib 拒绝——组级端点是唯一可靠形态），PUT 最快者（mac 无 MUSE 组，proxy-auto-switch 会因缺组提前退出，故不调用） |
+| GPT 组管理 | 30 分钟链里 proxy-auto-switch（GPT+MUSE+US-FAST 三组） | node-pipeline 刷新 `node-valid` 后对 GPT 做组级 trace 测速；隔离验证实际出口和 ChatGPT 主页，按美国 → 新加坡 → 日本取同级延迟最低的合格节点，切换后读回确认 |
 | 本地节点补充 | App 通道（AtlasCore/Ninja/西瓜进程内存/DPAPI 缓存） | `--supplement-yaml`：`providers/nextin.yaml` + `providers/supplements/*.yaml`（任意来源文件丢入即入库总表） |
-| 已知噪音 | — | node-pipeline 末步报 `missing_group MUSE` 退出 1：mac 模板无 MUSE 组，纯日志噪音，分配/切换不受影响 |
 
 ## 5. 多机共存语义（Windows + Mac 同时跑）+ 写入纪律裁定
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -184,7 +185,7 @@ def test_run_steps_runs_every_step_even_when_one_fails(tmp_path):
 def test_run_steps_ok_when_all_pass(tmp_path):
     layout = _ready(tmp_path)
     code = node_pipeline.run_steps(layout, runner=lambda _argv: 0,
-                                   say=lambda _m: None, switch=lambda _l, **_k: None)
+                                   say=lambda _m: None)
     assert code == node_pipeline.EXIT_OK
 
 
@@ -216,6 +217,7 @@ def _patch_configure(monkeypatch, recorded: list):
         return report
 
     monkeypatch.setattr(lifecycle, "configure", fake_configure)
+    monkeypatch.setattr(node_pipeline, "_reload_core", lambda *_a, **_k: True)
 
 
 def test_apply_presence_renders_once_when_valid_provider_appears(tmp_path, monkeypatch):
@@ -258,6 +260,18 @@ def test_apply_presence_defers_when_the_render_fails(tmp_path, monkeypatch):
         os.path.join(layout.node_state_dir, node_pipeline.PRESENCE_MARKER)
     )
     assert any("re-render failed" in line for line in lines)
+
+
+def test_apply_presence_retries_after_controller_reload_failure(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    Path(layout.valid_provider_file).write_text("proxies: []")
+    _patch_configure(monkeypatch, [])
+    reload_results = iter((False, True))
+    monkeypatch.setattr(node_pipeline, "_reload_core", lambda *_a, **_k: next(reload_results))
+
+    assert node_pipeline.apply_presence(layout, context_factory=_Ctx) is False
+    assert node_pipeline.apply_presence(layout, context_factory=_Ctx) is True
+    assert node_pipeline.apply_presence(layout, context_factory=_Ctx) is False
 
 
 def test_apply_presence_handles_manual_removal(tmp_path, monkeypatch):
@@ -427,9 +441,9 @@ def test_provider_refresh_failure_is_retried_next_tick(tmp_path):
 
 
 class _FakeAPI:
-    """Minimal controller stand-in: proxies/GPT + per-name delay probe."""
+    """Live controller stand-in that records production changes."""
 
-    def __init__(self, members, delays, now="AUTO-FOREIGN", gtype="selector"):
+    def __init__(self, members, delays, now="AUTO-FOREIGN", gtype="Selector"):
         self.members = members
         self.delays = delays
         self.now = now
@@ -438,89 +452,156 @@ class _FakeAPI:
 
     def json(self, path, method="GET", body=None):
         if path == "/proxies/GPT" and method == "PUT":
-            self.puts.append((body or {}).get("name"))
+            self.now = body["name"]
+            self.puts.append(self.now)
             return {}
         if path == "/proxies/GPT":
-            return {"type": self.gtype, "now": self.now, "all": list(self.members),
-                    "alive": True}
-        if path.startswith("/group/GPT/delay"):
-            return dict(self.delays)
-        return {}
-
-    def put(self, path, body):
-        assert path == "/proxies/GPT"
-        self.puts.append(body["name"])
+            return {"type": self.gtype, "now": self.now, "all": list(self.members)}
+        assert path.startswith("/group/GPT/delay?")
+        assert "expected=200" in path
+        return self.delays
 
 
-def _patch_api(monkeypatch, fake):
-    import urllib.request
+@pytest.fixture
+def gpt_exits(monkeypatch):
+    exits = {}
 
-    def fake_urlopen(request, timeout=None):
-        class _Resp:
-            status = 200
+    @contextmanager
+    def session(_layout, names):
+        assert all(name in exits for name in names)
+        yield exits.get
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return b"{}"
-
-        raise AssertionError("raw urlopen should not be used")
-        yield _Resp
-
-    # switch_gpt uses module-level api_json (urllib.request) in _api_json;
-    # patch node_pipeline's _api_json instead
-    monkeypatch.setattr(node_pipeline, "_api_json",
-                        lambda path, secret, method="GET", body=None: fake.json(path, method, body))
-    monkeypatch.setattr(node_pipeline, "_controller_api",
-                        lambda layout: ("http://127.0.0.1:9090", "secret"))
+    monkeypatch.setattr(node_pipeline, "_gpt_probe_session", session)
+    return exits
 
 
-def test_switch_gpt_picks_the_fastest_alive_member(tmp_path, monkeypatch):
+def test_switch_gpt_ignores_advertisement_and_unsupported_members(tmp_path, gpt_exits):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(
-        members=["AUTO-FOREIGN", "n-slow", "n-fast", "n-dead"],
-        delays={"n-slow": 800, "n-fast": 210, "n-dead": 0},
-    )
-    lines: list[str] = []
-    chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
-    assert chosen == "n-fast"
-    assert fake.puts == ["n-fast"]
-    assert any("GPT -> n-fast (210ms" in line for line in lines)
+    delays = {"★!!!网不通重新更新订阅": 50, "V1-香港02": 60, "🇭🇰 HK Ristretto": 70,
+              "AUTO-FOREIGN": 80, "leaf-not-in-gpt": 90, "V1-美国02": 240}
+    fake = _FakeAPI(list(delays)[:-2] + ["V1-美国02"], delays)
+    gpt_exits.update({"V1-美国02": "US"})
+    assert node_pipeline.switch_gpt(layout, api_json=fake.json) == "V1-美国02"
+    assert fake.puts == ["V1-美国02"]
 
 
-def test_switch_gpt_moves_off_current_to_a_faster_member(tmp_path, monkeypatch):
-    """The current selection is excluded from probing by design; a faster
-    alive member gets the PUT."""
+@pytest.mark.parametrize(
+    ("us_exit", "sg_exit", "expected"),
+    [("US", "SG", "unknown-name"), (None, "SG", "SG Nitro"), ("HK", None, "JP Cappuccino"),
+     ("JP", "SG", "SG Nitro")],
+)
+def test_switch_gpt_prefers_verified_egress_over_latency_and_name(
+    tmp_path, gpt_exits, us_exit, sg_exit, expected,
+):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(
-        members=["AUTO-FOREIGN", "n-current", "n-faster"],
-        delays={"n-current": 500, "n-faster": 120},
-        now="n-current",
-    )
-    lines: list[str] = []
-    chosen = node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json)
-    assert chosen == "n-faster"
-    assert fake.puts == ["n-faster"]
+    delays = {"SG Nitro": 72, "JP Cappuccino": 137, "US Trace Only": 277, "unknown-name": 300}
+    fake = _FakeAPI(list(delays), delays)
+    gpt_exits.update({"SG Nitro": sg_exit, "JP Cappuccino": "JP",
+                      "US Trace Only": None, "unknown-name": us_exit})
+    assert node_pipeline.switch_gpt(layout, api_json=fake.json) == expected
+    assert fake.puts == [expected]
 
 
-def test_switch_gpt_skips_non_selector(tmp_path, monkeypatch):
+def test_switch_gpt_picks_fastest_verified_member_within_region(tmp_path, gpt_exits):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(members=["AUTO-FOREIGN"], delays={}, gtype="Fallback")
+    fake = _FakeAPI(["US slow", "US fast", "US offline"],
+                    {"US slow": 500, "US fast": 210, "US offline": 0}, now="US slow")
+    gpt_exits.update({"US slow": "US", "US fast": "US"})
+    assert node_pipeline.switch_gpt(layout, api_json=fake.json) == "US fast"
+    assert fake.puts == ["US fast"]
+
+
+def test_switch_gpt_keeps_current_when_no_candidate_passes(tmp_path, gpt_exits):
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(["US offline", "US trace only"], {"US offline": 0, "US trace only": 300})
+    gpt_exits["US trace only"] = None
+    assert node_pipeline.switch_gpt(layout, api_json=fake.json) is None
+    assert fake.puts == []
+
+
+def test_switch_gpt_skips_non_selector(tmp_path):
+    layout = _ready(tmp_path)
+    fake = _FakeAPI(["GPT-US"], {}, gtype="Fallback")
     lines: list[str] = []
     assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
     assert any("not a selector" in line for line in lines)
 
 
-def test_switch_gpt_no_alive_member_keeps_selection(tmp_path, monkeypatch):
+def test_switch_gpt_defers_when_live_provider_reload_is_pending(tmp_path):
     layout = _ready(tmp_path)
-    fake = _FakeAPI(members=["AUTO-FOREIGN", "n1"], delays={"n1": 0})
+    Path(layout.valid_provider_file).write_text("proxies: []")
+    fake = _FakeAPI(["US fast"], {"US fast": 210})
     lines: list[str] = []
     assert node_pipeline.switch_gpt(layout, say=lines.append, api_json=fake.json) is None
-    assert any("no alive" in line for line in lines)
+    assert "reload pending" in lines[-1]
+    assert fake.puts == []
+
+
+@pytest.mark.parametrize(
+    ("response", "accepted"),
+    [(b"HTTP/2 200\r\ncontent-type: text/html\r\n\r\n<body>ChatGPT</body>", True),
+     (b"HTTP/2 200\r\nCf-Mitigated: challenge\r\n\r\nchallenge", False),
+     (b"HTTP/2 403\r\n\r\nblocked", False),
+     (b"HTTP/2 302\r\nlocation: https://example.invalid\r\n\r\nredirect", False)],
+)
+def test_gpt_probe_http_requires_200_and_rejects_mitigation(
+    monkeypatch, response, accepted,
+):
+    def run(argv, **_kwargs):
+        assert "--suppress-connect-headers" in argv
+        assert "http://127.0.0.1:17890" in argv
+        return node_pipeline.subprocess.CompletedProcess(argv, 0, stdout=response)
+
+    monkeypatch.setattr(node_pipeline.subprocess, "run", run)
+    assert bool(node_pipeline._gpt_http_body(17890, "https://chatgpt.com/")) is accepted
+
+
+@pytest.mark.parametrize(
+    ("trace", "homepage", "verified"),
+    [(b"loc=US\n", b"<html>ChatGPT</html>", "US"),
+     (b"loc=US\n", b"<script>window._cf_chl_opt</script>", None),
+     (b"loc=US\n", b"", None),
+     (b"loc=HK\n", b"<html>ChatGPT</html>", None),
+     (b"", b"<html>ChatGPT</html>", None)],
+)
+def test_gpt_probe_session_requires_supported_exit_and_unblocked_homepage(
+    tmp_path, monkeypatch, trace, homepage, verified,
+):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    from node_ops import probe
+
+    layout = _ready(tmp_path)
+    Path(layout.valid_provider_file).write_text("proxies: [{name: candidate, type: direct}]")
+    monkeypatch.setattr(node_pipeline, "_default_interface", lambda: "en0")
+
+    @contextmanager
+    def isolated_session(_self, nodes, names, *, interface):
+        assert [node["name"] for node in nodes] == names == ["candidate"]
+        assert interface == "en0"
+        yield "http://127.0.0.1:17891", 17890
+
+    def http_body(port, url):
+        assert port == 17890
+        return {node_pipeline.config.GPT_URL: trace, "https://chatgpt.com/": homepage}[url]
+
+    monkeypatch.setattr(probe.IsolatedProber, "session", isolated_session)
+    monkeypatch.setattr(probe, "select_and_verify",
+                        lambda api, group, name: group == "TEST" and name == "candidate")
+    monkeypatch.setattr(node_pipeline, "_gpt_http_body", http_body)
+    with node_pipeline._gpt_probe_session(layout, ["candidate"]) as verify:
+        assert verify("candidate") == verified
+
+
+def test_main_switches_against_refreshed_provider(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    calls = []
+    for name in ("clear_stale_ops_lock", "run_steps", "apply_presence",
+                 "maybe_refresh_provider", "switch_gpt"):
+        monkeypatch.setattr(node_pipeline, name,
+                            lambda *_a, step=name, **_k: calls.append(step) or 0)
+    assert node_pipeline.main([], context_factory=lambda: type("Ctx", (), {"layout": layout})()) == 0
+    assert calls == ["clear_stale_ops_lock", "run_steps", "apply_presence",
+                     "maybe_refresh_provider", "switch_gpt"]
 
 
 # ---- install / uninstall wiring -------------------------------------------------
