@@ -16,6 +16,7 @@ a name reserved by another input node.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -94,6 +95,17 @@ def _fields(row: Any) -> Optional[Dict[str, Any]]:
     return fields if isinstance(fields, dict) else None
 
 
+_AD_NAME = re.compile(r"★|官网|招募|防丢失|网不通|更新订阅|请咨询|客服")
+
+
+def is_ad_node_name(name: Any) -> bool:
+    """True for subscription advertisement entries (``★V-官网``, ``★!!!网不通
+    重新更新订阅`` …).  They carry a real server so a url-test can "pass" them,
+    but they are not proxies; keeping them in the valid pool lets auto-switch
+    route GPT traffic through an ad endpoint."""
+    return isinstance(name, str) and bool(_AD_NAME.search(name))
+
+
 def _valid_proxy(config: Any) -> bool:
     if not isinstance(config, dict):
         return False
@@ -131,6 +143,7 @@ class BuildResult:
     stale_skipped: int = 0
     invalid: int = 0
     duplicates: int = 0
+    ad_skipped: int = 0
 
     @property
     def selected(self) -> int:
@@ -140,7 +153,7 @@ class BuildResult:
         return (f"rows total={self.total} gpt_skipped={self.gpt_skipped} "
                 f"region_skipped={self.region_skipped} stale_skipped={self.stale_skipped} "
                 f"invalid={self.invalid} duplicates={self.duplicates} "
-                f"selected={self.selected}")
+                f"ad_skipped={self.ad_skipped} selected={self.selected}")
 
 
 def build_proxies(rows: Iterable[Any], *, all_valid: bool = False,
@@ -178,6 +191,9 @@ def build_proxies(rows: Iterable[Any], *, all_valid: bool = False,
             config = json.loads(field_text(fields.get("节点配置JSON")))
         except (ValueError, TypeError):
             result.invalid += 1
+            continue
+        if is_ad_node_name(config.get("name") if isinstance(config, dict) else None):
+            result.ad_skipped += 1
             continue
         if not _valid_proxy(config):
             result.invalid += 1

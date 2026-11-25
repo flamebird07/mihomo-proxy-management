@@ -43,6 +43,13 @@ def row(config=None, *, gpt=True, region="美国", sync_ms=NOW_MS,
 
 
 class RebuildTests(unittest.TestCase):
+    def test_advertisement_rows_are_not_valid_nodes(self):
+        ad = cfg(name="★!!!网不通重新更新订阅")
+        real = cfg(name="us-01")
+        result = builder.build_proxies([row(ad), row(real)], now_ms=NOW_MS)
+        self.assertEqual([p["name"] for p in result.proxies], ["us-01"])
+        self.assertEqual(result.ad_skipped, 1)
+
     def test_lossless_nested_fields(self):
         nested = cfg(
             name="reality-01", ptype="vless", server="edge.example.com",
