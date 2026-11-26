@@ -57,6 +57,9 @@ def test_build_sync_argv_uses_installed_paths_and_carries_no_secret_values(tmp_p
 
     assert "--speedtest-write" not in argv
     assert "--no-speedtest" not in argv
+    # the host sync and the node pipeline exchange data through Feishu tables
+    # only; the pipeline's local nextin.yaml must not be passed to this job
+    assert "--source1-supplement" not in argv
     assert any(value == "--source1-cache" and argv[i + 1] == layout.provider_file
                for i, value in enumerate(argv))
     assert argv[argv.index("--core") + 1] == binary

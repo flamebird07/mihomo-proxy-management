@@ -113,7 +113,9 @@ def build_sync_argv(layout: Layout, *, binary: str) -> list[str]:
         "--gpt-history-file", os.path.join(state, "feishu-gpt-history.json"),
         "--lock-file", os.path.join(state, "feishu-bitable-sync.lock"),
         "--source-cache-dir", state,
-        "--source1-supplement", os.path.join(layout.providers, "nextin.yaml"),
+        # No --source1-supplement: the two pipelines share no local files.  The
+        # Nextin supplement reaches this host through the 「节点测速总表」 that
+        # the node pipeline owns (read-only table exchange).
         "--source1-cache", os.path.join(state, "source1-cache.yaml"),
         "--source1-cache", layout.provider_file,
         "--source2-cache", os.path.join(state, "source2-cache.yaml"),

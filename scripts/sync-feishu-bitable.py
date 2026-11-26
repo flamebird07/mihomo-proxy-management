@@ -2272,6 +2272,7 @@ def apply_source_cache(result: SourceResult, paths: list[str], log: Logger) -> b
 #: 可测速节点 is the node database on every host; the local cache is only the
 #: last resort when that table cannot be read.
 PIPELINE_NODES_TABLE_NAME = "节点测速总表"
+PIPELINE_SOURCE1_NAME = "飞兔"
 PIPELINE_SOURCE4_NAME = "西瓜加速"
 
 
@@ -4298,9 +4299,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"缓存文件时间={cache_file_time(cache_paths)}"
                 )
 
-        if first is not None and args.source1_supplement:
-            extra = load_cache_nodes([args.source1_supplement], log)
+        if first is not None:
+            # The source-1 supplement (Nextin/app exports) is exchanged through
+            # the shared 「节点测速总表」 only: the host sync must not read the
+            # pipeline's local nextin.yaml.  A failed table read degrades to the
+            # subscription fetch plus source1 caches above.
+            extra = (load_pipeline_source_nodes(client, log, source_name=PIPELINE_SOURCE1_NAME)
+                     if client is not None else [])
             if extra:
+                log.info(f"source1 supplement source=总表 nodes={len(extra)}")
                 if not first.nodes:
                     first.result = "缓存"
                 first.nodes = convert_sub.merge_proxies(first.nodes + extra)
