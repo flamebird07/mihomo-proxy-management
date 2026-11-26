@@ -37,6 +37,12 @@ Order of operations (every step before 3 is read-only):
    the deadline-bounded health gate and the 60 s probe.  Any failure rolls back
    to Nextin with ``scutil --nc start`` only; Always On VPN (On Demand) is
    never modified.
+5. **GPT exit** (best effort, only after a successful switch): the node
+   pipeline's verified US -> SG -> JP pick (:func:`mpm_macos.node_pipeline.
+   ensure_gpt_exit`) runs once.  The selector's default member is
+   ``AUTO-FOREIGN`` and the scheduled pipeline has no ``RunAtLoad``, so
+   without this step GPT stayed on the fastest - often blocked - exit until
+   the next hourly tick.  A failed pick only warns; the core stays in charge.
 
 Nothing here opens a password dialog: a LaunchDaemon already runs as root, and
 ``switch_to_mihomo_root`` is the root phase.  ``--drill-fail`` /
@@ -60,7 +66,8 @@ from mpm_common.sanitize import sanitize
 
 from . import conflict as conflict_mod
 from . import context as context_mod
-from . import lifecycle, probe as probe_mod, switch as switch_mod
+from . import lifecycle, node_pipeline as node_pipeline_mod
+from . import probe as probe_mod, switch as switch_mod
 from . import tun_dns as tun_dns_mod
 
 CONSOLE_DEADLINE_ENV = "MPM_BOOT_CONSOLE_DEADLINE_SECONDS"
@@ -227,6 +234,40 @@ def write_hold_ack(layout) -> None:
     write_atomic(layout.boot_hold_ack, BOOT_HOLD_ACK_TEXT, mode=0o600)
 
 
+def ensure_gpt_exit(
+    ctx: lifecycle.Context,
+    report: lifecycle.Report,
+    *,
+    runner: Callable[..., str | None] | None = None,
+) -> None:
+    """Give GPT a verified exit after the core is in charge (best effort).
+
+    The node pipeline picks a verified US -> SG -> JP exit, but its job is
+    ``StartInterval``-driven: without this step a fresh boot left GPT on its
+    default member (``AUTO-FOREIGN``, the fastest node - often Hong Kong,
+    which OpenAI blocks) until the next hourly tick.  Only a switch that just
+    succeeded reaches here; a failure is a warning because the core is
+    healthy and must not be rolled back over one group.
+    """
+    if not os.path.isfile(ctx.layout.valid_provider_file):
+        # No measured pool yet: GPT is the regional fallback (US -> SG -> JP)
+        # and picks its own member, so there is no selector to switch.
+        return
+    choose = runner or node_pipeline_mod.ensure_gpt_exit
+    try:
+        selected = choose(ctx.layout, say=report.add)
+    except Exception as exc:  # noqa: BLE001 - never fail the switch over one group
+        report.warn("GPT exit selection failed: " + sanitize(str(exc))[:200])
+        return
+    if selected:
+        report.add("GPT exit verified: " + str(selected))
+    else:
+        report.warn(
+            "GPT exit could not be verified; GPT keeps its current member "
+            "(the next node-pipeline tick retries)"
+        )
+
+
 def boot_switch(
     ctx: lifecycle.Context,
     *,
@@ -237,6 +278,7 @@ def boot_switch(
     console_deadline: float | None = None,
     network_deadline: float | None = None,
     vpn_name: str | None = None,
+    gpt_runner: Callable[..., str | None] | None = None,
 ) -> lifecycle.Report:
     """Run the boot entry: wait, then the same root flow as ``mpm-switch mihomo``."""
     report = lifecycle.Report(command="switch")
@@ -371,6 +413,11 @@ def boot_switch(
     report.messages.extend(switched.messages)
     report.warnings.extend(switched.warnings)
     report.data.update(switched.data)
+    if switched.status == "OK":
+        # The switch only proves the core routes traffic; GPT is a selector
+        # whose default member is AUTO-FOREIGN, so it needs the verified pick
+        # here or GPT rides the fastest (often blocked) exit for an hour.
+        ensure_gpt_exit(ctx, report, runner=gpt_runner)
     return report
 
 

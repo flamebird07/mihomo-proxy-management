@@ -129,6 +129,20 @@ def test_missing_service_output_is_recognised():
     assert conflict.is_missing_service_output(SCUTIL_SHOW_ON_DEMAND) is False
 
 
+def test_invalid_service_output_is_recognised():
+    """A profile whose NetworkExtension is gone cannot reconnect."""
+    text = (
+        '  (Invalid)        8B3C0C1A-4472-448A-95B6-5E0D9056D019 VPN '
+        '(com.Tommy.Nextin) "Nextin"  [VPN:com.Tommy.Nextin]\n'
+        'No "VPN" configuration available\n'
+    )
+    assert conflict.is_invalid_service_output(text) is True
+    assert conflict.is_invalid_service_output('No "VPN" configuration available') is True
+    assert conflict.is_invalid_service_output("(Invalid)") is True
+    assert conflict.is_invalid_service_output("No service\n") is False
+    assert conflict.is_invalid_service_output(SCUTIL_SHOW_ON_DEMAND) is False
+
+
 # ---- service states (a stop is not finished while it is Disconnecting) ----
 
 

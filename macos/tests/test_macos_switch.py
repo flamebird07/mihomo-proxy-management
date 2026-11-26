@@ -36,7 +36,10 @@ class VpnExecutor(FakeExecutor):
     what a plain root ``scutil --nc list`` may see.
 
     ``on_demand`` drives ``scutil --nc show``: ``False``/``True`` render the
-    flag, ``None`` makes the command fail with scutil's "No service".
+    flag, ``None`` makes the command fail with scutil's "No service", and
+    ``"invalid"`` renders the real macOS output for a profile whose
+    NetworkExtension is gone (``(Invalid)`` + ``No "VPN" configuration
+    available``) with a ``Disconnected`` status.
     ``reconnect_polls`` makes the VPN come back by itself after that many
     ``--nc list`` polls following a stop (Nextin's Always On VPN behaviour).
     ``status_provider`` / ``status_states`` drive ``scutil --nc status``: with
@@ -49,7 +52,7 @@ class VpnExecutor(FakeExecutor):
         connected: bool = False,
         stubborn: bool = False,
         listeners: tuple[int, ...] = (),
-        on_demand: bool | None = False,
+        on_demand: bool | None | str = False,
         reconnect_polls: int | None = None,
         status_provider=None,
         status_states=None,
@@ -82,6 +85,8 @@ class VpnExecutor(FakeExecutor):
         return (1, "", "")
 
     def _status(self, argv):
+        if self.on_demand == "invalid":
+            return self._result(argv, "Disconnected\n")
         if self.status_provider is not None:
             return self._result(argv, self.status_provider() + "\n")
         if self.status_states:
@@ -95,7 +100,12 @@ class VpnExecutor(FakeExecutor):
         return self._result(argv)
 
     def _nc_list_text(self) -> str:
-        state = "Connected" if self.connected else "Disconnected"
+        if self.connected:
+            state = "Connected"
+        elif self.on_demand == "invalid":
+            state = "Invalid"
+        else:
+            state = "Disconnected"
         return (
             "Available network connection services in the current set:\n"
             f'* ({state})    "{self.vpn_name}" [VPN:com.Tommy.Nextin]\n'
@@ -113,6 +123,13 @@ class VpnExecutor(FakeExecutor):
     def _show(self, argv):
         if self.on_demand is None:
             return Result(tuple(argv), 1, "", "No service\n")
+        if self.on_demand == "invalid":
+            return self._result(
+                argv,
+                '  (Invalid)        8B3C0C1A-4472-448A-95B6-5E0D9056D019 VPN '
+                '(com.Tommy.Nextin) "Nextin"  [VPN:com.Tommy.Nextin]\n'
+                'No "VPN" configuration available\n',
+            )
         return self._result(argv, self._on_demand_text())
 
     def _list(self, argv):
@@ -1227,7 +1244,53 @@ def test_missing_service_without_vpn_may_proceed(tmp_path):
     assert ctx.executor.connected is False, "the user phase never starts the VPN either"
 
 
-def test_missing_service_with_a_connected_vpn_still_refuses(tmp_path):
+def test_invalid_service_configuration_without_a_vpn_may_proceed(tmp_path):
+    """Nextin is only a node source: an (Invalid) profile cannot reconnect."""
+    ctx = _ctx(tmp_path, connected=False, on_demand="invalid")
+    marker = str(tmp_path / "marker")
+    commands: list[str] = []
+
+    report = switch.switch_to_mihomo(
+        ctx,
+        privileged=_marker_writer(marker, commands),
+        uid=501,
+        user="tester",
+        marker=marker,
+    )
+
+    assert report.status == "OK", report.warnings
+    assert len(commands) == 1
+    assert ctx.executor.connected is False
+
+
+def test_root_rollback_does_not_retry_an_invalid_nextin_configuration(
+    tmp_path, monkeypatch
+):
+    """An unusable profile is not reconnected (and does not spin the deadline)."""
+    ctx = _root_ctx(tmp_path, connected=False, on_demand="invalid")
+
+    def fake_start(ctx_arg, *, quiet=False, mode=None, health_guard=None):
+        return lifecycle.Report(command="start", status="OK", data={})
+
+    monkeypatch.setattr(switch.lifecycle, "start", fake_start)
+
+    report = switch.switch_to_mihomo_root(
+        ctx,
+        uid=501,
+        user="tester",
+        probe_runner=lambda: probe.ProbeReport(ok=False, reason="drill"),
+    )
+
+    assert report.status == "FAILED"
+    assert any("--nc stop" in event for event in ctx.executor.events), (
+        "the gate must allow the switch, not refuse before the teardown"
+    )
+    assert not any("--nc start" in event for event in ctx.executor.events)
+    assert ctx.executor.connected is False
+    assert "has no usable VPN configuration" in ctx.err.getvalue()
+
+
+
     """An unknown service must not excuse a connected VPN."""
     ctx = _ctx(tmp_path, connected=True, on_demand=None)
     ctx.executor.events.clear()

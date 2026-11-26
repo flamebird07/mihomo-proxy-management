@@ -419,8 +419,11 @@ class OnDemandState:
 
     ``value`` is ``True``/``False`` when the flag was parsed and ``None`` when
     it could not be read (command failed, line missing, contradictory lines).
-    ``service_missing`` records scutil's "No service": the VPN does not exist
-    at all, which is the only ``None`` that may still proceed.
+    ``service_missing`` records that the VPN has no usable service - scutil's
+    "No service" (the profile does not exist) or an ``(Invalid)`` profile with
+    no configuration (its NetworkExtension is gone).  Neither can reconnect,
+    so this is the only ``None`` that may still proceed, and only while no VPN
+    is connected.
     """
 
     value: bool | None = None
@@ -450,12 +453,16 @@ class OnDemandVerdict:
 def _read_on_demand(executor: Executor, argv: list[str]) -> OnDemandState:
     result = executor.run(argv)
     text = (result.stdout or "") + "\n" + (result.stderr or "")
-    # "No service" is recognised from the *merged* output whatever the return
-    # code is: it is the single exception that lets the switch continue, so it
-    # must not depend on scutil's exit status (a version that reports the
-    # condition on stdout while exiting 0 would otherwise be read as "the flag
-    # is unreadable" and fail closed).
-    service_missing = conflict_mod.is_missing_service_output(text)
+    # "No service" / "(Invalid)" is recognised from the *merged* output whatever
+    # the return code is: it is the single exception that lets the switch
+    # continue, so it must not depend on scutil's exit status (a version that
+    # reports the condition on stdout while exiting 0 would otherwise be read
+    # as "the flag is unreadable" and fail closed on a machine that has no
+    # usable VPN at all).
+    service_missing = (
+        conflict_mod.is_missing_service_output(text)
+        or conflict_mod.is_invalid_service_output(text)
+    )
     if not result.ok:
         detail = HOST.text(text.strip())[:160] or f"scutil exited {result.returncode}"
         return OnDemandState(None, detail, service_missing=service_missing)
@@ -489,8 +496,9 @@ def on_demand_refusal(
     * ``TRUE`` -> refuse: the system will reconnect the VPN right after the
       stop, so mihomo would race a live NetworkExtension;
     * ``None`` -> refuse (fail closed): an unreadable flag may well be on;
-    * ``None`` + "No service" + nothing connected -> allow: the service does
-      not exist, so there is nothing that could reconnect behind us;
+    * ``None`` + no usable service ("No service" or an ``(Invalid)`` profile
+      with no configuration) + nothing connected -> allow: such a VPN cannot
+      reconnect behind us;
     * ``FALSE`` -> allow.
 
     Nothing here ever *changes* Always On VPN (On Demand).
@@ -1126,6 +1134,24 @@ def status(ctx: lifecycle.Context) -> lifecycle.Report:
 # ---- rollback -------------------------------------------------------------
 
 
+def _nextin_unusable_as_user(
+    executor: Executor, *, name: str, uid: int, user: str
+) -> bool:
+    """Whether Nextin has no usable configuration and nothing is connected.
+
+    Nextin is only a node source for this project (its subscription can be
+    expired or its NetworkExtension removed), so a rollback must not spend the
+    connect deadline - or claim a reconnect - on a profile that cannot come up.
+    Unknown reads never skip the reconnect.
+    """
+    try:
+        state = read_on_demand_as_user(executor, name, uid=uid, user=user)
+        connections = connected_vpns_as_user(executor, uid=uid, user=user)
+    except Exception:  # noqa: BLE001 - unknown must not turn into "skip"
+        return False
+    return state.service_missing and not connections
+
+
 def _root_rollback(
     ctx: lifecycle.Context, *, name: str, uid: int, user: str
 ) -> bool:
@@ -1163,6 +1189,14 @@ def _root_rollback(
             sanitize(
                 "[FAIL] run `mpm-switch nextin` once mihomo has stopped, or "
                 "resolve the leftover core manually\n"
+            )
+        )
+        return False
+    if _nextin_unusable_as_user(ctx.executor, name=name, uid=uid, user=user):
+        ctx.err.write(
+            sanitize(
+                f"[WARN] {name} 没有可用的 VPN 配置（Invalid）；不回连 / "
+                f"{name} has no usable VPN configuration; not reconnecting\n"
             )
         )
         return False

@@ -37,7 +37,10 @@ FEISHU_SYNC_LABEL = f"com.{PROJECT}.feishu-sync"
 XIGUA_IPPOOL_LABEL = f"com.{PROJECT}.xigua-ippool"
 #: Fourth system job: the node pipeline (port of upstream ``run-node-pipeline``):
 #: collect -> ops (probe/gate) -> provide (valid-node file provider) -> stable
-#: GPT switch.  StartInterval-driven like the Feishu sync, never at boot.
+#: GPT switch.  StartInterval-driven like the Feishu sync, never at boot; the
+#: boot entry runs only the GPT selection step (``ensure_gpt_exit``) after the
+#: core is in charge, because a fresh selector otherwise stays on its default
+#: member until the first hourly tick.
 NODE_PIPELINE_LABEL = f"com.{PROJECT}.node-pipeline"
 BINARY_NAME = "mihomo"
 RUNNER_NAME = "runner"

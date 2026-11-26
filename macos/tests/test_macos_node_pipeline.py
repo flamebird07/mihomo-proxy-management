@@ -537,6 +537,41 @@ def test_switch_gpt_defers_when_live_provider_reload_is_pending(tmp_path):
     assert fake.puts == []
 
 
+def test_ensure_gpt_exit_reconciles_the_provider_before_switching(tmp_path):
+    """A provider rebuilt while the core was down left a stale hash marker."""
+    layout = _ready(tmp_path)
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(layout.valid_provider_file).write_text("proxies: []\n", encoding="utf-8")
+    order: list[str] = []
+
+    def refresh(_layout, *, say):
+        order.append("refresh")
+        return True
+
+    def switch(_layout, *, say):
+        order.append("switch")
+        return "US fast"
+
+    selected = node_pipeline.ensure_gpt_exit(
+        layout, say=lambda _m: None, refresh=refresh, switch=switch)
+
+    assert selected == "US fast"
+    assert order == ["refresh", "switch"]
+
+
+def test_ensure_gpt_exit_skips_without_a_valid_provider(tmp_path):
+    """No measured pool: GPT is the regional fallback and picks its own member."""
+    layout = _ready(tmp_path)
+    lines: list[str] = []
+
+    def switch(_layout, *, say):  # pragma: no cover - must never be called
+        raise AssertionError("switch_gpt must not run without a valid provider")
+
+    assert node_pipeline.ensure_gpt_exit(
+        layout, say=lines.append, switch=switch) is None
+    assert any("regional fallback" in line for line in lines)
+
+
 @pytest.mark.parametrize(
     ("response", "accepted"),
     [(b"HTTP/2 200\r\ncontent-type: text/html\r\n\r\n<body>ChatGPT</body>", True),

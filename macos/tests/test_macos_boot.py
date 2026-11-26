@@ -300,6 +300,109 @@ def test_a_running_core_with_nextin_up_still_runs_the_switch(tmp_path, monkeypat
     assert ctx.executor.connected is False
 
 
+# ---- GPT exit after the switch ------------------------------------------
+
+
+def _make_valid_provider(ctx) -> None:
+    os.makedirs(ctx.layout.providers, exist_ok=True)
+    with open(ctx.layout.valid_provider_file, "w", encoding="utf-8") as handle:
+        handle.write("proxies:\n  - name: US fast\n    type: ss\n")
+
+
+def test_boot_picks_a_verified_gpt_exit_after_the_switch(tmp_path, monkeypatch):
+    """The selector defaults to AUTO-FOREIGN; boot must run the verified pick."""
+    ctx = _root_ctx(tmp_path, connected=True)
+    _make_valid_provider(ctx)
+    monkeypatch.setattr(switch.lifecycle, "start", _start_ok)
+    calls: list[str] = []
+
+    def gpt(layout, *, say):
+        calls.append(layout.valid_provider_file)
+        say("gpt pick ran")
+        return "US fast"
+
+    report = boot.boot_switch(
+        ctx,
+        console_reader=_console_ready,
+        route_reader=_route_ready,
+        probe_runner=lambda: probe.ProbeReport(ok=True),
+        gpt_runner=gpt,
+    )
+
+    assert report.status == "OK", report.warnings
+    assert calls == [ctx.layout.valid_provider_file]
+    assert any("GPT exit verified: US fast" in message for message in report.messages)
+    assert not any("--nc start" in event for event in ctx.executor.events)
+
+
+def test_boot_gpt_pick_failure_is_a_warning_not_a_rollback(tmp_path, monkeypatch):
+    ctx = _root_ctx(tmp_path, connected=True)
+    _make_valid_provider(ctx)
+    monkeypatch.setattr(switch.lifecycle, "start", _start_ok)
+
+    def gpt(_layout, *, say):
+        raise RuntimeError("controller unreachable")
+
+    report = boot.boot_switch(
+        ctx,
+        console_reader=_console_ready,
+        route_reader=_route_ready,
+        probe_runner=lambda: probe.ProbeReport(ok=True),
+        gpt_runner=gpt,
+    )
+
+    assert report.status == "OK"
+    assert any("GPT exit selection failed" in warning for warning in report.warnings)
+    assert not any("--nc start" in event for event in ctx.executor.events)
+
+
+def test_boot_does_not_pick_gpt_without_a_valid_provider(tmp_path, monkeypatch):
+    """No node-valid pool: GPT is the regional fallback, there is no selector."""
+    ctx = _root_ctx(tmp_path, connected=True)
+    monkeypatch.setattr(switch.lifecycle, "start", _start_ok)
+    called: list[bool] = []
+
+    def gpt(_layout, *, say):  # pragma: no cover - must never be called
+        called.append(True)
+        return "US fast"
+
+    report = boot.boot_switch(
+        ctx,
+        console_reader=_console_ready,
+        route_reader=_route_ready,
+        probe_runner=lambda: probe.ProbeReport(ok=True),
+        gpt_runner=gpt,
+    )
+
+    assert report.status == "OK"
+    assert called == []
+
+
+def test_already_in_charge_does_not_restart_the_gpt_pick(tmp_path):
+    """A kickstart over a working core keeps its zero-work contract."""
+    ctx = _root_ctx(tmp_path, connected=False)
+    _make_valid_provider(ctx)
+    harness = LaunchdHarness(ctx.executor)
+    harness.loaded = True
+    harness.running = True
+    called: list[bool] = []
+
+    def gpt(_layout, *, say):  # pragma: no cover - must never be called
+        called.append(True)
+        return "US fast"
+
+    report = boot.boot_switch(
+        ctx,
+        console_reader=_console_ready,
+        route_reader=_route_ready,
+        gpt_runner=gpt,
+    )
+
+    assert report.status == "OK"
+    assert report.data["already_in_charge"] is True
+    assert called == []
+
+
 # ---- deadlines ------------------------------------------------------------
 
 

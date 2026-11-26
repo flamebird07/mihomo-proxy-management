@@ -285,6 +285,13 @@ core（`com.mihomo-proxy-management.core`）**永远不在开机时启用**。�
    原 PID 退出 + 端口释放 → 3–5 秒稳定窗口 → 冲突检测 → `start`（成功后仍 `disable` core）
    → 启动后复检 Nextin → deadline 健康检查 → 60 秒探测 → 任何失败回滚到 Nextin
    （只 `scutil --nc start`，**不改** Always On VPN）。
+5. **GPT 出口（切换成功后的 best effort 步骤）**：`GPT` 是 select 组，默认成员是
+   `AUTO-FOREIGN`（最快节点，常是 OpenAI 不支持的香港）；node-pipeline 作业只有
+   `StartInterval`、不在开机跑，所以过去开机后 GPT 会停在 `AUTO-FOREIGN` 直到第一个
+   整点 tick。现在开机入口在 core 就绪后调用一次
+   `node_pipeline.ensure_gpt_exit`（先对齐 `node-valid` provider，再执行已验证的
+   美国 → 新加坡 → 日本选择）。这一步失败**只告警、不回滚**：core 仍然健康，
+   下一个 node-pipeline tick 会重试。
 
 **Always On VPN（On Demand）必须保持关闭**：它是 `scutil` 的 `OnDemandEnabled : TRUE`。
 该标志为 `TRUE`（或读不到）时，开机入口**拒绝**启动 mihomo（只报告原因），因为系统会在
@@ -578,8 +585,11 @@ mpm-switch status   # 谁在接管：Nextin 连接状态 / mihomo launchd 状态
   disable Always On VPN (On Demand) in the Nextin app first”，
   并明确说明**没有停止 VPN、没有弹出密码框、没有修改代理**；
 * 读不到（命令失败、字段缺失、两行互相矛盾）→ 同样拒绝（fail closed），并给出原因；
-  **例外**：`scutil` 明确报 `No service`（VPN 服务根本不存在）且当前没有任何 VPN 连接时允许继续
-  —— 不存在的东西不会在背后重连；
+  **例外**：`scutil` 明确报 `No service`（VPN 服务根本不存在）或服务显示 `(Invalid)` /
+  `No "VPN" configuration available`（配置已无 NetworkExtension，无法连接）且当前没有任何
+  VPN 连接时允许继续 —— 连不上的东西不会在背后重连。Nextin 对本项目只是**可选的节点来源**
+  （订阅到期或 App 被移除时不需要它的任何数据），因此失效的 Nextin 配置不会阻塞开机切换
+  或 `mpm-switch mihomo`；回滚时也不会为一个不可用的配置空等 60 秒连接超时；
 * `FALSE` → 继续。root 阶段在 `scutil --nc stop` 之前会再读一次（走
   `launchctl asuser` 的用户会话），`TRUE` 则不 stop、直接拒绝；这种拒绝以**专用退出码
   `5`** 结束并**不进入回滚**（没有 stop、没有 `launchctl disable`、没有 `scutil --nc start`），
@@ -889,6 +899,14 @@ sudo /usr/local/bin/mihomo-proxy-management groups [--json]
  5 switch_gpt                         在刷新后读取 GPT 成员。按真实出口美国 → 新加坡 → 日本
                                       逐级选择，同级取 trace 延迟最低的合格节点
 ```
+
+**开机也要跑第 5 步**：这个作业没有 `RunAtLoad`，开机后要到第一个整点 tick 才会执行
+`switch_gpt`；而 `GPT` 是 select 组，core 刚启动时它的成员是默认的 `AUTO_FOREIGN`
+（最快节点，常是 OpenAI 不支持的香港），于是“开机后 GPT 连不上”。现在开机入口
+（boot-switch）在切换成功、core 就绪后执行一次
+`node_pipeline.ensure_gpt_exit`（先 `maybe_refresh_provider` 对齐落地文件与
+`provider.sha256` 标记，再 `switch_gpt`）。失败只记警告，不回滚 core；
+`node-valid.yaml` 不存在时跳过（此时 GPT 是区域 fallback，自己会选）。
 
 **有效节点分配模式（valid_nodes）**：渲染器检测 `providers/node-valid.yaml` 是否存在——
 存在时（第 4 步翻转后）`GPT` 使用 **select 组**（`use: [node-valid]`，成员是实测过关的

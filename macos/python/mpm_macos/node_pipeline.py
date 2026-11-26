@@ -133,7 +133,12 @@ def prerequisites(layout: Layout) -> tuple[int, list[str]]:
 def supplement_files(layout: Layout) -> list[str]:
     """Existing supplement files: the landing directory + the extracted
     ``nextin.yaml`` (legacy path).  Sorted for a stable argv; missing files
-    are skipped (node_provider would only warn)."""
+    are skipped (node_provider would only warn).
+
+    These are inputs owned by the node pipeline: the host sync
+    (``feishu-sync``) never reads them; it obtains the same nodes from the
+    「节点测速总表」 this pipeline publishes.
+    """
     import glob
 
     files = sorted(glob.glob(os.path.join(layout.supplements_dir, "*.yaml")))
@@ -520,6 +525,35 @@ def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
         raise RuntimeError("GPT selection could not be verified")
     say(f"node-pipeline: GPT -> {details} (was {current})")
     return best_name
+
+
+def ensure_gpt_exit(
+    layout: Layout,
+    *,
+    say: Callable[[str], None] = print,
+    refresh: Callable[..., bool] | None = None,
+    switch: Callable[..., str | None] | None = None,
+) -> str | None:
+    """Select a verified GPT exit once the core is in charge (boot step).
+
+    The scheduled pipeline already ends with :func:`switch_gpt`, but its job
+    only has ``StartInterval``: the first tick lands one interval after load,
+    so right after a boot GPT stayed on its default member (``AUTO-FOREIGN``,
+    the fastest node - often Hong Kong, which OpenAI blocks).  The boot entry
+    calls this so "switched to mihomo" and "GPT has a working exit" are the
+    same event.
+
+    The provider reload comes first on purpose: a tick that rebuilt
+    ``node-valid.yaml`` while the core was stopped could not write the
+    ``provider.sha256`` marker, so :func:`switch_gpt` would defer on that
+    mismatch until the next hourly tick.  The core reads the provider from
+    disk on start, so one reload reconciles the marker.
+    """
+    if not os.path.isfile(layout.valid_provider_file):
+        say("node-pipeline: no node-valid provider; GPT uses its regional fallback")
+        return None
+    (refresh or maybe_refresh_provider)(layout, say=say)
+    return (switch or switch_gpt)(layout, say=say)
 
 
 def apply_presence(

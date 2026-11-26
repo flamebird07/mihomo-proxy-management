@@ -121,6 +121,14 @@ _ON_DEMAND = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _NO_SERVICE = re.compile(r"\bNo\s+service\b", re.IGNORECASE)
+#: ``scutil --nc show <name>`` for a profile whose NetworkExtension is gone:
+#: the service line reads ``(Invalid)`` and the body says
+#: ``No "VPN" configuration available`` (macOS 14, 2026-11-26).  Such a
+#: profile cannot connect, so it is not a VPN that could come back behind us.
+_INVALID_SERVICE = re.compile(
+    r"\(Invalid\)|\bNo\s+\"?VPN\"?\s+configuration\s+available",
+    re.IGNORECASE,
+)
 
 
 def parse_scutil_nc_list(text: str) -> list[VpnConnection]:
@@ -173,6 +181,17 @@ def parse_on_demand_enabled(text: str) -> bool | None:
 def is_missing_service_output(text: str) -> bool:
     """Whether ``scutil`` said the VPN service does not exist ("No service")."""
     return bool(_NO_SERVICE.search(text or ""))
+
+
+def is_invalid_service_output(text: str) -> bool:
+    """Whether ``scutil`` reported a VPN whose configuration is unusable.
+
+    An ``(Invalid)`` profile / ``No "VPN" configuration available`` cannot
+    connect, so it can never reconnect behind a switch either.  Callers pair
+    this with "no VPN is connected" before treating it as nothing to tear
+    down - an unknown service must never excuse a live VPN.
+    """
+    return bool(_INVALID_SERVICE.search(text or ""))
 
 
 def parse_nc_status(text: str) -> str:
@@ -517,6 +536,7 @@ __all__ = [
     "describe",
     "detect",
     "in_project_block",
+    "is_invalid_service_output",
     "is_missing_service_output",
     "is_project_executable",
     "launchd_pid",
