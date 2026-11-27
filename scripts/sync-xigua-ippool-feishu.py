@@ -244,9 +244,11 @@ def parse_args(argv=None):
     parser.add_argument("--cursor", default=DEFAULT_CURSOR)
     parser.add_argument("--lock", default=DEFAULT_LOCK)
     parser.add_argument("--log-file", default=DEFAULT_LOG)
-    parser.add_argument("--env-file", default=base.DEFAULT_ENV_FILE)
+    parser.add_argument("--env-file", default=None)
     parser.add_argument("--app-token", default=base.DEFAULT_APP_TOKEN)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.env_file = args.env_file or base.default_env_file()
+    return args
 
 
 def main(argv=None) -> int:
