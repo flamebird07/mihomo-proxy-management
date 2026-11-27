@@ -2,7 +2,7 @@
 
 > **读者**：Windows 侧与 macOS 侧的开发者/Agent。两端**异步开发**，本文件是双方必须
 > 共同维护的"接口契约"——改动任何一侧的共享逻辑，先读这里，改完更新这里。
-> 最后更新：2026-11-27（流水线脚本去掉内置 app_token，表格地址改由部署机器提供；前版 2026-11-20 Windows 接入自检 + 测试基线）。
+> 最后更新：2026-11-28（Windows 纯飞书池流水线按真实入口运行：同一安装 env 文件下发、无源时跳过 collect、非零不遮盖；前版 2026-11-27 流水线脚本去掉内置 app_token）。
 
 ## 1. 一句话架构
 
@@ -37,6 +37,17 @@
 ```
 
 **自动分配只消费链 B**（总表→有效节点→本机 provider）。链 A 的表 2 不喂分配。
+
+**Windows 纯飞书池的流水线入口（2026-11-28）**：`scripts/run-node-pipeline.py` 的 pool 模式
+不再无条件传仓库内 `config/subscription.env`（新机没有该文件，真实 `node_provider` 会以退出码 2
+每轮必败）。改为选择当前安装的 env 文件（Windows=`MIHOMO_DIR\subscription.env`；解析见
+`portable_paths.default_env_file`），并把**同一个 env 文件**显式传给 collect/pool/ops/provide。
+collect 只在两类输入之一可用时运行：安装 env 或仍有效的仓库源文件里配置了 `SUBSCRIPTION_URL_n`，
+或存在可用的 source4（西瓜加速）App 输入；两者都没有时记 `SKIP collect` 日志，正常跑
+pool/ops/provide。非零退出码一律算失败（`node_provider` 的 3 同时表示写权限/API 故障，不再当
+"空采集"吞掉）。pool 模式的 ops `--core` 与 provide `--output` 都取 `MIHOMO_DIR` 下的安装路径；
+订阅模式三个旧 argv 语义不变。`scripts/render_config.py`：显式给了 `--output` 时，即使输入已是
+目标形状也写出该文件；默认原地重复（无 `--output` 且 changed=False）不重写。
 
 **表2 数据来源（2026-11-21，影响两端）**：西瓜加速没有订阅 URL，链 A 每轮优先读链 B 的
 「节点测速总表」作为其节点清单（按 来源 过滤、按 节点名 去重、取 节点配置JSON），
