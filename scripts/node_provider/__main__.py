@@ -36,12 +36,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import app_extract, schema
-from .envfile import EnvFileError, read_env_file, resolve_app_token
+from .envfile import EnvFileError, default_env_file, read_env_file, resolve_app_token
 from .feishu import FeishuClient
 from .lock import FileLock, LockBusy
 from .logutil import stderr_logger
-from .runner import (DEFAULT_APP_TOKEN, DEFAULT_ENV_FILE, EXIT_USAGE,
-                     Settings, run, run_collect)
+from .runner import (DEFAULT_APP_TOKEN, EXIT_USAGE, Settings, run, run_collect)
 from .subscription import DEFAULT_FETCH_PROXY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -82,8 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
                         help="Feishu Bitable app_token (--app-token > env "
                              "FEISHU_BITABLE_APP_TOKEN > --env-file); no default")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                        help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET")
+    parser.add_argument("--env-file", default=None,
+                        help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET "
+                             "(default: install dir subscription.env on Windows, "
+                             "else ~/.hermes/.env)")
     parser.add_argument("--table-name", default=schema.VALID_TABLE_NAME,
                         help="source table name (default: 有效节点)")
     parser.add_argument("--all-valid", action="store_true",
@@ -160,7 +161,8 @@ def main(argv: Optional[List[str]] = None, client_factory=FeishuClient,
 
     # The table address is the deployment's own: explicit flag, then the
     # process environment, then the env file.  There is no built-in default.
-    values = _load_env(args.env_file, logger)
+    env_file = args.env_file or default_env_file()
+    values = _load_env(env_file, logger)
     app_token = resolve_app_token(args.app_token, values or {}, os.environ)
     logger.add_secret(app_token)
     credentials = _credentials_from(values, logger)

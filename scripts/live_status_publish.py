@@ -59,6 +59,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from portable_paths import default_env_file, portable_path  # noqa: E402
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -66,7 +70,7 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 # never hardcoded.
 DEFAULT_APP_TOKEN = None
 APP_TOKEN_ENV_KEY = "FEISHU_BITABLE_APP_TOKEN"
-DEFAULT_ENV_FILE = r"C:\Users\Administrator\.hermes\.env"
+DEFAULT_ENV_FILE = portable_path(r"C:\Users\Administrator\.hermes\.env")
 DEFAULT_LOG_FILE = r"C:\mihomo\logs\live-status-publish.log"
 DEFAULT_LOCK_FILE = r"C:\mihomo\live-status-publish.lock"
 DEFAULT_ALERT_STATE_FILE = r"C:\mihomo\state\live-status-publish-alert-state.json"
@@ -1142,8 +1146,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"data age above which 数据是否陈旧=是 (default {DEFAULT_STALE_MINUTES})")
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
                         help="Bitable app token (overrides env FEISHU_BITABLE_APP_TOKEN and the env file)")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                        help="file holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN")
+    parser.add_argument("--env-file", default=None,
+                        help="file holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN "
+                             "(default: install dir subscription.env on Windows, "
+                             "else ~/.hermes/.env)")
     parser.add_argument("--table-id", default=None,
                         help=f"skip the {TABLE_NAME} table lookup and use this table_id")
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE,
@@ -1247,6 +1253,7 @@ def publish(args, log: Logger, client_factory: Callable[[Any, Logger], Any]) -> 
 def main(argv=None, client_factory: Callable[[Any, Logger], Any] | None = None,
          lock_factory: Callable[[str, Logger], Any] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.env_file = args.env_file or default_env_file()
     log = Logger(args.log_file, verbose=args.verbose)
     mode = "init" if args.init else ("apply" if args.apply else "dry-run")
     started = time.time()

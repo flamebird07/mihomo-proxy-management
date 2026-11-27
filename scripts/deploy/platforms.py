@@ -92,7 +92,10 @@ class MacosPlatform(bootstrap.Platform):
         argv = [self.python, "-m", "mpm_macos.cli", "install"]
         if not request.start:
             argv.append("--no-start")
-        return subprocess.call(argv, env=env, cwd=self.repo_root)
+        # The install child's stdout belongs on stderr: with --json the CLI must
+        # emit exactly one JSON value on stdout.
+        return subprocess.call(argv, env=env, cwd=self.repo_root,
+                               stdout=sys.stderr)
 
 
 class WindowsPlatform(bootstrap.Platform):
@@ -124,10 +127,16 @@ class WindowsPlatform(bootstrap.Platform):
     def install(self, request: bootstrap.InstallRequest) -> int:
         script = ntpath.join(self.repo_root, "scripts", "deploy.ps1")
         argv = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
-                "Bypass", "-File", script, "-StagingDir", request.staging_dir]
+                "Bypass", "-File", script, "-Phase", "Install",
+                "-StagingDir", request.staging_dir]
         if not request.start:
             argv.append("-NoStart")
-        return subprocess.call(argv, cwd=self.repo_root)
+        # Pin the install dir for the Install phase; MPM_PYTHON (the interpreter
+        # the bootstrap selected) is already inherited from the current process.
+        env = dict(os.environ)
+        env["MIHOMO_DIR"] = self.install_dir
+        return subprocess.call(argv, env=env, cwd=self.repo_root,
+                               stdout=sys.stderr)
 
 
 def get_platform(name: str, repo_root: str, environ=None) -> bootstrap.Platform:

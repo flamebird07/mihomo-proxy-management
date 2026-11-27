@@ -47,6 +47,11 @@ install_dir/providers/*.yaml
 install_dir/providers/*.yml
 !install_dir/providers/.gitkeep
 
+# The bootstrap-written Feishu node pool carries node credentials.  The default
+# install dir is already covered above; this catches a custom install dir that
+# lives inside the repository, without changing any existing exception.
+**/providers/feishu-pool.yaml
+
 # Linux side artifacts (staging roots, caches, build/test droppings).
 linux/.mpm-root/
 linux/**/__pycache__/

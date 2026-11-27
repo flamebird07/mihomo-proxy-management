@@ -7,6 +7,11 @@ rem path, so the same file works in the offline copy and in production.
 cd /d "%~dp0.."
 if errorlevel 1 exit /b 1
 
+rem The bootstrap registers this task with a pinned absolute interpreter (the
+rem machine-wide Python installed during bootstrap); manual runs keep using
+rem the PATH python.  MPM_PYTHON is set in the generated launcher, never taken
+rem from a transient shell.
+
 rem stdout and stderr go to a file of their own. cmd keeps the redirect handle
 rem open for the whole run, and that handle blocks sync-feishu-bitable.py's
 rem Logger from opening its own log file (PermissionError, errno 13), which
@@ -19,10 +24,18 @@ rem run non-zero even when a later stage succeeds.
 set "sync_exit=0"
 set "switch_exit=0"
 
-python scripts\sync-feishu-bitable.py >> "%BILL_LOG_DIR%\feishu-bitable-sync.stdout.log" 2>&1
+if defined MPM_PYTHON (
+  "%MPM_PYTHON%" scripts\sync-feishu-bitable.py >> "%BILL_LOG_DIR%\feishu-bitable-sync.stdout.log" 2>&1
+) else (
+  python scripts\sync-feishu-bitable.py >> "%BILL_LOG_DIR%\feishu-bitable-sync.stdout.log" 2>&1
+)
 set "sync_exit=%ERRORLEVEL%"
 
-python scripts\proxy-auto-switch.py >> "%BILL_LOG_DIR%\proxy-auto-switch-stdout.log" 2>&1
+if defined MPM_PYTHON (
+  "%MPM_PYTHON%" scripts\proxy-auto-switch.py >> "%BILL_LOG_DIR%\proxy-auto-switch-stdout.log" 2>&1
+) else (
+  python scripts\proxy-auto-switch.py >> "%BILL_LOG_DIR%\proxy-auto-switch-stdout.log" 2>&1
+)
 set "switch_exit=%ERRORLEVEL%"
 
 echo SYNC_RESULT exit=%sync_exit%

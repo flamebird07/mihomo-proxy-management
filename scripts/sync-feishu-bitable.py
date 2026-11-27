@@ -62,7 +62,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import convert_sub  # noqa: E402  (same directory, project-local converter)
-from portable_paths import portable_core, portable_path  # noqa: E402
+from portable_paths import default_env_file, portable_core, portable_path  # noqa: E402
 
 try:
     import yaml  # noqa: F401  (convert_sub already requires it)
@@ -4042,8 +4042,10 @@ def select_write_keys(speedtest_ran: bool, speedtest_write: bool,
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync mihomo status into a Feishu Bitable.")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                        help="File holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN")
+    parser.add_argument("--env-file", default=None,
+                        help="File holding FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_BITABLE_APP_TOKEN "
+                             "(default: install dir subscription.env on Windows, "
+                             "else ~/.hermes/.env)")
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
                         help="Bitable app token (overrides env FEISHU_BITABLE_APP_TOKEN and the env file)")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
@@ -4101,7 +4103,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Max geo probes for delay-dead leaves (0 = time sub-budget only)")
     parser.add_argument("--keep-placeholder", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.env_file = args.env_file or default_env_file()
+    return args
 
 
 def print_summary(tables: dict[str, dict[str, str]], script_path: str, results: list[SourceResult],

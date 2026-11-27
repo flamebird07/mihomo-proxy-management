@@ -176,6 +176,32 @@ notepad C:\mihomo\subscription.env   # 填 SUBSCRIPTION_URL / SECRET
 4. 注册 `MihomoProxy` 计划任务（开机 + 崩溃自动启动）
 5. 立即拉起服务并验证
 
+### 飞书供池（从 GitHub 引导，无订阅 URL）
+
+新机也可以不填订阅链接，改用飞书「节点测速总表」供池。功能分支
+`feat/github-bootstrap-deploy` 交付（尚未并入 `main`），完整前置条件、飞书授权、
+`--dry-run` / `--no-start` / `--skip-supply` / `--skip-install` / `--min-nodes` 语义、
+池刷新与排错见 [docs/GITHUB-DEPLOY.md](docs/GITHUB-DEPLOY.md)。
+
+```bash
+# Apple Silicon Mac（root）；需 Python ≥ 3.9 + venv
+git clone https://github.com/flamebird07/mihomo-proxy-management.git
+cd mihomo-proxy-management && git checkout feat/github-bootstrap-deploy
+sudo ./macos/scripts/bootstrap.sh
+```
+
+```powershell
+# Windows x64（amd64-v3 核心），以管理员身份运行
+git clone https://github.com/flamebird07/mihomo-proxy-management.git
+cd mihomo-proxy-management; git checkout feat/github-bootstrap-deploy
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy.ps1
+```
+
+引导会校验飞书应用的读权限、用「部署记录」做一次真实写入证明写权限，按摘要锁下载
+mihomo/Geo 资产，生成 `providers\feishu-pool.yaml`，再写本机凭据并安装。凭据只来自
+环境变量（`MPM_FEISHU_*`）、stdin JSON 或隐藏交互，绝不写进命令行；真实值不会进 Git。
+只验证不安装可加 `--skip-supply --skip-install`（Windows：`-SkipSupply -SkipInstall`）。
+
 ---
 
 ## 管理命令 / Management
@@ -264,6 +290,7 @@ mihomo-proxy-management/
 │   └── subscription.env.example   # 配置示例（不含凭证）
 ├── docs/
 │   ├── ARCHITECTURE.md            # 详细架构 / 故障排查（Windows）
+│   ├── GITHUB-DEPLOY.md           # 从 GitHub 用飞书供池部署 macOS / Windows 新机
 │   ├── LINUX.md                   # Linux 系统部署：支持矩阵 / 降级 / 供应链 / 生命周期
 │   └── hermes-mihomo-SKILL.md     # Hermes 技能修正稿（脱敏）
 ├── linux/                         # Linux 实现（唯一生命周期逻辑 = python/mpm）

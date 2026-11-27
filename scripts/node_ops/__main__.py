@@ -26,12 +26,12 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .envfile import EnvFileError, read_env_file, resolve_app_token
+from .envfile import EnvFileError, default_env_file, read_env_file, resolve_app_token
 from .feishu import FeishuClient, FeishuError
 from .lock import FileLock, LockBusy
 from .logutil import Logger
 from .probe import default_core_path
-from .runner import DEFAULT_APP_TOKEN, DEFAULT_ENV_FILE, RunError, Settings, run
+from .runner import DEFAULT_APP_TOKEN, RunError, Settings, run
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG_FILE = str(PROJECT_ROOT / "logs" / "node_ops.log")
@@ -59,8 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
                         help="Feishu Bitable app_token (--app-token > env "
                              "FEISHU_BITABLE_APP_TOKEN > --env-file); no default")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
-                        help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET")
+    parser.add_argument("--env-file", default=None,
+                        help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET "
+                             "(default: install dir subscription.env on Windows, "
+                             "else ~/.hermes/.env)")
     parser.add_argument("--core", default=default_core_path(),
                         help="mihomo core binary for the isolated probe")
     parser.add_argument("--probe-timeout-ms", type=int, default=5000,
@@ -103,7 +105,7 @@ def _credentials(settings: Settings, log: Logger,
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     settings = Settings(
-        env_file=args.env_file,
+        env_file=args.env_file or default_env_file(),
         app_token=args.app_token or "",
         workers=args.workers,
         total_budget_s=args.total_budget,

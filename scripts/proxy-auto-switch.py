@@ -67,7 +67,7 @@ if not (_HERE / "gpt_switch_entry.py").exists():
 import gpt_switch_entry
 import named_mutex_lock
 from gpt_stability_policy import NodeSnapshot, PolicyConfig
-from portable_paths import portable_path as portable_default
+from portable_paths import default_env_file, portable_path as portable_default
 
 DEFAULT_CONTROLLER = "http://127.0.0.1:9090"
 DEFAULT_TARGET = "https://chatgpt.com/robots.txt"
@@ -955,7 +955,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument("--timeout-ms", type=int, default=7000)
     parser.add_argument("--workers", type=int, default=12)
-    parser.add_argument("--env-file", default=DEFAULT_ENV_FILE)
+    parser.add_argument("--env-file", default=None,
+                        help="credentials env file (default: install dir "
+                             "subscription.env on Windows, else ~/.hermes/.env)")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     parser.add_argument("--alert-log", default=DEFAULT_ALERT_LOG)
@@ -982,7 +984,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retry-current", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.env_file = args.env_file or default_env_file()
+    return args
 
 
 def collect_candidates(proxies: dict[str, dict], groups: dict[str, dict]) -> list[str]:

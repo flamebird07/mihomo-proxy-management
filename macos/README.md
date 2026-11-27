@@ -72,6 +72,7 @@ macos/tests/                           host-free 测试（test_macos_*.py + maco
 /usr/local/share/mihomo-proxy-management/templates/
 /Library/Application Support/mihomo-proxy-management/config.yaml          (0600)
 /Library/Application Support/mihomo-proxy-management/providers/subscription.yaml
+/Library/Application Support/mihomo-proxy-management/providers/feishu-pool.yaml (0600，纯飞书供池)
 /Library/Application Support/mihomo-proxy-management/{GeoIP.dat,GeoSite.dat,Country.mmdb} (0644)
 /Library/Application Support/mihomo-proxy-management/state/subscription.env (0600)
 /Library/Application Support/mihomo-proxy-management/state/deployment.json  (0600)
@@ -108,6 +109,29 @@ runner 的 `mihomo -d` 都用它，LaunchDaemon 的 `--state-dir` 与 `WorkingDi
 | 健康检查 | `/usr/local/libexec/mihomo-proxy-management/scripts/health-check.sh` | `health` |
 | 切换 VPN | `/usr/local/bin/mpm-switch` | `switch {mihomo,nextin,status}` / `probe`（`switch rollback` 为内部兜底） |
 | 卸载 | `/usr/local/libexec/mihomo-proxy-management/scripts/uninstall.sh` | `uninstall [--purge]` |
+
+### 2.1 从 GitHub 引导（飞书供池，功能分支）
+
+功能分支 `feat/github-bootstrap-deploy` 提供 macOS 引导入口；Apple Silicon、Git、
+Python ≥ 3.9 且可创建 venv（引导可按需准备专用 venv/PyYAML），以 root 执行：
+
+```bash
+git clone https://github.com/flamebird07/mihomo-proxy-management.git
+cd mihomo-proxy-management && git checkout feat/github-bootstrap-deploy
+sudo ./macos/scripts/bootstrap.sh
+```
+
+可用开关与原 CLI 对齐：`--dry-run`（检查飞书读权限与节点池门槛，首次运行可能准备 Python 环境）、
+`--no-start`（照常安装/注册守护任务但不启动服务）、`--skip-supply`（复用已暂存资产）、
+`--skip-install`（到写凭据为止）、`--min-nodes N`（纯飞书供池的最低节点数，默认 1）。
+凭据来自 `MPM_FEISHU_*` 环境变量、stdin JSON（`feishu_url`/`app_id`/`app_secret`）或
+隐藏交互，值不进命令行；`sudo` 需 `--preserve-env=` 显式传递。
+
+纯飞书供池时，`proxy-providers.subscription` 指向上述
+`providers/feishu-pool.yaml`（即
+`/Library/Application Support/mihomo-proxy-management/providers/feishu-pool.yaml`，
+mihomo home 之内），由 `node-pipeline` 每轮从「节点测速总表」重建并热加载；取数失败
+或低于门槛时保留旧池。完整说明见 [docs/GITHUB-DEPLOY.md](../docs/GITHUB-DEPLOY.md)。
 
 秘密只从文件或环境变量读取，**永不出现在命令行参数里**：
 

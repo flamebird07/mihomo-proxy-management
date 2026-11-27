@@ -2,7 +2,7 @@
 
 > **读者**：Windows 侧与 macOS 侧的开发者/Agent。两端**异步开发**，本文件是双方必须
 > 共同维护的"接口契约"——改动任何一侧的共享逻辑，先读这里，改完更新这里。
-> 最后更新：2026-11-28（以飞书表格引导新机器）。
+> 最后更新：2026-11-28（新增从 GitHub 用飞书供池的 macOS/Windows 引导入口与池刷新约定）。
 
 ## 1. 一句话架构
 
@@ -16,7 +16,10 @@
 | `config/config.yaml.template` | 策略组/规则唯一来源。Windows 渲染器=install.ps1，macOS 渲染器=`macos/python/mpm_macos/config.py`（叠加 mac 专用覆盖，见 §4） | 改组/规则必须两侧重装生效；mac audit 会锁组形，Windows 侧改组要先看 `mpm_common/policy.py` |
 | `common/python/mpm_common/policy.py` | 区域过滤器常量（CURSOR/CODEBUDDY/GROKBOT 系） | template 与 audit 都引用它，单一事实源 |
 | `scripts/deploy/` | GitHub 引导命令、飞书权限校验、供应链锁与校验、配置及服务安装的宿主接线 | macOS/Windows 共用入口；凭据来自环境变量、stdin JSON 或交互 |
-| `scripts/feishu_pool.py` | 从「节点测速总表」生成 mihomo 文件节点池 | 只读飞书；低于节点下限时保留原池 |
+| `macos/scripts/bootstrap.sh` | macOS 引导入口（Apple Silicon，root）：`sudo ./macos/scripts/bootstrap.sh [--dry-run / --no-start / --skip-supply / --skip-install / --min-nodes N]`；按需准备专用 venv/PyYAML 后调用 `scripts/deploy/__main__.py --platform macos` | 与 Windows 同一 Python 流程；接口锁定、勿改名；由 `feat/github-bootstrap-deploy` 交付 |
+| `scripts/deploy.ps1` | Windows 引导入口（管理员 PowerShell）：Bootstrap 阶段准备 Python 3.10+/PyYAML 后调用同一流程；Install 阶段安装资产并注册任务，支持 `-InstallDir` | 进程级 `-ExecutionPolicy Bypass`；两个飞书任务以部署账号 Interactive/Limited 运行 |
+| `scripts/render_config.py` | 把渲染好的 config 的 `proxy-providers.subscription` 改成受管 pool 的 file provider | 纯飞书供池时由 install 调用；显式 `--output` 时总是写出 |
+| `scripts/feishu_pool.py` | 从「节点测速总表」生成 mihomo 文件节点池 | 只读飞书；引导建池一次，两端每轮 pipeline 重建；低于节点下限时保留原池 |
 | `scripts/convert_sub.py` | 订阅转换/合并（三源候选）；`--source1-supplement` 多源模式 | 跨平台纯逻辑 |
 | `scripts/sync-feishu-bitable.py` | 飞书表1(订阅源状态)/表2(可测速节点)/表3(GPT可用地区组) 写入链 | 两端共用；`--source-cache-dir`/`--source1-supplement` 是 mac 守护传的新参数 |
 | `scripts/node_provider/` + `node_ops/` + `gpt_switch_entry.py` + `gpt_stability_policy.py` | 节点流水线核心（采集→测速门控→有效节点 provider；GPT 稳定切换） | 跨平台纯逻辑；**数据只存飞书两表** |
@@ -40,6 +43,76 @@
 
 **自动分配只消费链 B**（总表→有效节点→本机 provider）。链 A 的表 2 不喂分配。
 
+**Windows 纯飞书池的流水线入口（2026-11-28）**：`scripts/run-node-pipeline.py` 的 pool 模式
+不再无条件传仓库内 `config/subscription.env`（新机没有该文件，真实 `node_provider` 会以退出码 2
+每轮必败）。改为选择当前安装的 env 文件（Windows=`MIHOMO_DIR\subscription.env`；解析见
+`portable_paths.default_env_file`），并把**同一个 env 文件**显式传给 collect/pool/ops/provide。
+collect 只在两类输入之一可用时运行：安装 env 或仍有效的仓库源文件里配置了 `SUBSCRIPTION_URL_n`，
+或存在可用的 source4（西瓜加速）App 输入；两者都没有时记 `SKIP collect` 日志，正常跑
+pool/ops/provide。非零退出码一律算失败（`node_provider` 的 3 同时表示写权限/API 故障，不再当
+"空采集"吞掉）。pool 模式的 ops `--core` 与 provide `--output` 都取 `MIHOMO_DIR` 下的安装路径；
+订阅模式三个旧 argv 语义不变。`scripts/render_config.py`：显式给了 `--output` 时，即使输入已是
+目标形状也写出该文件；默认原地重复（无 `--output` 且 changed=False）不重写。
+
+**Windows 引导入口的宿主接线（2026-11-28，`scripts/deploy.ps1`）**：
+- 入口分两阶段：默认 `Bootstrap` 准备 Python 3.10+ / PyYAML 后调用 `scripts/deploy/__main__.py`；
+  Python 适配器回调 `deploy.ps1 -Phase Install -StagingDir <dir> [-NoStart]`（`platforms.py` 已显式带
+  `-Phase Install`）。Bootstrap 选定的绝对解释器经子进程环境 `MPM_PYTHON` 传给 Install 阶段，
+  `Render-Config` 与任务注册都优先用它，绝不悄悄换另一个 Python。
+- Install 阶段先校验暂存文件齐全、按 SHA256 判断内容是否变化；全部一致时不停止运行中的 mihomo。
+- 引导注册的 `MihomoFeishuBitableSync` / `MihomoNodePipeline` 以**当前部署账号**的
+  Interactive/Limited principal 运行（绝不 SYSTEM/Highest；`Assert-BootstrapTaskPrincipal` /
+  `Test-ElevatedTaskIdentity` 会拒绝提升身份，pipeline 也拒绝继承提升后的 sync principal）。
+  注册前先用 `icacls` + 当前用户 SID 追加授权：对 `subscription.env` 追加只读（保留 Python 已设的
+  SYSTEM/Administrators ACL），对 `logs` 与 `providers` 追加 `(OI)(CI)M`（继承到子文件）；
+  每条 `icacls` 都检查退出码，失败则不注册依赖任务，也不给 Everyone、不读取凭据内容。
+  任务动作由 Task Scheduler 直接执行**绝对 Windows PowerShell 5.1 的 `-File` 入口**
+  （`sync-feishu-bitable.ps1 -Run` / `install-node-pipeline-task.ps1 -Run`，固定 `-InstallDir` 与
+  `-Interpreter`），不再生成 `.cmd` 启动器或拼 cmd 字符串；`-Run` 通过进程环境设置 `MIHOMO_DIR`，
+  以 `&` 调固定 Python，sync 先于 switch 且任一非零即让任务失败。手工 `-RegisterTask` 的旧行为
+  （schtasks /RL LIMITED、PATH python、仓库内 `.bat` 入口）保持不变。Bootstrap 无论默认或显式
+  `InstallDir` 都用规范化绝对路径经 `MIHOMO_DIR` 传给 CLI/Install 阶段，并跳过 Microsoft Store 的
+  `WindowsApps` 占位 python 再按版本挑选解释器。
+- `--json` 要求 stdout 只有一个 JSON 值：两个平台的安装子进程 stdout 统一导向 stderr，
+  交互提示也写 stderr。
+
+**从 GitHub 用飞书供池引导（2026-11-28，macOS + Windows；功能分支 `feat/github-bootstrap-deploy`）**：
+
+- 入口：macOS `sudo ./macos/scripts/bootstrap.sh`（Apple Silicon；Python ≥ 3.9 + 可用
+  venv，引导可按需准备专用 venv/PyYAML），Windows 管理员 PowerShell 里
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy.ps1`
+  （Python ≥ 3.10，缺失时按锁下载官方安装器并装 PyYAML）。两端都要求显式
+  `git checkout feat/github-bootstrap-deploy`（功能分支交付、尚未并入 `main`），
+  命令细节见 `docs/GITHUB-DEPLOY.md`。
+- 同一流程（`scripts/deploy/__main__.py`）：地址 -> 飞书访问校验（读表 + 写「部署记录」
+  探针）-> 供应链（`supply.lock.json` 的 URL+大小+SHA256，滚动资产优先用 GitHub API
+  digest）-> 节点池（无订阅 URL 时）-> 写本机凭据 -> 平台安装器。任一步失败即停；
+  供应链失败回滚本轮暂存，安装前失败不留半套安装。
+- 凭据优先级：进程环境变量（`MPM_FEISHU_BASE_URL` / `MPM_FEISHU_APP_ID` /
+  `MPM_FEISHU_APP_SECRET`；地址也认 `MPM_FEISHU_BITABLE_APP_TOKEN`）> stdin JSON
+  （键 `feishu_url` / `app_id` / `app_secret`）> 隐藏交互；值不进 argv。可选
+  `MPM_SUBSCRIPTION_URL` 或本机文件已有的有效主订阅会选择订阅模式；`_2.._4` 可提供辅助采集源。
+- 开关：`--dry-run` 只做读校验 + 池门槛（写探针跳过，判定只看读权限），不下载/不写池/
+  不写凭据/不建目录/不安装；`--no-start` 照常安装与注册任务但不启动服务；`--skip-supply`
+  复用已有暂存；`--skip-install` 到写凭据为止；`--min-nodes` 仅纯飞书供池生效（默认 1）。
+  退出码 0/2/3/4/5/6（130=交互中断）。
+- 路径：Windows `%MIHOMO_DIR%\providers\feishu-pool.yaml` 与
+  `%MIHOMO_DIR%\subscription.env`（默认 `C:\mihomo`，`-InstallDir` 可改）；macOS
+  `/Library/Application Support/mihomo-proxy-management/providers/feishu-pool.yaml` 与
+  `state/subscription.env`（0600）。飞书池路径必须是被 pipeline 认得的受管路径
+  （`./providers/feishu-pool.yaml` 或其安装目录绝对形式）；指到自定义文件会退回订阅模式。
+- 池刷新：Windows 每小时 `MihomoNodePipeline` 的 pool 步骤重建池，内容哈希记在
+  `logs/pool.sha256`，成功热加载（`PUT /providers/proxies/subscription`）后才推进标记；
+  macOS node-pipeline 每轮做同一件事。取数/门槛/写文件失败保留旧池（退出码 3/4/5，
+  原子写）；纯飞书且无订阅、无本机补充输入时记 `SKIP collect` 后照常 pool/ops/provide。
+- Windows 任务：`MihomoFeishuBitableSync`（默认 30 分钟，先 sync 后 switch）与
+  `MihomoNodePipeline`（每小时）都以当前部署账号 Interactive/Limited 运行、用户登录时才执行；
+  核心 `MihomoProxy` 是独立的 SYSTEM/Highest 开机任务。注册前用 `icacls` 给部署账号追加
+  `subscription.env` 只读与 `logs`/`providers` Modify，拒绝继承提升的 sync 身份。
+  macOS 对应 feishu-sync / node-pipeline 两个 LaunchDaemon。
+- 验收边界：Windows 的真实权限/计划任务与 macOS 的 root 安装尚未实机验证，由主脑在最终
+  集成分支核对；文档与离线测试只锁定接口与路径。
+
 **表2 数据来源（2026-11-21，影响两端）**：西瓜加速没有订阅 URL，链 A 每轮优先读链 B 的
 「节点测速总表」作为其节点清单（按 来源 过滤、按 节点名 去重、取 节点配置JSON），
 表1 拉取结果=总表；读不到时才回退本地 `source4-cache.yaml`（拉取结果=缓存）。
@@ -51,9 +124,14 @@
 | 维度 | Windows | macOS |
 |---|---|---|
 | 调度 | 计划任务（bat/ps1） | 4 个 LaunchDaemon：core / boot-switch / feishu-sync(600s) / node-pipeline(3600s)，均无 KeepAlive 风暴 |
+| 引导入口 | `scripts/deploy.ps1`（管理员 PowerShell，进程级 `-ExecutionPolicy Bypass`；`-InstallDir` 自定义目录） | `macos/scripts/bootstrap.sh`（`sudo`；Apple Silicon，Python ≥ 3.9 + venv） |
+| 引导运行时 | Python ≥ 3.10（缺失时引导按锁安装）+ PyYAML（pip） | 引导可按需准备专用 venv + PyYAML |
+| 飞书池路径 | `%MIHOMO_DIR%\providers\feishu-pool.yaml`（默认 `C:\mihomo`） | `/Library/Application Support/mihomo-proxy-management/providers/feishu-pool.yaml` |
+| 飞书任务身份 | sync/pipeline 以部署账号 Interactive/Limited（登录才跑）；核心 `MihomoProxy` = SYSTEM/Highest | feishu-sync / node-pipeline 为 root LaunchDaemon |
+| 池刷新 | 每小时 pipeline 的 pool 步骤 + controller 热加载 | 每小时 node-pipeline 轮次（接口锁定，同一语义） |
 | 生产目录 | `C:\mihomo` | `/Library/Application Support/mihomo-proxy-management`（= mihomo `-d`） |
 | 有效节点 provider | `C:\mihomo\providers\node-valid.yaml` | `providers/node-valid.yaml`（在 `-d` 内，mihomo 拒绝 home 外路径） |
-| 渲染器 | `install.ps1`（模板原样） | `config.py`（叠加覆盖：GPT/US-FAST/GROKBOT 审计形、fake-ip 198.19/16、provider interval 秒化、source1-local/nextin 补充、**valid_nodes 分配模式**） |
+| 渲染器 | `install.ps1`（订阅模式渲染模板，飞书供池经 `scripts/render_config.py` 转文件 provider） | `config.py`（叠加覆盖：GPT/US-FAST/GROKBOT 审计形、fake-ip 198.19/16、provider interval 秒化、source1-local/nextin 补充、**valid_nodes 分配模式**） |
 | 切换 | — | `mpm-switch`（osascript 密码框、Always On VPN 预检、失败回滚） |
 | GPT 组管理 | 30 分钟链里 proxy-auto-switch（GPT+MUSE+US-FAST 三组） | node-pipeline 刷新 `node-valid` 后对 GPT 做组级 trace 测速；隔离验证实际出口和 ChatGPT 主页，按美国 → 新加坡 → 日本取同级延迟最低的合格节点，切换后读回确认 |
 | 本地节点补充 | App 通道（AtlasCore/Ninja/西瓜进程内存/DPAPI 缓存） | `--supplement-yaml`：`providers/nextin.yaml` + `providers/supplements/*.yaml`（任意来源文件丢入即入库总表） |
