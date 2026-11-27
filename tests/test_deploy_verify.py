@@ -234,5 +234,33 @@ class NoLeakTests(unittest.TestCase):
                 self.assertEqual([item[1] for item in factory.built], [SECRET] * len(factory.built))
 
 
+class ResolvedTokenTests(unittest.TestCase):
+    def test_report_carries_the_resolved_token_but_not_in_repr(self):
+        parsed = feishu_url.parse_bitable_url(f"https://example.feishu.cn/base/{TOKEN}")
+        _, _, report = run(FakeFeishu())
+        self.assertEqual(report.app_token, TOKEN)
+        self.assertNotIn(TOKEN, repr(report))
+
+        client = FakeFeishu(wiki_node={"obj_type": "bitable", "obj_token": OBJ_TOKEN})
+        _, _, wiki_report = run(client, f"https://example.feishu.cn/wiki/fakeWikiToken123456789xyz")
+        self.assertEqual(wiki_report.app_token, OBJ_TOKEN)
+        self.assertNotIn(OBJ_TOKEN, repr(wiki_report))
+
+
+class DryRunTests(unittest.TestCase):
+    def test_write_probe_can_be_skipped_for_dry_run(self):
+        client = FakeFeishu(rows=[{"fields": {}}, {"fields": {}}])
+        factory = Factory(client)
+        parsed = feishu_url.parse_bitable_url(f"https://example.feishu.cn/base/{TOKEN}")
+        report = verify.verify_access(factory, credentials(), parsed, record(),
+                                      log=None, write_probe=False)
+        self.assertTrue(report.read_ok)
+        self.assertFalse(report.write_ok)
+        self.assertEqual(report.registry_action, "skipped")
+        self.assertEqual(report.problems, ())
+        for method in ("create_table", "batch_create", "update_record"):
+            self.assertEqual(client.called(method), [], method)
+
+
 if __name__ == "__main__":
     unittest.main()
