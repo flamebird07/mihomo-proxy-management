@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -630,13 +631,256 @@ def test_gpt_probe_session_requires_supported_exit_and_unblocked_homepage(
 def test_main_switches_against_refreshed_provider(tmp_path, monkeypatch):
     layout = _ready(tmp_path)
     calls = []
-    for name in ("clear_stale_ops_lock", "run_steps", "apply_presence",
-                 "maybe_refresh_provider", "switch_gpt"):
+    for name in ("clear_stale_ops_lock", "run_steps", "maybe_refresh_pool",
+                 "apply_presence", "maybe_refresh_provider", "switch_gpt"):
         monkeypatch.setattr(node_pipeline, name,
                             lambda *_a, step=name, **_k: calls.append(step) or 0)
     assert node_pipeline.main([], context_factory=lambda: type("Ctx", (), {"layout": layout})()) == 0
-    assert calls == ["clear_stale_ops_lock", "run_steps", "apply_presence",
-                     "maybe_refresh_provider", "switch_gpt"]
+    assert calls == ["clear_stale_ops_lock", "run_steps", "maybe_refresh_pool",
+                     "apply_presence", "maybe_refresh_provider", "switch_gpt"]
+
+
+# ---- feishu pool mode ------------------------------------------------------------
+
+
+def _write_pool_config(layout: paths_mod.Layout, *, ptype="file",
+                       path="./providers/feishu-pool.yaml") -> None:
+    """A minimal rendered-config stand-in: pool_mode only reads the
+    ``subscription`` proxy-provider section."""
+    os.makedirs(layout.support, exist_ok=True)
+    lines = ["proxy-providers:", "  subscription:", f"    type: {ptype}"]
+    if path:
+        lines.append(f"    path: {path}")
+    Path(layout.config).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_pool_mode_requires_the_managed_pool_file_provider(tmp_path):
+    layout = _ready(tmp_path)
+    assert node_pipeline.pool_mode(layout) is False  # no config yet
+
+    _write_pool_config(layout, ptype="file")
+    assert node_pipeline.pool_mode(layout) is True
+
+    # a hand-written custom file provider is not the managed pool
+    _write_pool_config(layout, ptype="file", path="./providers/custom.yaml")
+    assert node_pipeline.pool_mode(layout) is False
+
+    _write_pool_config(layout, ptype="http", path="./providers/subscription.yaml")
+    assert node_pipeline.pool_mode(layout) is False
+
+
+def test_pool_mode_never_raises_on_unreadable_config(tmp_path):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.support, exist_ok=True)
+    Path(layout.config).write_text("{unclosed", encoding="utf-8")
+    assert node_pipeline.pool_mode(layout) is False  # broken YAML
+    Path(layout.config).write_text("rules: []\n", encoding="utf-8")
+    assert node_pipeline.pool_mode(layout) is False  # no proxy-providers
+
+
+def test_step_labels_match_the_mode():
+    assert node_pipeline.step_labels(False) == ("collect", "ops", "provide")
+    assert node_pipeline.step_labels(True) == ("collect", "pool", "ops", "provide")
+    assert node_pipeline.STEP_LABELS == ("collect", "ops", "provide"), (
+        "the subscription constant must not gain the pool label")
+
+
+def test_build_step_argv_pool_mode_inserts_the_pool_step(tmp_path):
+    layout = _ready(tmp_path)  # has the nextin supplement: collect keeps an input
+    argvs = node_pipeline.build_step_argv(layout, binary=layout.binary,
+                                          feishu_pool=True)
+    assert len(argvs) == 4
+    assert argvs[0][1:3] == ["-m", "node_provider"]
+    assert argvs[1] == [sys.executable, layout.pool_script,
+                        "--env-file", layout.secret_file,
+                        "--output", layout.pool_file]
+    assert argvs[2][1:3] == ["-m", "node_ops"]
+    assert argvs[3][1:3] == ["-m", "node_provider"]
+
+
+def test_build_step_argv_false_matches_the_subscription_shape(tmp_path):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)  # config present, but explicitly not pool mode
+    before = node_pipeline.build_step_argv(layout, binary=layout.binary,
+                                           feishu_pool=False)
+    assert len(before) == 3
+    assert before == node_pipeline.build_step_argv(layout, binary=layout.binary,
+                                                   feishu_pool=False)
+
+
+def test_build_step_argv_auto_detects_from_the_rendered_config(tmp_path):
+    layout = _ready(tmp_path)
+    assert len(node_pipeline.build_step_argv(layout, binary=layout.binary)) == 3
+    _write_pool_config(layout)
+    assert len(node_pipeline.build_step_argv(layout, binary=layout.binary)) == 4
+
+
+def test_build_step_argv_pool_mode_without_collect_inputs(tmp_path):
+    """A pure pool machine (no slot, no supplement) skips the collect step."""
+    layout = _ready(tmp_path)
+    _write_secret(layout, lines=FEISHU_LINES[1:])  # Feishu creds only, no URL
+    Path(os.path.join(layout.providers, "nextin.yaml")).unlink()
+    _write_pool_config(layout)
+    argvs = node_pipeline.build_step_argv(layout, binary=layout.binary)
+    assert len(argvs) == 4
+    assert argvs[0] is None  # recorded-and-skipped slot
+    assert argvs[1][1] == layout.pool_script
+    # subscription mode keeps its historical shape even without inputs
+    argvs = node_pipeline.build_step_argv(layout, binary=layout.binary,
+                                          feishu_pool=False)
+    assert len(argvs) == 3 and argvs[0] is not None
+
+
+def test_run_steps_pool_mode_runs_four_steps_and_names_failures(tmp_path):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)
+    seen: list[str] = []
+
+    def runner(argv: list[str]) -> int:
+        seen.append(argv[2] if argv[1] == "-m" else os.path.basename(argv[1]))
+        return 1 if len(seen) == 3 else 0  # the ops step fails
+
+    lines: list[str] = []
+    code = node_pipeline.run_steps(layout, runner=runner, say=lines.append,
+                                   feishu_pool=True)
+    assert code == node_pipeline.EXIT_STEP_FAILED
+    assert seen == ["node_provider", "feishu_pool.py", "node_ops", "node_provider"]
+    assert any("step ops failed" in line for line in lines)
+    assert not any("step pool failed" in line for line in lines), (
+        "labels and argvs must stay paired: ops must not be mislabelled as pool")
+
+
+def test_run_steps_pool_mode_skips_collect_without_inputs(tmp_path):
+    """A truly input-less pool machine still gets a healthy refresh."""
+    layout = _ready(tmp_path)
+    _write_secret(layout, lines=FEISHU_LINES[1:])
+    Path(os.path.join(layout.providers, "nextin.yaml")).unlink()
+    _write_pool_config(layout)
+    seen: list[str] = []
+
+    def runner(argv: list[str]) -> int:
+        seen.append(argv[2] if argv[1] == "-m" else os.path.basename(argv[1]))
+        return 0
+
+    lines: list[str] = []
+    code = node_pipeline.run_steps(layout, runner=runner, say=lines.append)
+    assert code == node_pipeline.EXIT_OK
+    assert seen == ["feishu_pool.py", "node_ops", "node_provider"]
+    assert any("collect skipped" in line for line in lines)
+
+
+def test_run_steps_default_stays_three_steps_without_a_config(tmp_path):
+    layout = _ready(tmp_path)  # no rendered config: subscription shape
+    seen: list[str] = []
+    code = node_pipeline.run_steps(layout, runner=lambda a: seen.append(a) or 0,
+                                   say=lambda _m: None)
+    assert code == node_pipeline.EXIT_OK
+    assert len(seen) == 3
+
+
+class _FakeResponse:
+    status = 204
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def test_provider_refresh_generalises_name_path_and_marker(tmp_path, monkeypatch):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.providers, exist_ok=True)
+    os.makedirs(layout.node_state_dir, exist_ok=True)
+    Path(layout.pool_file).write_text("proxies: []\n", encoding="utf-8")
+    urls: list[str] = []
+
+    def fake_urlopen(request, timeout=None):
+        urls.append(request.full_url)
+        return _FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    kwargs = dict(say=lambda _m: None, name="subscription",
+                  path=layout.pool_file, marker_name="pool.sha256")
+    assert node_pipeline.maybe_refresh_provider(layout, **kwargs) is True
+    assert urls[-1].endswith("/providers/proxies/subscription")
+    marker = os.path.join(layout.node_state_dir, "pool.sha256")
+    assert os.path.isfile(marker)
+    # unchanged content: no second request, marker untouched
+    assert node_pipeline.maybe_refresh_provider(layout, **kwargs) is False
+    assert len(urls) == 1
+
+
+def test_maybe_refresh_pool_requires_pool_mode_and_a_pool_file(tmp_path):
+    layout = _ready(tmp_path)
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(layout.pool_file).write_text("proxies: []\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def reload_provider(_secret: str):
+        calls.append("reload")
+        return 204
+
+    assert node_pipeline.maybe_refresh_pool(
+        layout, say=lambda _m: None, reload_provider=reload_provider) is False
+    assert calls == []  # subscription mode: nothing to refresh
+
+    _write_pool_config(layout)
+    assert node_pipeline.maybe_refresh_pool(
+        layout, say=lambda _m: None, reload_provider=reload_provider) is True
+    assert calls == ["reload"]
+    assert os.path.isfile(os.path.join(layout.node_state_dir,
+                                       node_pipeline.POOL_MARKER))
+
+
+def test_maybe_refresh_pool_failure_is_retried_next_tick(tmp_path):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)
+    os.makedirs(layout.providers, exist_ok=True)
+    Path(layout.pool_file).write_text("proxies: []\n", encoding="utf-8")
+    lines: list[str] = []
+    assert node_pipeline.maybe_refresh_pool(
+        layout, say=lines.append, reload_provider=lambda _s: None) is False
+    assert any("retried" in line for line in lines)
+    assert not os.path.exists(os.path.join(layout.node_state_dir,
+                                           node_pipeline.POOL_MARKER)), (
+        "marker persisted only after success: a failed reload is retried")
+
+
+def test_maybe_refresh_pool_without_a_pool_file(tmp_path):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)
+    assert node_pipeline.maybe_refresh_pool(
+        layout, say=lambda _m: None, reload_provider=lambda _s: 204) is False
+
+
+def test_prerequisites_pool_mode_requires_the_pool_script(tmp_path):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)
+    code, messages = node_pipeline.prerequisites(layout)
+    assert code == node_pipeline.EXIT_PREREQUISITES_MISSING
+    assert layout.pool_script in messages[-1]
+
+    Path(layout.pool_script).write_text("# stub\n", encoding="utf-8")
+    code, messages = node_pipeline.prerequisites(layout)
+    assert code == node_pipeline.EXIT_OK and messages == []
+
+
+def test_prerequisites_subscription_mode_ignores_the_pool_script(tmp_path):
+    layout = _ready(tmp_path)  # no rendered config: subscription mode
+    code, messages = node_pipeline.prerequisites(layout)
+    assert code == node_pipeline.EXIT_OK and messages == []
+
+
+def test_main_dry_run_pool_mode_prints_four_labelled_steps(tmp_path, capsys):
+    layout = _ready(tmp_path)
+    _write_pool_config(layout)
+    Path(layout.pool_script).write_text("# stub\n", encoding="utf-8")
+    code = node_pipeline.main(["--root", str(tmp_path), "--dry-run"])
+    assert code == node_pipeline.EXIT_OK
+    out = capsys.readouterr().out
+    for label in ("collect", "pool", "ops", "provide"):
+        assert f"node-pipeline argv[{label}]" in out
 
 
 # ---- install / uninstall wiring -------------------------------------------------

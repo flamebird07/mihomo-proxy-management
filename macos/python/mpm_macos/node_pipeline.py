@@ -9,7 +9,13 @@ nodes into the local machine's assignment.  Cross-platform contract:
 1. ``node_provider --collect``  - fetch the configured subscription sources
    into the Feishu 「节点测速总表」 (failures tolerated: a failed collect still
    lets the next steps refresh the existing table; fetching is explicitly not
-   urgent on this host - when the sources work, the table fills by itself);
+   urgent on this host - when the sources work, the table fills by itself).
+   Skipped on a Feishu-pool machine with no collect inputs (no subscription
+   slot, no supplement file): a zero-source collect can only exit non-zero;
+1b. ``feishu_pool.py``         - pool machines only: rebuild
+   ``providers/feishu-pool.yaml`` from the master table (the pool must be
+   regenerated *after* collect so new nodes reach the running core the same
+   tick), then
 2. ``node_ops``                 - source-agnostic isolated-core probe (free
    ports near 17890, ``tun.enable: false``, never the production ports),
    region classification and the GPT consecutive-round gate, writing the
@@ -117,6 +123,13 @@ def prerequisites(layout: Layout) -> tuple[int, list[str]]:
             f"{SWITCH_SCRIPT} is not installed - run `mihomo-proxy-management install`"
         )
         return EXIT_PREREQUISITES_MISSING, messages
+    if pool_mode(layout) and not os.path.isfile(layout.pool_script):
+        messages.append(
+            f"feishu_pool.py is not installed ({layout.pool_script}) - run "
+            "`mihomo-proxy-management install` (the Feishu-pool config needs it "
+            "to rebuild providers/feishu-pool.yaml every tick)"
+        )
+        return EXIT_PREREQUISITES_MISSING, messages
     values = _read_secret_values(layout.secret_file)
     if not ((values.get("FEISHU_APP_ID") or "").strip()
             and (values.get("FEISHU_APP_SECRET") or "").strip()):
@@ -146,6 +159,25 @@ def supplement_files(layout: Layout) -> list[str]:
     if os.path.isfile(legacy):
         files.append(legacy)
     return files
+
+
+SUBSCRIPTION_SLOT_KEYS = ("SUBSCRIPTION_URL", "SUBSCRIPTION_URL_2",
+                          "SUBSCRIPTION_URL_3", "SUBSCRIPTION_URL_4")
+
+
+def collect_inputs(layout: Layout) -> list[str]:
+    """Everything the collect step would read: the subscription slots (main +
+    auxiliary) configured in the secret file plus the supplement files.
+
+    A pure Feishu-pool machine has no subscription URL at all and ``source4``
+    is Windows-only (DPAPI), so an empty list means a collect run would find
+    zero sources and exit non-zero on zero nodes - the tick skips collect
+    instead (see :func:`build_step_argv`).
+    """
+    values = _read_secret_values(layout.secret_file)
+    slots = [key for key in SUBSCRIPTION_SLOT_KEYS
+             if (values.get(key) or "").strip()]
+    return slots + supplement_files(layout)
 
 
 def _node_ops_alive() -> bool:
@@ -206,20 +238,49 @@ def clear_stale_ops_lock(layout: Layout, *, say: Callable[[str], None] = print) 
     return True
 
 
-def _provider_hash(layout: Layout) -> str | None:
+#: Pool mode: the step inserted between collect and ops, and the marker that
+#: records "the running core has loaded this pool file's content" (see
+#: :func:`maybe_refresh_pool`).
+POOL_STEP_LABEL = "pool"
+POOL_MARKER = "pool.sha256"
+
+
+def pool_mode(layout: Layout) -> bool:
+    """Whether the rendered config reads the Feishu pool file (no subscription
+    URL).  An unreadable config means "not in pool mode": nothing to refresh.
+
+    Only the managed pool provider counts: the ``subscription`` provider must
+    be a ``type: file`` provider pointing at ``config.POOL_PROVIDER_PATH`` -
+    a hand-written custom file provider is not refreshed here.
+    """
+    try:
+        import yaml  # lazy: the daemon's interpreter carries PyYAML
+
+        with open(layout.config, "r", encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+    except Exception:  # noqa: BLE001 - missing file / bad YAML / no yaml module
+        return False
+    providers = document.get("proxy-providers") if isinstance(document, dict) else None
+    provider = providers.get(config.PROVIDER_NAME) if isinstance(providers, dict) else None
+    return (isinstance(provider, dict)
+            and provider.get("type") == "file"
+            and provider.get("path") == config.POOL_PROVIDER_PATH)
+
+
+def _provider_hash(path: str) -> str | None:
     import hashlib
 
     try:
-        with open(layout.valid_provider_file, "rb") as handle:
+        with open(path, "rb") as handle:
             return hashlib.sha256(handle.read()).hexdigest()
     except OSError:
         return None
 
 
-def _loaded_provider_hash(layout: Layout) -> str | None:
-    marker = os.path.join(layout.node_state_dir, "provider.sha256")
+def _loaded_provider_hash(path: str) -> str | None:
+    """The hash recorded in the marker file at ``path`` (``None`` if absent)."""
     try:
-        with open(marker, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             return handle.read().strip()
     except OSError:
         return None
@@ -228,21 +289,27 @@ def _loaded_provider_hash(layout: Layout) -> str | None:
 def maybe_refresh_provider(layout: Layout, *,
                            say: Callable[[str], None] = print,
                            reload_provider: Callable[[str], int | None] | None = None,
+                           name: str = "node-valid",
+                           path: str | None = None,
+                           marker_name: str = "provider.sha256",
                            ) -> bool:
-    """Hot-reload the node-valid file provider when its content changed.
+    """Hot-reload a ``type: file`` provider when its content changed.
 
     mihomo never re-reads a ``type: file`` provider on its own; without this
     the running core would keep the pool from the first tick forever.  The
     hash is only persisted after a successful reload, so a failed reload is
-    retried on the next tick.
+    retried on the next tick.  ``node-valid`` (the measured valid-node pool)
+    is the default target; :func:`maybe_refresh_pool` passes the Feishu pool
+    file for hosts without a subscription URL.
     """
-    if not os.path.isfile(layout.valid_provider_file):
+    provider_file = path or layout.valid_provider_file
+    if not os.path.isfile(provider_file):
         return False
-    marker = os.path.join(layout.node_state_dir, "provider.sha256")
-    current = _provider_hash(layout)
+    marker = os.path.join(layout.node_state_dir, marker_name)
+    current = _provider_hash(provider_file)
     if current is None:
         return False
-    if current == _loaded_provider_hash(layout):
+    if current == _loaded_provider_hash(marker):
         return False
 
     if reload_provider is None:
@@ -253,7 +320,7 @@ def maybe_refresh_provider(layout: Layout, *,
             values = _read_secret_values(layout.secret_file)
             secret = (values.get("SECRET") or "").strip()
             request = urllib.request.Request(
-                f"{LIVE_CONTROLLER}/providers/proxies/node-valid",
+                f"{LIVE_CONTROLLER}/providers/proxies/{name}",
                 data=b"",
                 headers={"Authorization": f"Bearer {secret}"} if secret else {},
                 method="PUT",
@@ -267,59 +334,102 @@ def maybe_refresh_provider(layout: Layout, *,
     secret_present = bool((_read_secret_values(layout.secret_file) or {}).get("SECRET"))
     status = reload_provider(secret_present)
     if status not in (200, 204):
-        say("node-pipeline: node-valid provider reload unavailable "
+        say(f"node-pipeline: {name} provider reload unavailable "
             "(retried next tick): " + HOST.text(f"{status}"))
         return False
     os.makedirs(layout.node_state_dir, mode=0o700, exist_ok=True)
     with open(marker, "w", encoding="utf-8") as handle:
         handle.write(current + "\n")
-    say("node-pipeline: node-valid provider reloaded "
+    say(f"node-pipeline: {name} provider reloaded "
         f"http={status} (pool refreshed without dropping connections)")
     return True
 
 
-def build_step_argv(layout: Layout, *, binary: str) -> list[list[str]]:
-    """The four step argvs (paths only; no secret values on any command line)."""
+def maybe_refresh_pool(layout: Layout, *, say: Callable[[str], None] = print,
+                       reload_provider: Callable[[str], int | None] | None = None) -> bool:
+    """Hot-reload the Feishu pool provider on hosts without a subscription URL."""
+    if not pool_mode(layout):
+        return False
+    return maybe_refresh_provider(layout, say=say, reload_provider=reload_provider,
+                                  name=config.PROVIDER_NAME, path=layout.pool_file,
+                                  marker_name=POOL_MARKER)
+
+
+def build_step_argv(layout: Layout, *, binary: str,
+                    feishu_pool: bool | None = None) -> list:
+    """The step argvs (paths only; no secret values on any command line).
+
+    Pool mode (``feishu_pool``; auto-detected from the rendered config when
+    ``None``) inserts the Feishu pool rebuild between collect and ops - the
+    pool must be regenerated *after* collect so nodes merged into the master
+    table this tick reach the running core the same tick.  A pool machine
+    with no collect inputs gets ``None`` in the collect slot: the tick records
+    and skips it instead of running a collect that can only exit non-zero on
+    zero nodes.  Subscription mode returns exactly the historical three argvs.
+    """
     state = layout.node_state_dir
     secret = layout.secret_file
-    return [
-        [sys.executable, "-m", NODE_PROVIDER_PACKAGE,
-         "--collect",
-         "--sources-env", secret,
-         "--env-file", secret,
-         "--fetch-proxy", "http://127.0.0.1:7890",
-         # Mirrors upstream run-node-pipeline: the source4 app channel is
-         # attempted and degrades to a logged per-channel failure on hosts
-         # without it (macOS: no DPAPI/ShuttleClient -> profile_missing).
-         "--from-app", "source4",
-         # Source-1 supplements: the host's own nodes enter the shared table
-         # even when the slot-1 subscription fetch is blocked.  Every file in
-         # providers/supplements/ (the landing point for locally obtained
-         # nodes: browser downloads, app exports) plus the extracted
-         # nextin.yaml is merged each tick; fetch-side dedupe keeps fetched
-         # nodes first and per-source table replace keeps them fresh.
-         *sum((["--supplement-yaml", path] for path in supplement_files(layout)), []),
-         "--lock-file", os.path.join(state, "node_provider.lock")],
-        [sys.executable, "-m", NODE_OPS_PACKAGE,
-         "--env-file", secret,
-         "--core", binary,
-         # Probe budgets sized for a ~130-row master table (the upstream
-         # 600s defaults were tuned for ~100 nodes: with 129 entries the
-         # delay budget ran out mid-round, most nodes never got GPT-target
-         # measurements, and the gate wiped 有效节点 to zero - the publish
-         # gate kept the old provider, but the pool stopped growing).
-         "--total-budget", "1800",
-         "--ipinfo-budget", "1200",
-         "--log-file", os.path.join(layout.logs, "node_ops.log"),
-         "--lock-file", os.path.join(state, "node_ops.lock")],
-        [sys.executable, "-m", NODE_PROVIDER_PACKAGE,
-         "--output", layout.valid_provider_file,
-         "--env-file", secret,
-         "--lock-file", os.path.join(state, "node_provider.lock")],
+    collect: list[str] | None = [
+        sys.executable, "-m", NODE_PROVIDER_PACKAGE,
+        "--collect",
+        "--sources-env", secret,
+        "--env-file", secret,
+        "--fetch-proxy", "http://127.0.0.1:7890",
+        # Mirrors upstream run-node-pipeline: the source4 app channel is
+        # attempted and degrades to a logged per-channel failure on hosts
+        # without it (macOS: no DPAPI/ShuttleClient -> profile_missing).
+        "--from-app", "source4",
+        # Source-1 supplements: the host's own nodes enter the shared table
+        # even when the slot-1 subscription fetch is blocked.  Every file in
+        # providers/supplements/ (the landing point for locally obtained
+        # nodes: browser downloads, app exports) plus the extracted
+        # nextin.yaml is merged each tick; fetch-side dedupe keeps fetched
+        # nodes first and per-source table replace keeps them fresh.
+        *sum((["--supplement-yaml", path] for path in supplement_files(layout)), []),
+        "--lock-file", os.path.join(state, "node_provider.lock"),
     ]
+    if feishu_pool is None:
+        feishu_pool = pool_mode(layout)
+    steps: list = []
+    if feishu_pool:
+        if collect_inputs(layout):
+            steps.append(collect)
+        else:
+            steps.append(None)
+        steps.append([sys.executable, layout.pool_script,
+                      "--env-file", secret,
+                      "--output", layout.pool_file])
+    else:
+        steps.append(collect)
+    steps.append([sys.executable, "-m", NODE_OPS_PACKAGE,
+                  "--env-file", secret,
+                  "--core", binary,
+                  # Probe budgets sized for a ~130-row master table (the upstream
+                  # 600s defaults were tuned for ~100 nodes: with 129 entries the
+                  # delay budget ran out mid-round, most nodes never got GPT-target
+                  # measurements, and the gate wiped 有效节点 to zero - the publish
+                  # gate kept the old provider, but the pool stopped growing).
+                  "--total-budget", "1800",
+                  "--ipinfo-budget", "1200",
+                  "--log-file", os.path.join(layout.logs, "node_ops.log"),
+                  "--lock-file", os.path.join(state, "node_ops.lock")])
+    steps.append([sys.executable, "-m", NODE_PROVIDER_PACKAGE,
+                  "--output", layout.valid_provider_file,
+                  "--env-file", secret,
+                  "--lock-file", os.path.join(state, "node_provider.lock")])
+    return steps
 
 
 STEP_LABELS = ("collect", "ops", "provide")
+
+
+def step_labels(feishu_pool: bool) -> tuple:
+    """Labels matching :func:`build_step_argv` for the given mode.
+
+    ``STEP_LABELS`` itself stays the subscription-mode constant: existing
+    callers pair it with the three subscription argvs.
+    """
+    return ("collect", POOL_STEP_LABEL, "ops", "provide") if feishu_pool else STEP_LABELS
 
 
 def run_steps(
@@ -327,12 +437,14 @@ def run_steps(
     *,
     runner: Callable[[list[str]], int] | None = None,
     say: Callable[[str], None] = print,
+    feishu_pool: bool | None = None,
 ) -> int:
     """Build the provider; every step runs even if a previous one failed.
 
     Mirrors upstream ``run-node-pipeline.py`` semantics: the exit code is 1
     when any step failed, and each step's stdout/stderr lands in the shared
-    ``node-pipeline.log``.
+    ``node-pipeline.log``.  A ``None`` argv (the skipped no-input collect of a
+    pure pool machine) is recorded and not executed.
     """
     binary = context_mod.resolve_runtime_binary(layout)
     os.makedirs(layout.node_state_dir, mode=0o700, exist_ok=True)
@@ -354,9 +466,17 @@ def run_steps(
             log.write(f"EXIT {process.returncode}\n")
             return process.returncode
 
+    if feishu_pool is None:
+        feishu_pool = pool_mode(layout)
     execute = runner or _default_runner
     failed: list[str] = []
-    for label, argv in zip(STEP_LABELS, build_step_argv(layout, binary=binary)):
+    for label, argv in zip(step_labels(feishu_pool),
+                           build_step_argv(layout, binary=binary,
+                                           feishu_pool=feishu_pool)):
+        if argv is None:
+            say(f"node-pipeline: step {label} skipped (no collect inputs; "
+                "ops/provide still refresh from the shared table)")
+            continue
         code = execute(argv)
         if code != 0:
             failed.append(label)
@@ -472,8 +592,9 @@ def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
             + str(gpt.get("type")) + "); switch skipped")
         return None
     current = gpt.get("now")
-    provider_hash = _provider_hash(layout)
-    if provider_hash != _loaded_provider_hash(layout):
+    provider_hash = _provider_hash(layout.valid_provider_file)
+    if provider_hash != _loaded_provider_hash(
+            os.path.join(layout.node_state_dir, "provider.sha256")):
         say("node-pipeline: node-valid reload pending; GPT switch deferred")
         return None
     try:
@@ -514,7 +635,7 @@ def switch_gpt(layout: Layout, *, say: Callable[[str], None] = print,
     live = call("/proxies/GPT")
     if ((live.get("type") or "").lower() != "selector" or live.get("now") != current
             or best_name not in (live.get("all") or ())
-            or provider_hash != _provider_hash(layout)):
+            or provider_hash != _provider_hash(layout.valid_provider_file)):
         say("node-pipeline: GPT changed during verification; switch skipped")
         return None
     if best_name == current:
@@ -658,13 +779,23 @@ def main(
     if args.dry_run or code != EXIT_OK:
         if args.dry_run and code == EXIT_OK:
             binary = context_mod.resolve_runtime_binary(layout)
-            for label, argv in zip(STEP_LABELS, build_step_argv(layout, binary=binary)):
-                print(f"node-pipeline argv[{label}]: " + HOST.text(" ".join(argv)))
+            mode = pool_mode(layout)
+            for label, argv in zip(step_labels(mode),
+                                   build_step_argv(layout, binary=binary,
+                                                   feishu_pool=mode)):
+                if argv is None:
+                    print(f"node-pipeline argv[{label}]: skipped "
+                          "(no collect inputs; ops/provide still refresh)")
+                else:
+                    print(f"node-pipeline argv[{label}]: " + HOST.text(" ".join(argv)))
         print(f"node-pipeline dry-run: exit={code}")
         return code
 
     clear_stale_ops_lock(layout)
     steps_code = run_steps(layout)
+    # Pool machines: push the freshly rebuilt pool file into the running core
+    # before the presence flip (a re-render would restart from disk anyway).
+    maybe_refresh_pool(layout)
     apply_presence(layout, context_factory=lambda: ctx)
     maybe_refresh_provider(layout)
     try:
