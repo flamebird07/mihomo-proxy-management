@@ -1,5 +1,6 @@
 """deploy.supply: digest-locked staging is pure, offline, and leak-free."""
 
+import copy
 import gzip
 import hashlib
 import io
@@ -398,6 +399,112 @@ class ExtractTests(TempDirTestCase):
             with self.assertRaises(supply.SupplyError) as caught:
                 supply.extract_member(data, asset)
         self.assertEqual(caught.exception.kind, "archive_too_large")
+
+
+class BoundedExtractTests(TempDirTestCase):
+    """The member cap bites during decompression, not after."""
+
+    def test_gzip_over_small_cap(self):
+        asset, data = gzip_asset(payload=b"z" * 5000)
+        with mock.patch.object(supply, "MAX_MEMBER_BYTES", 1024):
+            with self.assertRaises(supply.SupplyError) as caught:
+                supply.extract_member(data, asset)
+        self.assertEqual(caught.exception.kind, "archive_too_large")
+        self.assertEqual(caught.exception.detail, "gztool")
+
+    def test_zip_over_small_cap(self):
+        asset, data = zip_asset({"tool": b"z" * 5000}, "tool")
+        with mock.patch.object(supply, "MAX_MEMBER_BYTES", 1024):
+            with self.assertRaises(supply.SupplyError) as caught:
+                supply.extract_member(data, asset)
+        self.assertEqual(caught.exception.kind, "archive_too_large")
+        self.assertEqual(caught.exception.detail, "ziptool")
+
+    def test_raw_over_cap(self):
+        with mock.patch.object(supply, "MAX_MEMBER_BYTES", 10):
+            with self.assertRaises(supply.SupplyError) as caught:
+                supply.extract_member(b"z" * 40, make_asset())
+        self.assertEqual(caught.exception.kind, "archive_too_large")
+
+    def test_truncated_gzip_is_invalid(self):
+        asset, data = gzip_asset(payload=b"x" * 200)
+        with self.assertRaises(supply.SupplyError) as caught:
+            supply.extract_member(data[:len(data) // 2], asset)
+        self.assertEqual(caught.exception.kind, "archive_invalid")
+
+    def test_multi_member_gzip_concatenates(self):
+        data = gzip.compress(b"alpha") + gzip.compress(b"beta")
+        asset = make_asset(key="gztool", fmt="gzip",
+                           digest=hashlib.sha256(data).hexdigest(), size=len(data))
+        self.assertEqual(supply.extract_member(data, asset), b"alphabeta")
+
+    def test_forged_zip_file_size_is_caught_while_streaming(self):
+        payload = b"z" * 5000
+        asset, data = zip_asset({"tool": payload}, "tool")
+        real_getinfo = zipfile.ZipFile.getinfo
+        real_open = zipfile.ZipFile.open
+
+        def lying_getinfo(zip_file, name):
+            info = copy.copy(real_getinfo(zip_file, name))
+            info.file_size = 8  # a forged central directory: smaller than truth
+            return info
+
+        def honest_open(zip_file, name, *args, **kwargs):
+            if isinstance(name, str):
+                name = real_getinfo(zip_file, name)  # the reader sees the truth
+            return real_open(zip_file, name, *args, **kwargs)
+
+        with mock.patch.object(supply, "MAX_MEMBER_BYTES", 1024), \
+                mock.patch.object(zipfile.ZipFile, "getinfo", lying_getinfo), \
+                mock.patch.object(zipfile.ZipFile, "open", honest_open):
+            with self.assertRaises(supply.SupplyError) as caught:
+                supply.extract_member(data, asset)
+        self.assertEqual(caught.exception.kind, "archive_too_large")
+        self.assertEqual(caught.exception.detail, "ziptool")
+
+
+class StageCleanupTests(TempDirTestCase):
+    """Staging leaves nothing behind, whatever exception flies."""
+
+    def test_keyboard_interrupt_cleans_temp_file(self):
+        with mock.patch("os.replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                supply.stage_asset(make_asset(), PAYLOAD, self.tmp)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_fetch_that_writes_nothing_leaves_no_download(self):
+        def silent_fetch(url, destination):
+            return  # "succeeds" without writing the target file
+
+        with self.assertRaises(supply.SupplyError) as caught:
+            supply.stage_assets([make_asset(key="m")], self.tmp,
+                                fetch=silent_fetch)
+        self.assertEqual(caught.exception.kind, "download_failed")
+        self.assertFalse(any(name.endswith(".download")
+                             for name in os.listdir(self.tmp)))
+
+    def test_digest_mismatch_leaves_no_download(self):
+        asset = make_asset(key="m", digest="cd" * 32)
+        with self.assertRaises(supply.SupplyError) as caught:
+            supply.stage_assets([asset], self.tmp,
+                                fetch=fake_fetch({asset.url: PAYLOAD}))
+        self.assertEqual(caught.exception.kind, "digest_mismatch")
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_each_asset_is_extracted_exactly_once(self):
+        calls = []
+        real = supply.extract_member
+
+        def counting(data, asset):
+            calls.append(asset.key)
+            return real(data, asset)
+
+        fetch = fake_fetch({StageAssetsTests.A1.url: PAYLOAD,
+                            StageAssetsTests.A2.url: StageAssetsTests.SECOND})
+        with mock.patch.object(supply, "extract_member", counting):
+            supply.stage_assets([StageAssetsTests.A1, StageAssetsTests.A2],
+                                self.tmp, fetch=fetch)
+        self.assertEqual(calls, ["a1", "a2"])
 
 
 class StageAssetTests(TempDirTestCase):

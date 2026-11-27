@@ -10,7 +10,6 @@ GitHub API's own asset digest is preferred when the API answers.
 from __future__ import annotations
 
 import fnmatch
-import gzip
 import hashlib
 import io
 import json
@@ -26,6 +25,9 @@ from typing import Callable, List, Optional
 LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "supply.lock.json")
 #: Uncompressed cap for one archive member: a decompression bomb must not fill the disk.
 MAX_MEMBER_BYTES = 400 * 1024 * 1024
+#: Streaming granularity: input is fed and output is counted in chunks this size.
+CHUNK_BYTES = 1024 * 1024
+_GZIP_WBITS = 16 + zlib.MAX_WBITS  # gzip framing on top of raw deflate
 FORMATS = ("raw", "gzip", "zip")
 OS_NAMES = ("macos", "windows", "linux", "all")
 ARCH_NAMES = ("arm64", "amd64", "all")
@@ -233,24 +235,65 @@ def extract_member(data: bytes, asset: Asset) -> bytes:
     """Return the payload bytes, in memory only.  Archive members are never
     written to an archive-derived path - extraction reads bytes out of the
     archive, so an entry's name cannot point outside the staging directory
-    (no zip-slip by construction)."""
+    (no zip-slip by construction).  The size cap bites *while* decompressing:
+    a bomb is stopped before it can fill memory."""
     if asset.fmt == "raw":
+        if len(data) > MAX_MEMBER_BYTES:
+            raise SupplyError("archive_too_large", asset.key)
         return data
     if asset.fmt == "gzip":
-        try:
-            member = gzip.decompress(data)
-        except (OSError, EOFError, zlib.error):
-            raise SupplyError("archive_invalid", asset.key) from None
-    else:
-        member = _zip_member(data, asset)
-    if len(member) > MAX_MEMBER_BYTES:
-        raise SupplyError("archive_too_large", asset.key)
-    return member
+        return _gzip_member(data, asset)
+    return _zip_member(data, asset)
+
+
+def _gzip_member(data: bytes, asset: Asset) -> bytes:
+    """Bounded streaming inflate of (possibly multi-member) gzip data.
+
+    Input is fed in bounded chunks and every output piece is counted against
+    ``MAX_MEMBER_BYTES`` as it is produced, so the cap holds during - not
+    after - decompression.  After ``eof``, trailing bytes may form another
+    gzip member and are inflated the same way."""
+    if not data:
+        raise SupplyError("archive_invalid", asset.key)
+    chunks: List[bytes] = []
+    total = 0
+    pending = data  # compressed input not yet handed to any decompressor
+    while pending:
+        decompressor = zlib.decompressobj(_GZIP_WBITS)
+        buffered = b""  # input read from ``pending`` but not yet decompressed
+        complete = False
+        while True:
+            if buffered:
+                feed, buffered = buffered[:CHUNK_BYTES], buffered[CHUNK_BYTES:]
+            elif pending:
+                feed, pending = pending[:CHUNK_BYTES], pending[CHUNK_BYTES:]
+            else:
+                break  # input exhausted before the member ended: truncated
+            try:
+                out = decompressor.decompress(feed, MAX_MEMBER_BYTES - total + 1)
+            except zlib.error:
+                raise SupplyError("archive_invalid", asset.key) from None
+            if out:
+                total += len(out)
+                if total > MAX_MEMBER_BYTES:
+                    raise SupplyError("archive_too_large", asset.key)
+                chunks.append(out)
+            if decompressor.unconsumed_tail:
+                buffered += decompressor.unconsumed_tail
+            if decompressor.eof:
+                complete = True
+                break
+        if not complete:
+            raise SupplyError("archive_invalid", asset.key)
+        pending = decompressor.unused_data + buffered
+    return b"".join(chunks)
 
 
 def _zip_member(data: bytes, asset: Asset) -> bytes:
     """The one member ``asset.member`` names - exactly, or by glob when the
-    glob matches exactly one non-directory entry."""
+    glob matches exactly one non-directory entry.  The central-directory size
+    is checked before any data is read, and the streaming read keeps counting
+    in case that size was forged."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             candidates = [name for name in archive.namelist()
@@ -261,21 +304,32 @@ def _zip_member(data: bytes, asset: Asset) -> bytes:
                 raise SupplyError("member_missing", asset.key)
             if len(candidates) > 1:
                 raise SupplyError("member_ambiguous", asset.key)
+            name = candidates[0]
+            if archive.getinfo(name).file_size > MAX_MEMBER_BYTES:
+                raise SupplyError("archive_too_large", asset.key)
+            chunks: List[bytes] = []
+            total = 0
             try:
-                return archive.read(candidates[0])
+                with archive.open(name) as stream:
+                    while True:
+                        piece = stream.read(CHUNK_BYTES)
+                        if not piece:
+                            break
+                        total += len(piece)
+                        if total > MAX_MEMBER_BYTES:
+                            raise SupplyError("archive_too_large", asset.key)
+                        chunks.append(piece)
             except _ZIP_READ_ERRORS:
                 raise SupplyError("archive_invalid", asset.key) from None
+            return b"".join(chunks)
     except zipfile.BadZipFile:
         raise SupplyError("archive_invalid", asset.key) from None
 
 
-def stage_asset(asset: Asset, data: bytes, staging_dir: str, *,
-                api_digest: str = "") -> str:
-    """Verify, extract, and atomically place the member at
-    ``staging_dir/install_as``.  The staging directory must already exist; a
-    failed or mismatched asset leaves nothing behind - not even a temp file."""
-    verify_payload(data, asset, api_digest)
-    member = extract_member(data, asset)
+def _place_member(member: bytes, asset: Asset, staging_dir: str) -> str:
+    """Atomically place ``member`` at ``staging_dir/install_as``.  The
+    staging directory must already exist; a failed placement leaves nothing
+    behind - not even a temp file, whatever exception flies."""
     target = os.path.join(staging_dir, asset.install_as)
     temporary = ""
     try:
@@ -291,6 +345,29 @@ def stage_asset(asset: Asset, data: bytes, staging_dir: str, *,
         if temporary:
             _discard(temporary)
         raise SupplyError("stage_failed", type(exc).__name__) from None
+    except BaseException:
+        if temporary:
+            _discard(temporary)
+        raise
+    return target
+
+
+def _stage_member(asset: Asset, data: bytes, staging_dir: str, *,
+                  api_digest: str = "") -> tuple:
+    """Verify, extract once, and place.  Returns ``(target, member_len)`` so
+    ``_stage_one`` can log the length without extracting a second time."""
+    verify_payload(data, asset, api_digest)
+    member = extract_member(data, asset)
+    target = _place_member(member, asset, staging_dir)
+    return target, len(member)
+
+
+def stage_asset(asset: Asset, data: bytes, staging_dir: str, *,
+                api_digest: str = "") -> str:
+    """Verify, extract, and atomically place the member at
+    ``staging_dir/install_as``.  The staging directory must already exist; a
+    failed or mismatched asset leaves nothing behind - not even a temp file."""
+    target, _ = _stage_member(asset, data, staging_dir, api_digest=api_digest)
     return target
 
 
@@ -323,15 +400,17 @@ def _stage_one(asset: Asset, staging_dir: str, mirror: str, *, fetch,
     """Download, read back, discard the raw download, then verify and stage."""
     destination = os.path.join(staging_dir, asset.key + ".download")
     try:
-        fetch(member_url(asset.url, mirror), destination)
-    except Exception as exc:  # noqa: BLE001 - the fetcher's text never leaks
-        raise SupplyError("download_failed", type(exc).__name__) from None
-    try:
-        with open(destination, "rb") as stream:
-            data = stream.read()
-    except OSError as exc:
-        raise SupplyError("download_failed", type(exc).__name__) from None
-    _discard(destination)  # the raw download never outlives this call
+        try:
+            fetch(member_url(asset.url, mirror), destination)
+        except Exception as exc:  # noqa: BLE001 - the fetcher's text never leaks
+            raise SupplyError("download_failed", type(exc).__name__) from None
+        try:
+            with open(destination, "rb") as stream:
+                data = stream.read()
+        except OSError as exc:
+            raise SupplyError("download_failed", type(exc).__name__) from None
+    finally:
+        _discard(destination)  # the raw download never outlives this call
     api_digest = ""
     if asset.rolling and fetch_release is not None:
         try:
@@ -344,6 +423,7 @@ def _stage_one(asset: Asset, staging_dir: str, mirror: str, *, fetch,
             api_digest = asset_digest_from_release(release, asset)
             if api_digest and api_digest != asset.digest:
                 say(f"supply lock digest stale key={asset.key} verified=api")
-    target = stage_asset(asset, data, staging_dir, api_digest=api_digest)
-    say(f"supply staged key={asset.key} bytes={len(extract_member(data, asset))}")
+    target, member_len = _stage_member(asset, data, staging_dir,
+                                       api_digest=api_digest)
+    say(f"supply staged key={asset.key} bytes={member_len}")
     return target
