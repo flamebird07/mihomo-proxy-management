@@ -154,10 +154,16 @@ class ResolverPriorityTests(unittest.TestCase):
             self.assertEqual(parse(["--app-token", token]).app_token, token)
 
     def test_no_script_hardcodes_a_token_literal(self):
-        for name in ("sync-feishu-bitable.py", "live_status_publish.py",
-                     "sync-xigua-ippool-feishu.py", "source1_independent.py"):
-            text = (SCRIPTS / name).read_text(encoding="utf-8")
-            self.assertNotRegex(text, r"DEFAULT_APP_TOKEN\s*=\s*[\"']", name)
+        scripts = (("sync-feishu-bitable.py",), ("live_status_publish.py",),
+                   ("sync-xigua-ippool-feishu.py",), ("source1_independent.py",),
+                   ("node_provider", "runner.py"), ("node_ops", "runner.py"))
+        for parts in scripts:
+            text = (SCRIPTS.joinpath(*parts)).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"DEFAULT_APP_TOKEN\s*=\s*[\"']", "/".join(parts))
+        # The pipeline entry points must not smuggle one in through argparse.
+        for name in ("node_provider", "node_ops"):
+            text = (SCRIPTS / name / "__main__.py").read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"--app-token[\"'],\s*default\s*=\s*[\"']", name)
 
 
 class LiveBuildClientTests(unittest.TestCase):

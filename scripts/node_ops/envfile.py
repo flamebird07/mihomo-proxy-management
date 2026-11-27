@@ -7,12 +7,14 @@ Contract (matches the existing project convention):
   * no variable expansion, no escape processing;
   * a duplicate key or an unclosed quote is an error (fail closed).
 
+Also resolves the Bitable app_token, which has no built-in default.
+
 Secrets are returned to the caller but never logged by this module.
 """
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 
 class EnvFileError(Exception):
@@ -51,3 +53,23 @@ def require(values: Dict[str, str], key: str) -> str:
     if not value:
         raise EnvFileError(f"missing required env key: {key}")
     return value
+
+
+#: Process-environment key holding the Bitable app_token.  The table address
+#: belongs to the deploying machine, so there is deliberately no default here.
+APP_TOKEN_ENV_KEY = "FEISHU_BITABLE_APP_TOKEN"
+
+
+def resolve_app_token(cli_token: Optional[str], env_file_values: Dict[str, str],
+                      environ: Optional[Dict[str, str]]) -> str:
+    """``--app-token`` > process env > env file; "" when absent everywhere.
+
+    The returned value is a credential: never log or print it.
+    """
+    environ = environ or {}
+    for candidate in (cli_token, environ.get(APP_TOKEN_ENV_KEY),
+                      (env_file_values or {}).get(APP_TOKEN_ENV_KEY)):
+        value = (candidate or "").strip()
+        if value:
+            return value
+    return ""

@@ -36,7 +36,12 @@ EXIT_READ = 3
 EXIT_THRESHOLD = 4
 EXIT_PARTIAL = 5
 
-DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
+#: The Bitable app_token is the table address of the deployment.  There is
+#: deliberately no built-in default: an argparse default would silently beat
+#: ``FEISHU_BITABLE_APP_TOKEN`` in the env file and send a machine to a table
+#: it was never pointed at.  The attribute stays (``None``) for the entry
+#: points that import it; the value comes from :func:`envfile.resolve_app_token`.
+DEFAULT_APP_TOKEN = None
 DEFAULT_ENV_FILE = (r"C:\Users\Administrator\.hermes\.env"
                     if os.name == "nt" else os.path.expanduser("~/.hermes/.env"))
 

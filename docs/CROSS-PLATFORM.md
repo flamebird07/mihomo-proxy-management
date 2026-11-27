@@ -2,7 +2,7 @@
 
 > **读者**：Windows 侧与 macOS 侧的开发者/Agent。两端**异步开发**，本文件是双方必须
 > 共同维护的"接口契约"——改动任何一侧的共享逻辑，先读这里，改完更新这里。
-> 最后更新：2026-11-20（Windows 接入自检 + 测试基线；前版 2026-11-19 feat/macos-compat PR #3）。
+> 最后更新：2026-11-27（流水线脚本去掉内置 app_token，表格地址改由部署机器提供；前版 2026-11-20 Windows 接入自检 + 测试基线）。
 
 ## 1. 一句话架构
 
@@ -19,7 +19,7 @@
 | `scripts/sync-feishu-bitable.py` | 飞书表1(订阅源状态)/表2(可测速节点)/表3(GPT可用地区组) 写入链 | 两端共用；`--source-cache-dir`/`--source1-supplement` 是 mac 守护传的新参数 |
 | `scripts/node_provider/` + `node_ops/` + `gpt_switch_entry.py` + `gpt_stability_policy.py` | 节点流水线核心（采集→测速门控→有效节点 provider；GPT 稳定切换） | 跨平台纯逻辑；**数据只存飞书两表** |
 | `scripts/named_mutex_lock.py` | GPT 切换跨进程锁：Windows=kernel32 named mutex，POSIX=`flock` 文件锁（`NAMED_MUTEX_LOCK_DIR` 可改目录） | 两实现语义对齐：超时=LockBusy，持锁方死亡=内核释放 |
-| **飞书 Bitable** `URo9bAsd5azYe5swAmtclIbEnNh` | 数据总线：「节点测速总表」「有效节点」「采集状态」（流水线）+ 表1/2/3、实时状态、西瓜IP池（sync 链） | 表按**名称**运行时定位，列结构见 `node_provider/schema.py` / `node_ops/schema.py`（两侧镜像，改一边必须同步另一边） |
+| **飞书 Bitable** `URo9bAsd5azYe5swAmtclIbEnNh` | 数据总线：「节点测速总表」「有效节点」「采集状态」（流水线）+ 表1/2/3、实时状态、西瓜IP池（sync 链） | 表按**名称**运行时定位，列结构见 `node_provider/schema.py` / `node_ops/schema.py`（两侧镜像，改一边必须同步另一边）。app_token **没有代码内置默认值**（2026-11-27）：每台机器自带自己的表格地址，解析优先级 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` > env 文件同名键；三处都没有时 `node_provider` / `node_ops` 以退出码 2 报告键名（`app_token_missing`）并等下个周期重试 |
 
 ## 3. 双链并行（谁写哪张表，别搞混）
 
@@ -105,6 +105,9 @@ socket 绑物理网卡直连，绕开 TUN）且 DNS 换用大陆可达解析器
 `upsert ... tombstoned=N` 行确认窗口行为；④ 若有 Windows 专属适配问题（路径、
 计划任务、Ninja 会话读取等）由 Windows 侧自行修——但**不得改变写入纪律本身**：
 任何"改回替换/按载荷删除"的提交都会被裁定测试拒绝。
+⑤ `node_provider` / `node_ops` 不再内置 app_token（2026-11-27）：`--env-file` 指向的文件
+（或进程环境变量）必须有 `FEISHU_BITABLE_APP_TOKEN`，否则这两个入口以退出码 2 退出并打印
+`app_token_missing: FEISHU_BITABLE_APP_TOKEN`（只报键名）。
 
 - **采集 24h 滚动去重**（S7）：订阅源是共享的，任一机器抓过（成功或失败都记录）其他机器
   24h 内跳过；App 通道按机器隔离（`读取机器` 一并入键），本机失败只影响本机——macOS 没有
@@ -112,6 +115,10 @@ socket 绑物理网卡直连，绕开 TUN）且 DNS 换用大陆可达解析器
 - 凭据：两端可用**同一个**飞书应用（推荐）；mac 端凭据在 0600 的
   `state/subscription.env`（FEISHU_APP_ID/SECRET/BITABLE_APP_TOKEN + SUBSCRIPTION_URL*），
   缺失=报告+下周期重试，不阻塞安装。
+- 表格地址（app_token，2026-11-27，影响两端）：`node_provider` / `node_ops` / `sync-feishu-bitable.py` /
+  `live_status_publish.py` 统一按 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` > env 文件
+  同名键解析，代码里不再有任何内置默认值——否则 argparse 默认值会压过 env 文件里配置的地址，
+  把机器连到别的表格上。Windows 生产接入前确认 env 文件里有这个键（见上方接入清单 ⑤）。
 
 ## 6. 修改纪律（异步开发不互相踩）
 

@@ -26,7 +26,12 @@ from .logutil import Logger
 from .model import NodeEntry
 from .probe import IsolatedProber, ProbeResult, default_core_path
 
-DEFAULT_APP_TOKEN = "URo9bAsd5azYe5swAmtclIbEnNh"
+#: The Bitable app_token is the table address of the deployment.  There is
+#: deliberately no built-in default: an argparse default would silently beat
+#: ``FEISHU_BITABLE_APP_TOKEN`` in the env file and send a machine to a table
+#: it was never pointed at.  The attribute stays (``None``) for the entry
+#: points that import it; the value comes from :func:`envfile.resolve_app_token`.
+DEFAULT_APP_TOKEN = None
 DEFAULT_ENV_FILE = (r"C:\Users\Administrator\.hermes\.env"
                     if os.name == "nt" else os.path.expanduser("~/.hermes/.env"))
 
@@ -40,7 +45,7 @@ class RunError(Exception):
 @dataclass
 class Settings:
     env_file: str = DEFAULT_ENV_FILE
-    app_token: str = DEFAULT_APP_TOKEN
+    app_token: str = ""
     workers: int = 4
     total_budget_s: float = 600.0
     ipinfo_budget_s: float = 600.0

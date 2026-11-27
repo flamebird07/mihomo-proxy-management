@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import app_extract, schema
-from .envfile import EnvFileError, read_env_file
+from .envfile import EnvFileError, read_env_file, resolve_app_token
 from .feishu import FeishuClient
 from .lock import FileLock, LockBusy
 from .logutil import stderr_logger
@@ -80,7 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true",
                         help="full extraction/rebuild; never write Feishu or a file")
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
-                        help="Feishu Bitable app_token (default: project app)")
+                        help="Feishu Bitable app_token (--app-token > env "
+                             "FEISHU_BITABLE_APP_TOKEN > --env-file); no default")
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
                         help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET")
     parser.add_argument("--table-name", default=schema.VALID_TABLE_NAME,
@@ -100,11 +101,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _credentials(path: str, logger):
+def _load_env(path: str, logger) -> Optional[dict]:
     try:
-        values = read_env_file(path)
+        return read_env_file(path)
     except EnvFileError as exc:
         logger.error(f"credentials unavailable class={type(exc).__name__}")
+        return None
+
+
+def _credentials(path: str, logger):
+    return _credentials_from(_load_env(path, logger), logger)
+
+
+def _credentials_from(values: Optional[dict], logger):
+    if values is None:
         return None
     app_id = (values.get("FEISHU_APP_ID") or "").strip()
     app_secret = (values.get("FEISHU_APP_SECRET") or "").strip()
@@ -148,13 +158,22 @@ def main(argv: Optional[List[str]] = None, client_factory=FeishuClient,
             if not Path(directory or ".").is_dir():
                 parser.error("output directory does not exist")
 
-    credentials = _credentials(args.env_file, logger)
+    # The table address is the deployment's own: explicit flag, then the
+    # process environment, then the env file.  There is no built-in default.
+    values = _load_env(args.env_file, logger)
+    app_token = resolve_app_token(args.app_token, values or {}, os.environ)
+    logger.add_secret(app_token)
+    credentials = _credentials_from(values, logger)
     if credentials is None:
         if not (args.collect and args.dry_run):
             return EXIT_USAGE
-        client = None
+        client = None  # without credentials a collect dry-run cannot reach Feishu anyway
+    elif not app_token:
+        logger.error("app_token_missing: FEISHU_BITABLE_APP_TOKEN "
+                     "(--app-token > env > --env-file)")
+        return EXIT_USAGE
     else:
-        client = client_factory(credentials[0], credentials[1], args.app_token)
+        client = client_factory(credentials[0], credentials[1], app_token)
 
     settings = Settings(
         output=args.output,

@@ -21,11 +21,12 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from .envfile import EnvFileError, read_env_file
+from .envfile import EnvFileError, read_env_file, resolve_app_token
 from .feishu import FeishuClient, FeishuError
 from .lock import FileLock, LockBusy
 from .logutil import Logger
@@ -35,6 +36,15 @@ from .runner import DEFAULT_APP_TOKEN, DEFAULT_ENV_FILE, RunError, Settings, run
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG_FILE = str(PROJECT_ROOT / "logs" / "node_ops.log")
 DEFAULT_LOCK_FILE = str(PROJECT_ROOT / "logs" / "node_ops.lock")
+
+#: Logged (key name only) when the table address is configured nowhere.  Every
+#: node_ops mode reads Feishu, so there is no token-less path.
+APP_TOKEN_MISSING = ("app_token_missing: FEISHU_BITABLE_APP_TOKEN "
+                     "(--app-token > env > --env-file)")
+
+
+class AppTokenMissing(Exception):
+    """The Bitable app_token is configured nowhere; nothing was contacted."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ensure-tables", action="store_true",
                         help="only create/patch the two Feishu tables, then exit")
     parser.add_argument("--app-token", default=DEFAULT_APP_TOKEN,
-                        help="Feishu Bitable app_token (default: project app)")
+                        help="Feishu Bitable app_token (--app-token > env "
+                             "FEISHU_BITABLE_APP_TOKEN > --env-file); no default")
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE,
                         help="credentials env file with FEISHU_APP_ID/FEISHU_APP_SECRET")
     parser.add_argument("--core", default=default_core_path(),
@@ -65,7 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _credentials(settings: Settings, log: Logger) -> Optional[FeishuClient]:
+def _credentials(settings: Settings, log: Logger,
+                 environ: Optional[dict] = None) -> Optional[FeishuClient]:
     try:
         values = read_env_file(settings.env_file)
     except EnvFileError as exc:
@@ -77,14 +89,22 @@ def _credentials(settings: Settings, log: Logger) -> Optional[FeishuClient]:
         log.warn("credentials unavailable class=missing_keys")
         return None
     log.add_secret(app_secret)
-    return FeishuClient(app_id, app_secret, settings.app_token, log.info)
+    # The table address is the deployment's own: explicit flag, then the
+    # process environment, then the env file.  There is no built-in default.
+    app_token = resolve_app_token(settings.app_token, values,
+                                  os.environ if environ is None else environ)
+    if not app_token:
+        log.error(APP_TOKEN_MISSING)
+        raise AppTokenMissing(APP_TOKEN_MISSING)
+    log.add_secret(app_token)
+    return FeishuClient(app_id, app_secret, app_token, log.info)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     settings = Settings(
         env_file=args.env_file,
-        app_token=args.app_token,
+        app_token=args.app_token or "",
         workers=args.workers,
         total_budget_s=args.total_budget,
         ipinfo_budget_s=args.ipinfo_budget,
@@ -96,7 +116,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         verbose=args.verbose,
     )
     log = Logger(args.log_file, verbose=args.verbose)
-    client = _credentials(settings, log)
+    try:
+        client = _credentials(settings, log)
+    except AppTokenMissing as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if client is None:
         print("error: Feishu credentials are required", file=sys.stderr)
         return 2

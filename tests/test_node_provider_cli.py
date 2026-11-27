@@ -197,7 +197,7 @@ class CredentialAndCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             env = os.path.join(root, "creds.env")
             with open(env, "w", encoding="utf-8") as handle:
-                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\n")
+                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\nFEISHU_BITABLE_APP_TOKEN=fake-app-token-cli\n")
             with self.assertRaises(SystemExit) as caught:
                 cli.main(["--env-file", env])
             self.assertEqual(caught.exception.code, 2)
@@ -206,7 +206,7 @@ class CredentialAndCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             env = os.path.join(root, "creds.env")
             with open(env, "w", encoding="utf-8") as handle:
-                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\n")
+                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\nFEISHU_BITABLE_APP_TOKEN=fake-app-token-cli\n")
             with self.assertRaises(SystemExit) as caught:
                 cli.main(["--env-file", env, "-o",
                           os.path.join(root, "missing", "p.yaml")])
@@ -217,7 +217,7 @@ class CredentialAndCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             env = os.path.join(root, "creds.env")
             with open(env, "w", encoding="utf-8") as handle:
-                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\n")
+                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\nFEISHU_BITABLE_APP_TOKEN=fake-app-token-cli\n")
             output = os.path.join(root, "provider.yaml")
             created = []
 
@@ -236,7 +236,7 @@ class CredentialAndCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             env = os.path.join(root, "creds.env")
             with open(env, "w", encoding="utf-8") as handle:
-                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\n")
+                handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\nFEISHU_BITABLE_APP_TOKEN=fake-app-token-cli\n")
             code = cli.main(["--env-file", env, "--dry-run"],
                             client_factory=lambda *a: FakeClient([row(cfg("a"))]),
                             now_ms=NOW_MS)
@@ -247,7 +247,7 @@ class CollectCliTests(unittest.TestCase):
     def _env(self, root):
         env = os.path.join(root, "creds.env")
         with open(env, "w", encoding="utf-8") as handle:
-            handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\n")
+            handle.write("FEISHU_APP_ID=id\nFEISHU_APP_SECRET=secret-value\nFEISHU_BITABLE_APP_TOKEN=fake-app-token-cli\n")
         return env
 
     def test_collect_requires_a_channel(self):
