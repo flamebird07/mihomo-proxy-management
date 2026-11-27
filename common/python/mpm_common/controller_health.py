@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Union
 from urllib.parse import quote
 
 from .errors import FailClosed, NotReady
@@ -58,7 +58,7 @@ Transport = Callable[[str, str, dict[str, str], Any, float], tuple[int, bytes]]
 
 #: A request timeout, or a callable re-evaluated before *each* request so a
 #: multi-request helper follows a moving (deadline-derived) budget.
-TimeoutSpec = float | Callable[[], float] | None
+TimeoutSpec = Optional[Union[float, Callable[[], float]]]
 
 
 def _timeout_for(spec: TimeoutSpec, default: float) -> float:

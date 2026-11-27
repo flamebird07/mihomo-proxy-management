@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -103,6 +104,7 @@ SUBCOMMANDS = (
     "uninstall",
     "switch",
     "probe",
+    "bootstrap",
 )
 
 STATE_SCHEMA = 1
@@ -1322,6 +1324,255 @@ def _install_binary(ctx: Context) -> bool:
             payload = handle.read()
         write_atomic(target, payload, mode=0o644)
     return changed
+
+
+# ---- fresh-Mac bootstrap --------------------------------------------------
+
+#: Operator override for the venv's base interpreter; tried before every
+#: discovered candidate.
+BASE_PYTHON_ENV = "MPM_BASE_PYTHON"
+#: Python.org installers put each version here; highest version wins.
+PYTHON_FRAMEWORK_VERSIONS = "/Library/Frameworks/Python.framework/Versions"
+#: Fallbacks after the operator override and the Python.org frameworks.
+FIXED_BASE_PYTHONS = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "/usr/bin/python3",
+)
+MIN_PYTHON = (3, 9)
+#: Trusted argv only (never a shell): print the version and fail when it is
+#: older than ``MIN_PYTHON``, so one probe decides usability.
+PYTHON_VERSION_PROBE = (
+    "import sys; print('%d.%d' % sys.version_info[:2]); "
+    "raise SystemExit(0 if sys.version_info >= " + repr(MIN_PYTHON) + " else 1)"
+)
+YAML_PROBE = "import yaml"
+VENV_CREATE_TIMEOUT_SECONDS = 300.0
+VENV_PIP_TIMEOUT_SECONDS = 600.0
+DEPLOY_ENTRY_PARTS = ("scripts", "deploy", "__main__.py")
+
+
+def framework_python_candidates(frameworks_dir: str | None = None) -> list[str]:
+    """Python.org framework interpreters, highest version first.
+
+    Only concrete ``Versions/<x.y>/bin/python3`` executables are returned; a
+    host without the directory simply contributes none.  The directory is a
+    parameter so a host-free test can point it at a throwaway tree.
+    """
+    base = PYTHON_FRAMEWORK_VERSIONS if frameworks_dir is None else frameworks_dir
+    if not os.path.isdir(base):
+        return []
+    found: list[tuple[tuple[int, ...], str]] = []
+    for name in sorted(os.listdir(base)):
+        parts = name.split(".")
+        if not parts or not all(part.isdigit() for part in parts):
+            continue
+        path = os.path.join(base, name, "bin", "python3")
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            found.append((tuple(int(part) for part in parts), path))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in found]
+
+
+def base_python_candidates(ctx: Context) -> list[str]:
+    """Base interpreters to probe, in the documented order.
+
+    ``MPM_BASE_PYTHON`` -> Python.org frameworks (version first) ->
+    ``/opt/homebrew/bin/python3`` -> ``/usr/local/bin/python3`` ->
+    ``/usr/bin/python3`` -> ``python3`` on the context's PATH.  Duplicates
+    keep their first position.
+    """
+    ordered: list[str] = []
+
+    def add(path: str | None) -> None:
+        candidate = (path or "").strip()
+        if candidate and candidate not in ordered:
+            ordered.append(candidate)
+
+    add(ctx.environ.get(BASE_PYTHON_ENV))
+    for path in framework_python_candidates():
+        add(path)
+    for path in FIXED_BASE_PYTHONS:
+        add(path)
+    add(ctx.executor.which("python3"))
+    return ordered
+
+
+def find_base_python(ctx: Context) -> str:
+    """First candidate whose trusted version probe reports Python >=3.9.
+
+    Every candidate is probed with an argv list (no shell).  When none works,
+    the error names each candidate, its exit code and the version it claimed,
+    plus the ``MPM_BASE_PYTHON`` escape hatch.
+    """
+    tried: list[str] = []
+    for candidate in base_python_candidates(ctx):
+        result = ctx.executor.run(
+            [candidate, "-c", PYTHON_VERSION_PROBE], timeout=30.0
+        )
+        if result.ok:
+            return candidate
+        version = (result.stdout or "").strip().splitlines()
+        claimed = HOST.text(version[0]) if version else ""
+        detail = f"{candidate} (rc={result.returncode}"
+        detail += f", {claimed})" if claimed else ")"
+        tried.append(detail)
+    hint = "; ".join(tried) if tried else "no python3 candidate was found"
+    raise FailClosed(
+        "no usable Python >=3.9 for the mpm venv; set MPM_BASE_PYTHON to one "
+        "(tried: " + hint + ")"
+    )
+
+
+def _venv_has_yaml(ctx: Context, venv_python: str) -> bool:
+    """Whether the fixed venv's interpreter exists and can import PyYAML."""
+    result = ctx.executor.run([venv_python, "-c", YAML_PROBE], timeout=30.0)
+    return bool(result.ok)
+
+
+def ensure_venv(ctx: Context, *, report: Report | None = None) -> str:
+    """Return ``layout.venv_python``, preparing the fixed venv when needed.
+
+    An already-working venv (interpreter present and ``import yaml`` passes)
+    is reused as-is.  Otherwise a base interpreter is found, the **fixed**
+    ``layout.libexec_venv`` directory is rebuilt with ``--clear`` and PyYAML
+    is installed; a broken venv therefore never causes a rebuild anywhere
+    else.  The replacement interpreter is always located *before* the old
+    venv is cleared, so a host without another Python changes nothing.
+    """
+    layout = ctx.layout
+    venv_python = layout.venv_python
+    if _venv_has_yaml(ctx, venv_python):
+        if report is not None:
+            report.add("Python venv reused: " + layout.libexec_venv)
+        return venv_python
+
+    base = find_base_python(ctx)
+    venv_dir = layout.libexec_venv
+    if os.path.islink(venv_dir):
+        raise FailClosed(
+            "the mpm venv path is a symlink; refusing to clear anything but "
+            "the fixed venv directory: " + venv_dir
+        )
+    if os.path.exists(venv_dir) and not os.path.isdir(venv_dir):
+        raise FailClosed(
+            "the mpm venv path exists but is not a directory; refusing to "
+            "replace anything but the fixed venv directory: " + venv_dir
+        )
+    ensure_dir(os.path.dirname(venv_dir), 0o755)
+
+    created = ctx.executor.run(
+        [base, "-m", "venv", "--clear", venv_dir],
+        timeout=VENV_CREATE_TIMEOUT_SECONDS,
+    )
+    if not created.ok:
+        raise FailClosed(
+            "could not create the mpm venv at "
+            + venv_dir
+            + f" with {base} (rc={created.returncode}); install the Xcode "
+            "command-line tools or set MPM_BASE_PYTHON to a Python >=3.9"
+        )
+    installed = ctx.executor.run(
+        [
+            venv_python,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--quiet",
+            "pyyaml",
+        ],
+        timeout=VENV_PIP_TIMEOUT_SECONDS,
+    )
+    if not installed.ok:
+        raise FailClosed(
+            "could not install PyYAML into "
+            + venv_dir
+            + f" (rc={installed.returncode}); check pip's network access and retry"
+        )
+    if not _venv_has_yaml(ctx, venv_python):
+        raise FailClosed(
+            "the new mpm venv cannot import yaml: " + venv_python
+        )
+    if report is not None:
+        report.add("Python venv prepared: " + layout.libexec_venv)
+    return venv_python
+
+
+def bootstrap(
+    ctx: Context,
+    *,
+    quiet: bool = False,
+    dry_run: bool = False,
+    start: bool = True,
+    skip_supply: bool = False,
+    skip_install: bool = False,
+    min_nodes: int | None = None,
+    runner: Callable[..., Any] | None = None,
+) -> Report:
+    """Prepare the venv and hand this checkout to ``scripts/deploy``.
+
+    The deploy child inherits the process's real stdin/stdout/stderr so its
+    hidden prompts (``getpass``) and a piped stdin JSON both work; progress is
+    its own, and this report stays the lifecycle's ``--quiet``/``--json``
+    output.  ``MPM_PYTHON`` is exported as the venv interpreter, which the
+    platform installer uses for the ``mpm_macos.cli install`` child.  The
+    child's exit code is preserved; nothing here takes the lifecycle lock -
+    the install child does that itself.
+    """
+    if ctx.system_profile and ctx.geteuid() != ROOT_UID:
+        raise FailClosed("bootstrap requires root; run the checkout wrapper with sudo")
+    report = Report(command="bootstrap")
+    repo_root = _repo_root()
+    deploy_entry = os.path.join(repo_root, *DEPLOY_ENTRY_PARTS)
+    if not os.path.isfile(deploy_entry):
+        raise FailClosed(
+            "bootstrap needs the deploy entry from this checkout: " + deploy_entry
+        )
+    if min_nodes is not None and min_nodes < 0:
+        raise FailClosed("--min-nodes must be >= 0")
+    venv_python = ensure_venv(ctx, report=report)
+
+    argv = [venv_python, deploy_entry, "--platform", "macos"]
+    if dry_run:
+        argv.append("--dry-run")
+    if not start:
+        argv.append("--no-start")
+    if skip_supply:
+        argv.append("--skip-supply")
+    if skip_install:
+        argv.append("--skip-install")
+    if min_nodes is not None:
+        argv.extend(["--min-nodes", str(min_nodes)])
+
+    env = dict(os.environ)
+    env.update(ctx.environ)
+    env["MPM_PYTHON"] = venv_python
+    if not quiet:
+        report.add("bootstrap: deploying this Mac from the Feishu Bitable")
+
+    spawn = runner or subprocess.run
+    try:
+        completed = spawn(
+            argv,
+            cwd=repo_root,
+            env=env,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+        )
+    except OSError as exc:
+        raise FailClosed("could not run the deploy entry: " + type(exc).__name__)
+    exit_code = int(getattr(completed, "returncode", 1))
+    report.data["deploy"] = {"argv": list(argv), "exit_code": exit_code}
+    if exit_code != 0:
+        report.status = "FAILED"
+        report.exit_code = exit_code
+        report.warn(f"deploy exited {exit_code}")
+        return report
+    if not quiet:
+        report.add("bootstrap complete (deploy exit 0)")
+    return report
 
 
 def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> Report:

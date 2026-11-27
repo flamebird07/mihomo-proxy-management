@@ -138,6 +138,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="minimum merged candidates (default: the converter's own floor)",
     )
 
+    bootstrap = common(
+        "bootstrap",
+        "prepare the venv and deploy this Mac from the Feishu Bitable (root)",
+    )
+    bootstrap.add_argument(
+        "--dry-run", action="store_true",
+        help="prepare Python if needed, then check Feishu access without installing"
+    )
+    bootstrap.add_argument(
+        "--no-start", action="store_true", help="install without starting the service"
+    )
+    bootstrap.add_argument(
+        "--skip-supply", action="store_true", help="skip downloading binaries into staging"
+    )
+    bootstrap.add_argument(
+        "--skip-install", action="store_true", help="skip calling the platform installer"
+    )
+    bootstrap.add_argument(
+        "--min-nodes", type=int, help="minimum pool nodes required (default: deploy's own)"
+    )
+
     uninstall = common("uninstall", "remove the LaunchDaemon and program files")
     uninstall.add_argument(
         "--purge", action="store_true", help="also remove config, provider, logs and state"
@@ -256,6 +277,23 @@ def _dispatch(ctx: lifecycle.Context, args: argparse.Namespace) -> lifecycle.Rep
             report.exit_code = int(ExitCode.NOT_READY)
             report.warn(verdict.reason or "probe failed")
         return report
+    if command == "bootstrap":
+        # A sandbox --root here would mean the venv/install children silently
+        # target the real host while the operator thinks otherwise; refuse it
+        # outright instead of trying to thread it through the deploy flow.
+        if getattr(args, "root", None):
+            raise FailClosed(
+                "bootstrap does not accept --root: it always installs on this host"
+            )
+        return lifecycle.bootstrap(
+            ctx,
+            quiet=bool(args.quiet),
+            dry_run=bool(args.dry_run),
+            start=not bool(args.no_start),
+            skip_supply=bool(args.skip_supply),
+            skip_install=bool(args.skip_install),
+            min_nodes=getattr(args, "min_nodes", None),
+        )
     if command == "uninstall":
         return lifecycle.uninstall(ctx, purge=bool(args.purge), quiet=args.quiet)
     raise FailClosed(f"unknown command: {sanitize(str(command))}")

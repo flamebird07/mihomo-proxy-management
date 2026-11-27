@@ -153,6 +153,37 @@ socket 绑物理网卡直连，绕开 TUN）且 DNS 换用大陆可达解析器
   同名键解析，代码里不再有任何内置默认值——否则 argparse 默认值会压过 env 文件里配置的地址，
   把机器连到别的表格上。Windows 生产接入前确认 env 文件里有这个键（见上方接入清单 ⑤）。
 
+### 新机引导：macOS venv 与 `bootstrap`（2026-11-28）
+
+新机器从 Git 检出后只有一条命令，不再要求手工装 Python 包：
+
+```sh
+sudo ./macos/scripts/bootstrap.sh [--dry-run] [--no-start] [--skip-supply] [--skip-install] [--min-nodes N]
+# 检出上下文的等价入口（仍未装 CLI 时）：
+PYTHONPATH=common/python:macos/python /usr/bin/python3 -m mpm_macos.cli bootstrap ...
+```
+
+- **专用 venv**：`/usr/local/libexec/mpm-python-venv`（`Layout.libexec_venv` / `venv_python`，
+  随 `--root` 派生）。`lifecycle.ensure_venv` 先复用它：解释器存在且 `import yaml` 通过即复用；
+  否则按 **`MPM_BASE_PYTHON` → Python.org `/Library/Frameworks/Python.framework/Versions/*`
+  （版本高优先）→ `/opt/homebrew/bin/python3` → `/usr/local/bin/python3` →
+  `/usr/bin/python3` → `PATH`** 找基础解释器（可信 argv 探测 `>=3.9`），再
+  `-m venv --clear` 重建**这个固定目录**并 `-m pip install --disable-pip-version-check
+  --quiet pyyaml`，最后复验 `import yaml`。坏 venv 只会重建该目录，且必须先找到可用替代解释器。
+- **交给 deploy**：`lifecycle.bootstrap` 确认本检出有 `scripts/deploy/__main__.py`，用继承
+  stdin/stdout/stderr 的 `subprocess.run` 以 argv 调用
+  `venv/python3 scripts/deploy/__main__.py --platform macos ...`，透传
+  `--dry-run/--no-start/--skip-supply/--skip-install/--min-nodes`，并把 `MPM_PYTHON` 设为
+  venv 给安装子进程；子进程退出码原样作为 CLI 退出码。stdout 的生命周期报告仍按 CLI 的
+  `--quiet/--json` 输出（deploy 自己的进度走 stderr）。
+- **不加锁、拒绝 `--root`**：`bootstrap` 不进 `MUTATING_COMMANDS`（`install` 子进程自己拿
+  生命周期锁）；CLI 明确拒绝 `--root`，避免沙箱路径漏传时 venv/安装悄悄落到生产路径。
+- **解释器兼容**：`mpm_common.controller_health.TimeoutSpec` 改为
+  `typing.Optional`/`typing.Union` 写法，系统 `/usr/bin/python3`（3.9）上的
+  `python3 -m mpm_macos.cli --help` / `import` 不再因 PEP 604 运行时求值而报错。
+- `scripts/deploy/platforms.py` 的 `MACOS_DEFAULT_PYTHON` 与上述 venv 路径一致；`_common.sh`
+  在没有 venv 时用 `MPM_BASE_PYTHON` 或 `/usr/bin/python3` 引导，普通管理命令仍优先用已安装 CLI。
+
 ## 6. 修改纪律（异步开发不互相踩）
 
 1. **共享文件**（§2 表格）里的任何行为变更：提交说明写清"影响两端"，mac 侧守护是

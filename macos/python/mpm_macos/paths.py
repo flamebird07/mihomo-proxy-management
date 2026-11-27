@@ -8,6 +8,7 @@ layout:
     /Library/LaunchDaemons/com.mihomo-proxy-management.boot-switch.plist
     /usr/local/bin/mihomo-proxy-management
     /usr/local/libexec/mihomo-proxy-management/current/{mihomo,runner}
+    /usr/local/libexec/mpm-python-venv/bin/python3
     /usr/local/share/mihomo-proxy-management/{python,templates,scripts}
     /Library/Application Support/mihomo-proxy-management/{config.yaml,providers,state,logs}
     /var/run/mihomo-proxy-management/{lifecycle.lock,core.lock}
@@ -54,6 +55,11 @@ NODE_PIPELINE_PLIST_NAME = f"{NODE_PIPELINE_LABEL}.plist"
 
 SUPPORT_DIR_NAME = PROJECT
 RUN_DIR_NAME = PROJECT
+#: Dedicated interpreter for the runtime: system Python on a fresh Mac has no
+#: PyYAML, so the bootstrap creates this one fixed venv and every later entry
+#: (installed CLI, deploy child) runs on it.  Never a user- or PATH-selected
+#: interpreter, so a rebuild can only ever touch this directory.
+VENV_DIR_NAME = "mpm-python-venv"
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,16 @@ class Layout:
     @property
     def libexec(self) -> str:
         return os.path.join(self.root, "usr", "local", "libexec", PROJECT)
+
+    @property
+    def libexec_venv(self) -> str:
+        """The bootstrap-created venv (``/usr/local/libexec/mpm-python-venv``)."""
+        return os.path.join(self.root, "usr", "local", "libexec", VENV_DIR_NAME)
+
+    @property
+    def venv_python(self) -> str:
+        """The venv's interpreter - the only Python a runtime entry may use."""
+        return os.path.join(self.libexec_venv, "bin", "python3")
 
     @property
     def libexec_current(self) -> str:
@@ -359,6 +375,7 @@ class Layout:
             self.cli_entry,
             self.switch_entry,
             self.libexec,
+            self.libexec_venv,
             self.share,
             self.support,
             self.run_dir,
@@ -435,6 +452,7 @@ __all__ = [
     "POOL_FILE_NAME",
     "PROJECT",
     "RUNNER_NAME",
+    "VENV_DIR_NAME",
     "Layout",
     "managed_dirs",
 ]
