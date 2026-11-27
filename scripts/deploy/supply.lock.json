@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-27",
+  "generated_by": "read-only release metadata queries (GitHub REST API, wintun.net, python.org); digests confirmed by an actual download only for wintun and the Python installer",
+  "policy": {
+    "pinning": "exact asset URL + digest + byte size; a missing or mismatched digest aborts before anything is staged",
+    "rolling_assets": "meta-rules-dat republishes under a tag literally named 'latest', so the digest here is only a fallback: the live GitHub API asset digest is preferred whenever the API answers",
+    "fallback": "none; an unreachable API never degrades into an unverified download",
+    "credentials": "none; public read-only metadata only",
+    "mirrors": "MPM_GITHUB_MIRROR may prefix github.com download URLs; verification is unchanged, so a mirror can only fail, never substitute"
+  },
+  "mihomo_tag": "v1.19.34",
+  "python_tag": "3.13.17",
+  "assets": [
+    {
+      "key": "mihomo-darwin-arm64",
+      "os": "macos",
+      "arch": "arm64",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-darwin-arm64-v1.19.34.gz",
+      "digest": "1a7a20eca63fbbaec90137717465bfde488d0db2a3a79b8fadebf9b2545b6e4c",
+      "size": 20649699,
+      "fmt": "gzip",
+      "install_as": "mihomo",
+      "mode": "0755"
+    },
+    {
+      "key": "mihomo-windows-amd64-v3",
+      "os": "windows",
+      "arch": "amd64",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-windows-amd64-v3-v1.19.34.zip",
+      "digest": "ace63713ea5137d7fcc58c1434b7dee15bccf77457573c84ff2c14b8fb7f07d6",
+      "size": 22386207,
+      "fmt": "zip",
+      "member": "mihomo-windows-amd64*.exe",
+      "install_as": "mihomo.exe",
+      "mode": "0755"
+    },
+    {
+      "key": "wintun",
+      "os": "windows",
+      "arch": "all",
+      "url": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+      "digest": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+      "size": 750540,
+      "fmt": "zip",
+      "member": "wintun/bin/amd64/wintun.dll",
+      "install_as": "wintun.dll"
+    },
+    {
+      "key": "python-windows-amd64",
+      "os": "windows",
+      "arch": "amd64",
+      "url": "https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe",
+      "digest": "5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190",
+      "size": 29941280,
+      "fmt": "raw",
+      "install_as": "python-3.13.17-amd64.exe",
+      "authenticode_signer": "Python Software Foundation"
+    },
+    {
+      "key": "geoip",
+      "os": "all",
+      "arch": "all",
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+      "digest": "9dc8e7de8db8300ce27b606f4a30632265713d2f33bcc568c0d2c44c825c8687",
+      "size": 16676025,
+      "fmt": "raw",
+      "install_as": "GeoIP.dat",
+      "rolling": true,
+      "api": "https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/tags/latest"
+    },
+    {
+      "key": "geosite",
+      "os": "all",
+      "arch": "all",
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+      "digest": "f187c87088838f757c880bcbd4bb172e45697d6a8d08158beb49c7500dc0da1e",
+      "size": 4357245,
+      "fmt": "raw",
+      "install_as": "GeoSite.dat",
+      "rolling": true,
+      "api": "https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/tags/latest"
+    },
+    {
+      "key": "geoip-metadb",
+      "os": "all",
+      "arch": "all",
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+      "digest": "137a8c42fbb2d91a499770c97b75ca615c86d2b477c021dfe7ee6a371ade31ca",
+      "size": 8505514,
+      "fmt": "raw",
+      "install_as": "geoip.metadb",
+      "rolling": true,
+      "api": "https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/tags/latest"
+    }
+  ]
+}
