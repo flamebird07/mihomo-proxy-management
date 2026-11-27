@@ -652,3 +652,255 @@ def test_uninstall_purge_removes_state(tmp_path):
     lifecycle.uninstall(ctx, purge=True, quiet=True)
     assert not os.path.exists(ctx.layout.support)
     assert not os.path.exists(ctx.layout.run_dir)
+
+
+# ---- Feishu-pool mode (no subscription URL) --------------------------------
+
+
+def _pool_context(tmp_path, **kwargs):
+    """A context whose secret file has no subscription URL (pool mode)."""
+    return make_context(
+        tmp_path,
+        environ={"MPM_SUBSCRIPTION_URL": "", "MPM_SECRET": ""},
+        **kwargs,
+    )
+
+
+def _write_pool(ctx, names=("美国-01", "日本-01", "新加坡-01")) -> None:
+    """A node pool provider file inside the sandbox (host-free by construction)."""
+    path = ctx.layout.pool_file
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(
+            {"proxies": [{"name": name, "type": "ss"} for name in names]},
+            handle,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+
+
+def _write_secrets(ctx, text="SUBSCRIPTION_URL=\nSECRET=canary-controller\n") -> None:
+    """A 0600-file payload with the controller secret (always required)."""
+    os.makedirs(ctx.layout.state_dir, exist_ok=True)
+    with open(ctx.layout.secret_file, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def test_load_secrets_allows_an_empty_subscription_url(tmp_path):
+    ctx = _pool_context(tmp_path)
+    os.makedirs(ctx.layout.state_dir, exist_ok=True)
+    with open(ctx.layout.secret_file, "w", encoding="utf-8") as handle:
+        handle.write("SECRET=canary-controller\n")
+    secrets = ctx.secrets()
+    assert secrets.subscription_url == ""
+    assert secrets.controller_secret == "canary-controller"
+
+
+def test_load_secrets_still_fails_closed_without_a_controller_secret(tmp_path):
+    ctx = _pool_context(tmp_path)
+    os.makedirs(ctx.layout.state_dir, exist_ok=True)
+    with open(ctx.layout.secret_file, "w", encoding="utf-8") as handle:
+        handle.write("SUBSCRIPTION_URL=\n")
+    with pytest.raises(FailClosed):
+        ctx.secrets()
+
+
+def test_empty_url_round_trips_through_save_secrets(tmp_path):
+    ctx = _pool_context(tmp_path)
+    os.makedirs(ctx.layout.state_dir, exist_ok=True)
+    with open(ctx.layout.secret_file, "w", encoding="utf-8") as handle:
+        handle.write(
+            "SECRET=canary-controller\n"
+            "FEISHU_APP_ID=app-id\n"
+            "FEISHU_APP_SECRET=app-secret\n"
+        )
+    secrets = ctx.secrets()
+    lifecycle.save_secrets(ctx.layout, secrets)
+    reread = ctx.secrets()
+    assert reread.subscription_url == ""
+    assert reread.controller_secret == "canary-controller"
+    assert reread.feishu_app_id == "app-id"
+    assert reread.feishu_app_secret == "app-secret"
+
+
+def test_pool_install_renders_the_file_provider(tmp_path):
+    ctx = _pool_context(tmp_path)
+    prepare_install(ctx)
+    _write_secrets(ctx)
+    _write_pool(ctx)
+
+    report = lifecycle.install(ctx, quiet=True, skip_start=True)
+
+    assert report.status == "OK", report.messages
+    assert report.data["provider_nodes"] == 3
+    with open(ctx.layout.config, "r", encoding="utf-8") as handle:
+        document = yaml.safe_load(handle.read())
+    provider = document["proxy-providers"]["subscription"]
+    assert provider["type"] == "file"
+    assert provider["path"] == config.POOL_PROVIDER_PATH
+    assert "url" not in provider
+    assert "interval" not in provider
+    # the policy verdict was computed from the pool node names (美国/日本 hit
+    # CURSOR; the missing CODEBUDDY-HK region surfaces as a warning)
+    assert any("CODEBUDDY-HK" in warning for warning in report.warnings)
+
+
+def test_pool_install_fails_closed_when_the_pool_file_is_missing(tmp_path):
+    ctx = _pool_context(tmp_path)
+    prepare_install(ctx)
+    _write_secrets(ctx)
+
+    with pytest.raises(FailClosed) as excinfo:
+        lifecycle.install(ctx, quiet=True, skip_start=True)
+
+    assert "Feishu node pool" in str(excinfo.value)
+
+
+def test_pool_install_fails_closed_when_the_pool_has_no_cursor_region(tmp_path):
+    ctx = _pool_context(tmp_path)
+    prepare_install(ctx)
+    _write_secrets(ctx)
+    _write_pool(ctx, names=("香港-01", "新加坡-01"))
+
+    with pytest.raises(FailClosed):
+        lifecycle.install(ctx, quiet=True, skip_start=True)
+
+
+def test_root_pool_install_chowns_the_pool_file(tmp_path):
+    owner = _Ownership(0)
+    # the controller secret comes from the environment: a real root install
+    # writes the 0600 secret file itself (an unowned file would trip the
+    # system-profile secret check before install even starts)
+    ctx = make_context(
+        tmp_path,
+        environ={"MPM_SUBSCRIPTION_URL": "", "MPM_SECRET": "canary-root-install"},
+        system_profile=True,
+        geteuid=owner.geteuid,
+        chown=owner.chown,
+    )
+    prepare_install(ctx)
+    _write_pool(ctx)
+
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    assert os.path.normpath(ctx.layout.pool_file) in owner.paths()
+
+
+def test_install_copies_the_feishu_pool_script(tmp_path):
+    ctx, _harness, _network = _installed(tmp_path)
+    installed = os.path.join(ctx.layout.scripts_dir, "feishu_pool.py")
+    assert os.path.isfile(installed)
+
+
+def test_groups_reads_the_pool_file_in_pool_mode(tmp_path):
+    ctx = _pool_context(tmp_path)
+    prepare_install(ctx)
+    _write_secrets(ctx)
+    _write_pool(ctx)
+    assert lifecycle.install(ctx, quiet=True, skip_start=True).status == "OK"
+
+    report = lifecycle.groups(ctx)
+
+    assert report.status == "OK"
+    assert report.data["provider_nodes"] == 3
+    rows = {row["name"]: row for row in report.data["groups"]}
+    assert rows["CURSOR-US"]["matched_nodes"] == 1
+    assert rows["CURSOR-JP"]["matched_nodes"] == 1
+
+
+class _FakePoolModule:
+    """Stands in for the installed ``feishu_pool.py`` (records argv)."""
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+        self.argvs: list[list[str]] = []
+
+    def main(self, argv):
+        self.argvs.append(list(argv))
+        return self.code
+
+
+def _update_sources_context(tmp_path):
+    ctx = _pool_context(tmp_path)
+    prepare_install(ctx)
+    _write_secrets(ctx)
+    return ctx
+
+
+def test_update_sources_pool_branch_builds_the_pool(tmp_path):
+    ctx = _update_sources_context(tmp_path)
+    module = _FakePoolModule(0)
+    destination = os.path.join(ctx.layout.providers, "candidate.yaml")
+    os.makedirs(ctx.layout.providers, exist_ok=True)
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write("proxies: []\n")
+
+    report = lifecycle.update_sources(ctx, load_module=lambda _path: module)
+
+    assert report.status == "OK"
+    assert report.data["mode"] == "feishu-pool"
+    assert report.data["exit_code"] == 0
+    assert any("candidate pool written" in message for message in report.messages)
+    assert len(module.argvs) == 1
+    argv = module.argvs[0]
+    assert argv[argv.index("--env-file") + 1] == ctx.layout.secret_file
+    assert argv[argv.index("-o") + 1] == destination
+
+
+def test_update_sources_pool_branch_passes_min_nodes(tmp_path):
+    ctx = _update_sources_context(tmp_path)
+    module = _FakePoolModule(0)
+    destination = os.path.join(ctx.layout.providers, "candidate.yaml")
+    os.makedirs(ctx.layout.providers, exist_ok=True)
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write("proxies: []\n")
+
+    lifecycle.update_sources(ctx, min_nodes=5, load_module=lambda _path: module)
+
+    argv = module.argvs[0]
+    assert argv[argv.index("--min-nodes") + 1] == "5"
+
+
+def test_update_sources_pool_below_minimum_maps_to_exit_4(tmp_path):
+    ctx = _update_sources_context(tmp_path)
+    module = _FakePoolModule(4)
+
+    report = lifecycle.update_sources(ctx, load_module=lambda _path: module)
+
+    assert report.status == "FAILED"
+    assert report.exit_code == 4
+    assert report.data["mode"] == "feishu-pool"
+    assert any("Feishu pool below the minimum" in message for message in report.messages)
+
+
+def test_update_sources_pool_failure_exit_raises(tmp_path):
+    ctx = _update_sources_context(tmp_path)
+    module = _FakePoolModule(3)
+
+    with pytest.raises(FailClosed) as excinfo:
+        lifecycle.update_sources(ctx, load_module=lambda _path: module)
+
+    assert "Feishu pool build failed (exit 3)" in str(excinfo.value)
+
+
+def test_update_sources_refuses_the_pool_file_as_destination(tmp_path):
+    ctx = _update_sources_context(tmp_path)
+
+    with pytest.raises(FailClosed):
+        lifecycle.update_sources(ctx, output=ctx.layout.pool_file)
+
+
+def test_update_sources_subscription_branch_reports_its_mode(tmp_path):
+    ctx = make_context(tmp_path)  # default environment: a subscription URL
+    prepare_install(ctx)
+    module = _FakePoolModule(0)
+    destination = os.path.join(ctx.layout.providers, "candidate.yaml")
+    os.makedirs(ctx.layout.providers, exist_ok=True)
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write("proxies: []\n")
+
+    report = lifecycle.update_sources(ctx, load_module=lambda _path: module)
+
+    assert report.status == "OK"
+    assert report.data["mode"] == "subscription"
+    assert module.argvs[0][module.argvs[0].index("--sources-env-file") + 1] == ctx.layout.secret_file

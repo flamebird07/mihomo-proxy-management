@@ -132,8 +132,9 @@ def health_deadline_seconds(environ: dict[str, str] | None = None) -> float:
 
 #: Geo databases copied next to the binary into the mihomo ``-d`` directory.
 #: ``GeoIP.dat``/``GeoSite.dat`` are what ``geodata-mode: true`` loads;
-#: ``Country.mmdb`` is kept for a future ``geodata-mode: false`` config.
-_GEO_DATA_FILES = ("GeoIP.dat", "GeoSite.dat", "Country.mmdb")
+#: ``geoip.metadb`` replaced ``Country.mmdb`` in upstream geo release packages
+#: (both are kept so old and new installs both validate).
+_GEO_DATA_FILES = ("GeoIP.dat", "GeoSite.dat", "geoip.metadb", "Country.mmdb")
 
 
 @dataclass
@@ -257,6 +258,10 @@ def save_state(layout: Layout, state: DeploymentState) -> None:
 
 @dataclass
 class Secrets:
+    #: Empty string = Feishu-pool mode: the ``subscription`` provider renders
+    #: as a file provider over ``providers/feishu-pool.yaml`` (written by the
+    #: bootstrap / the installed pool script).  A non-empty URL is the classic
+    #: subscription mode.  Render mode is decided *only* by this field.
     subscription_url: str
     controller_secret: str
     interval_minutes: int = 60
@@ -291,7 +296,10 @@ def load_secrets(
     environ: dict[str, str] | None = None,
     system_profile: bool = True,
 ) -> Secrets:
-    """Environment overrides the 0600 file; a missing value fails closed."""
+    """Environment overrides the 0600 file; a missing controller secret fails closed.
+
+    An empty subscription URL is allowed: it selects the Feishu-pool mode.
+    """
     values: dict[str, str] = {}
     path = layout.secret_file
     if os.path.isfile(path):
@@ -302,11 +310,9 @@ def load_secrets(
     url = env.get("MPM_SUBSCRIPTION_URL") or values.get("SUBSCRIPTION_URL", "")
     secret = env.get("MPM_SECRET") or values.get("SECRET", "")
     interval = env.get("MPM_SUBSCRIPTION_INTERVAL") or values.get("SUBSCRIPTION_INTERVAL") or "60"
-    if not url:
-        raise FailClosed(
-            "subscription URL is not configured (state/subscription.env SUBSCRIPTION_URL "
-            "or MPM_SUBSCRIPTION_URL)"
-        )
+    # An empty URL is the Feishu-pool mode, not a configuration error: render
+    # then turns ``subscription`` into a file provider over the node pool and
+    # every consumer fail-closes if that pool file is missing or empty.
     if not secret:
         raise FailClosed(
             "controller secret is not configured (state/subscription.env SECRET or MPM_SECRET)"
@@ -670,6 +676,8 @@ def _install_static(ctx: Context) -> list[str]:
         # the node pipeline's assignment chain (upstream run-node-pipeline port)
         "proxy-auto-switch.py",
         "portable_paths.py",
+        # the Feishu node pool builder (pool-mode refreshes run the installed copy)
+        "feishu_pool.py",
         "gpt_switch_entry.py",
         "gpt_stability_policy.py",
         "named_mutex_lock.py",
@@ -751,7 +759,29 @@ def _read_provider_nodes(ctx: Context) -> list[str]:
     return []
 
 
+def _read_pool_nodes(ctx: Context) -> list[str]:
+    """Node names from the Feishu pool file (empty when it is absent/empty)."""
+    path = ctx.layout.pool_file
+    if os.path.isfile(path):
+        names = config_mod.provider_node_names(read_text_strict(path))
+        if names:
+            return names
+    return []
+
+
 def _ensure_provider(ctx: Context, secrets: Secrets) -> list[str]:
+    if not secrets.subscription_url:
+        # Feishu-pool mode: the pool file must already exist with at least one
+        # node (the bootstrap / the pipeline writes it); install never fetches.
+        names = _read_pool_nodes(ctx)
+        if not names:
+            raise FailClosed(
+                "no subscription URL is configured and the Feishu node pool "
+                + HOST.text(ctx.layout.pool_file)
+                + " is missing or empty: run the bootstrap, or set SUBSCRIPTION_URL "
+                "in the secret file"
+            )
+        return names
     names = _read_provider_nodes(ctx)
     if names:
         return names
@@ -815,7 +845,12 @@ def configure(
     state = load_state(layout) or DeploymentState()
     target_mode = mode or state.mode or "tun"
 
-    nodes = provider_nodes if provider_nodes is not None else _read_provider_nodes(ctx)
+    if provider_nodes is not None:
+        nodes = provider_nodes
+    elif secrets.subscription_url:
+        nodes = _read_provider_nodes(ctx)
+    else:
+        nodes = _read_pool_nodes(ctx)
     if not nodes:
         raise FailClosed(
             "provider node list is empty; cannot validate the CURSOR/CODEBUDDY policy"
@@ -1336,6 +1371,9 @@ def install(ctx: Context, *, quiet: bool = False, skip_start: bool = False) -> R
     nodes = _ensure_provider(ctx, secrets)
     report.data["provider_nodes"] = len(nodes)
     _own(ctx, layout.provider_file)
+    if os.path.isfile(layout.pool_file):
+        # Feishu-pool mode: the pool file is an installer artifact too.
+        _own(ctx, layout.pool_file)
 
     config_report = configure(ctx, quiet=quiet, provider_nodes=nodes, secrets=secrets)
     report.data["configure"] = config_report.status
@@ -2438,11 +2476,19 @@ def groups(ctx: Context) -> Report:
     """
     report = Report(command="groups")
     layout = ctx.layout
-    names = _read_provider_nodes(ctx)
+    # Same source-mode decision as ``configure``: URL configured -> the
+    # subscription provider file, otherwise the Feishu pool file.  An
+    # unreadable secret file keeps the old subscription-mode source.
+    try:
+        pool_mode = not ctx.secrets().subscription_url
+    except FailClosed:
+        pool_mode = False
+    names = _read_pool_nodes(ctx) if pool_mode else _read_provider_nodes(ctx)
     if not names:
+        source = layout.pool_file if pool_mode else layout.provider_file
         report.warn(
             "provider file has no nodes; run install/refresh first "
-            f"({HOST.text(layout.provider_file)})"
+            f"({HOST.text(source)})"
         )
     try:
         specs = config_mod.group_specs(read_text_strict(layout.config))
@@ -2534,6 +2580,7 @@ def update_sources(
     """
     report = Report(command="update-sources")
     layout = ctx.layout
+    secrets: Secrets | None = None
     try:
         secrets = ctx.secrets()
         report.data["sources"] = sorted(secrets.extra_subscription_urls)
@@ -2542,9 +2589,51 @@ def update_sources(
         report.data["sources"] = []
     destination = output or os.path.join(layout.providers, "candidate.yaml")
     supplement = os.path.join(layout.providers, "nextin.yaml")
-    protected = (layout.provider_file, supplement, layout.config, layout.secret_file)
+    protected = (
+        layout.provider_file,
+        supplement,
+        layout.config,
+        layout.secret_file,
+        layout.pool_file,
+    )
     if os.path.realpath(destination) in {os.path.realpath(path) for path in protected}:
         raise FailClosed("candidate output must not replace a live configuration or source file")
+
+    if secrets is not None and not secrets.subscription_url and not secrets.extra_subscription_urls:
+        # Feishu-pool mode: no subscription to convert - run the installed
+        # pool script instead so the candidate comes from the master table.
+        report.data["mode"] = "feishu-pool"
+        module = (load_module or config_mod.load_convert_module)(layout.pool_script)
+        argv = ["--env-file", layout.secret_file, "-o", destination]
+        if min_nodes is not None:
+            argv += ["--min-nodes", str(min_nodes)]
+        try:
+            code = int(module.main(argv))
+        except SystemExit as exc:  # defensive: argparse on our argv never exits
+            code = int(exc.code or 0)
+        except FailClosed:
+            raise
+        except Exception as exc:  # noqa: BLE001 - pool failures are reported, sanitized
+            raise FailClosed("Feishu pool build failed: " + _failure_reason(exc)) from exc
+        report.data["exit_code"] = code
+        report.data["output"] = HOST.text(destination)
+        if code == 0:
+            if not os.path.isfile(destination):
+                raise FailClosed(
+                    "pool script reported success but wrote no candidate file: "
+                    + HOST.text(destination)
+                )
+            report.add("candidate pool written: " + HOST.text(destination))
+            report.status = "OK"
+        elif code == 4:
+            report.status = "FAILED"
+            report.exit_code = 4
+            report.add("no candidate pool written (Feishu pool below the minimum)")
+        else:
+            raise FailClosed(f"Feishu pool build failed (exit {code})")
+        return report
+
+    report.data["mode"] = "subscription"
     argv = ["--sources-env-file", layout.secret_file, "-o", destination]
     if os.path.isfile(supplement):
         argv += ["--source1-supplement", supplement]

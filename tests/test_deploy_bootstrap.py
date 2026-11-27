@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -196,6 +197,241 @@ class SubscriptionModeTests(TempRootTestCase):
             text = stream.read()
         self.assertIn(f"SUBSCRIPTION_URL_3={url}", text)
         self.assertNotIn("SUBSCRIPTION_URL=", text.replace("SUBSCRIPTION_URL_3=", ""))
+
+
+class SecretTests(TempRootTestCase):
+    """The controller SECRET: generated once, kept on re-runs, never leaked."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.dirname(self.platform.secret_path), exist_ok=True)
+
+    def write_secret_file(self, text):
+        with open(self.platform.secret_path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+
+    def read_secret_file(self):
+        with open(self.platform.secret_path, "r", encoding="utf-8") as stream:
+            return stream.read()
+
+    def generated_secret(self):
+        match = re.search(r"^SECRET=(\S+)$", self.read_secret_file(), re.MULTILINE)
+        self.assertIsNotNone(match, "the secret file must carry a SECRET line")
+        return match.group(1)
+
+    def test_first_run_generates_a_controller_secret(self):
+        self.write_secret_file("# hand-added\nEXISTING_KEY=keep-me\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        generated = self.generated_secret()
+        self.assertGreaterEqual(len(generated), 32)
+        self.assertIn("SECRET", result.secret_keys)
+
+    def test_rerun_keeps_an_existing_secret(self):
+        self.write_secret_file("SECRET=keep-me-bearer-value\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertIn("SECRET=keep-me-bearer-value", self.read_secret_file())
+
+    def test_blank_secret_is_regenerated(self):
+        self.write_secret_file("SECRET=\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertNotEqual(self.generated_secret(), "")
+
+    def test_dry_run_writes_no_secret_file_and_still_counts_pool_nodes(self):
+        result, _, _ = run_flow(self.platform, lock=self.lock, dry_run=True)
+        self.assertTrue(result.ok())
+        self.assertFalse(result.secret_written)
+        self.assertFalse(os.path.exists(self.platform.secret_path))
+        self.assertFalse(os.path.exists(self.platform.pool_path))
+        # the dry run reached the node count without generating any file
+        self.assertEqual(result.pool_nodes, 1)
+
+    def test_dry_run_never_draws_from_the_rng_and_plans_the_secret_key(self):
+        with mock.patch.object(bootstrap.secrets_mod, "token_urlsafe",
+                               return_value="planned-not-used") as rng:
+            result, _, _ = run_flow(self.platform, lock=self.lock, dry_run=True)
+        rng.assert_not_called()
+        self.assertTrue(result.ok())
+        self.assertIn("SECRET", result.secret_keys)  # planned, value not drawn
+
+    def test_real_run_draws_the_rng_once_when_no_secret_exists(self):
+        with mock.patch.object(bootstrap.secrets_mod, "token_urlsafe",
+                               return_value="drawn-bearer-token") as rng:
+            result, _, _ = run_flow(self.platform, lock=self.lock)
+        rng.assert_called_once()
+        self.assertTrue(result.ok())
+        self.assertIn("SECRET=drawn-bearer-token", self.read_secret_file())
+
+    def test_real_run_keeps_the_file_secret_without_drawing(self):
+        self.write_secret_file("SECRET=keep-me-bearer-value\n")
+        with mock.patch.object(bootstrap.secrets_mod, "token_urlsafe") as rng:
+            result, _, _ = run_flow(self.platform, lock=self.lock)
+        rng.assert_not_called()
+        self.assertTrue(result.ok())
+
+    def test_generated_secret_never_reaches_logs_repr_or_summary(self):
+        result, _, logs = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        generated = self.generated_secret()
+        joined = "\n".join(logs)
+        for blob in (joined, repr(result), json.dumps(result.summary())):
+            self.assertNotIn(generated, blob)
+
+
+class PoolDecisionTests(TempRootTestCase):
+    """pool_required must match the final install mode (main URL decides)."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.dirname(self.platform.secret_path), exist_ok=True)
+
+    def write_secret_file(self, text):
+        with open(self.platform.secret_path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+
+    def read_secret_file(self):
+        with open(self.platform.secret_path, "r", encoding="utf-8") as stream:
+            return stream.read()
+
+    def test_existing_main_url_on_rerun_skips_the_pool(self):
+        url = "https://sub.real-host.test/one?token=abc"
+        self.write_secret_file(f"SUBSCRIPTION_URL={url}\nSECRET=keep\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertFalse(result.pool_required)
+        self.assertFalse(result.pool_written)
+        self.assertFalse(os.path.exists(self.platform.pool_path))
+        self.assertIn(f"SUBSCRIPTION_URL={url}", self.read_secret_file())
+
+    def test_empty_main_url_still_builds_the_pool(self):
+        self.write_secret_file("SUBSCRIPTION_URL=\nSECRET=keep\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertTrue(result.pool_required)
+        self.assertTrue(result.pool_written)
+        self.assertTrue(os.path.exists(self.platform.pool_path))
+
+    def test_sample_main_url_is_not_a_configuration(self):
+        self.write_secret_file('SUBSCRIPTION_URL="https://example.com/your-sub"\n')
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertTrue(result.pool_required)
+        self.assertTrue(result.pool_written)
+
+    def test_env_only_aux_subscription_still_builds_the_pool(self):
+        url = "https://sub.real-host.test/two?token=xyz"
+        result, _, _ = run_flow(self.platform, lock=self.lock,
+                                environ={"MPM_SUBSCRIPTION_URL_2": url})
+        self.assertTrue(result.ok())
+        self.assertTrue(result.pool_required)
+        self.assertTrue(result.pool_written)
+        self.assertIn(f"SUBSCRIPTION_URL_2={url}", self.read_secret_file())
+
+    def test_env_main_url_overrides_the_file(self):
+        self.write_secret_file("SUBSCRIPTION_URL=https://old.host.test/one\n")
+        url = "https://sub.real-host.test/new?token=abc"
+        result, _, _ = run_flow(self.platform, lock=self.lock,
+                                environ={"MPM_SUBSCRIPTION_URL": url})
+        self.assertTrue(result.ok())
+        self.assertFalse(result.pool_required)
+        self.assertIn(f"SUBSCRIPTION_URL={url}", self.read_secret_file())
+
+
+class MainUrlSyncTests(TempRootTestCase):
+    """The main URL written to the file must match the derived install mode:
+    a placeholder must be cleared, a real value must survive."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.dirname(self.platform.secret_path), exist_ok=True)
+
+    def write_secret_file(self, text):
+        with open(self.platform.secret_path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+
+    def read_secret_file(self):
+        with open(self.platform.secret_path, "r", encoding="utf-8") as stream:
+            return stream.read()
+
+    def assert_main_url_cleared(self):
+        text = self.read_secret_file()
+        self.assertIsNone(re.search(r"(?m)^SUBSCRIPTION_URL=\S", text),
+                          f"main URL must be cleared, got: {text!r}")
+
+    def test_placeholder_env_url_ends_up_cleared_in_the_file(self):
+        placeholder = "https://provider.example.invalid/link?clash=1"
+        result, _, _ = run_flow(self.platform, lock=self.lock,
+                                environ={"MPM_SUBSCRIPTION_URL": placeholder})
+        self.assertTrue(result.ok())
+        self.assertTrue(result.pool_required)
+        self.assertTrue(result.pool_written)
+        self.assert_main_url_cleared()
+        self.assertNotIn(placeholder, self.read_secret_file())
+
+    def test_placeholder_file_url_is_cleared_without_env_override(self):
+        self.write_secret_file("SUBSCRIPTION_URL=https://provider.example.invalid/link\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertTrue(result.pool_required)
+        self.assertTrue(result.pool_written)
+        self.assert_main_url_cleared()
+
+    def test_placeholder_env_url_does_not_overwrite_a_real_file_url(self):
+        real = "https://sub.real-host.test/one?token=abc"
+        self.write_secret_file(f"SUBSCRIPTION_URL={real}\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock,
+                                environ={"MPM_SUBSCRIPTION_URL": "https://example.com/your-sub"})
+        self.assertTrue(result.ok())
+        self.assertFalse(result.pool_required)
+        self.assertIn(f"SUBSCRIPTION_URL={real}", self.read_secret_file())
+
+    def test_valid_env_url_wins_over_a_placeholder_file_url(self):
+        url = "https://sub.real-host.test/new?token=abc"
+        self.write_secret_file("SUBSCRIPTION_URL=https://example.com/your-sub\n")
+        result, _, _ = run_flow(self.platform, lock=self.lock,
+                                environ={"MPM_SUBSCRIPTION_URL": url})
+        self.assertTrue(result.ok())
+        self.assertFalse(result.pool_required)
+        text = self.read_secret_file()
+        self.assertIn(f"SUBSCRIPTION_URL={url}", text)
+        self.assertNotIn("your-sub", text)
+
+    def test_real_aux_and_unrelated_keys_survive_the_main_url_clear(self):
+        aux = "https://sub.real-host.test/two?token=xyz"
+        result, _, _ = run_flow(
+            self.platform, lock=self.lock,
+            environ={"MPM_SUBSCRIPTION_URL": "https://example.com/your-sub",
+                     "MPM_SUBSCRIPTION_URL_2": aux})
+        self.assertTrue(result.ok())
+        text = self.read_secret_file()
+        self.assert_main_url_cleared()
+        self.assertIn(f"SUBSCRIPTION_URL_2={aux}", text)
+        self.assertIn("FEISHU_BITABLE_APP_TOKEN=", text)
+
+
+class ExistingFileEncodingTests(TempRootTestCase):
+    """Windows-edited env files carry a BOM; reading must not corrupt keys."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.dirname(self.platform.secret_path), exist_ok=True)
+
+    def test_bom_prefixed_file_keeps_its_keys_and_main_url(self):
+        url = "https://sub.real-host.test/one?token=abc"
+        with open(self.platform.secret_path, "wb") as stream:
+            stream.write(
+                "\ufeff".encode("utf-8")
+                + f"SUBSCRIPTION_URL={url}\r\nSECRET=keep\r\nNOTE=keep-me\r\n".encode("utf-8"))
+        result, _, _ = run_flow(self.platform, lock=self.lock)
+        self.assertTrue(result.ok())
+        self.assertFalse(result.pool_required)  # the BOM hid nothing
+        with open(self.platform.secret_path, "r", encoding="utf-8") as stream:
+            text = stream.read()
+        self.assertIn(f"SUBSCRIPTION_URL={url}", text)
+        self.assertIn("NOTE=keep-me", text)
+        self.assertIn("SECRET=keep", text)
 
 
 class NodesFailOnSecondRead(FakeFeishu):

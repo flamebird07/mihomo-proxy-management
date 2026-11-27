@@ -48,6 +48,16 @@ def _macos_layout(repo_root: str, root: str):
     return Layout(root=root)
 
 
+def _env_file_value(path: str, key: str) -> str:
+    """One KEY from an already-written env file (utf-8-sig: Windows edits may
+    leave a BOM); a missing file yields ``""``."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            return bootstrap.env_file_values(stream.read()).get(key, "")
+    except OSError:
+        return ""
+
+
 class MacosPlatform(bootstrap.Platform):
     """Paths and the installer call for a macOS (arm64) host."""
 
@@ -72,6 +82,13 @@ class MacosPlatform(bootstrap.Platform):
             p for p in (os.path.join(self.repo_root, "common", "python"),
                         os.path.join(self.repo_root, "macos", "python"),
                         env.get("PYTHONPATH")) if p)
+        # The installer's URL normalization runs over the secret file the
+        # bootstrap just wrote; a stale or placeholder MPM_SUBSCRIPTION_URL in
+        # the caller's environment must not bypass it (the installer would
+        # then pick subscription mode instead of the pool).  The file's main
+        # URL is the derived one, so it is re-fed as the override.
+        env["MPM_SUBSCRIPTION_URL"] = _env_file_value(self.secret_path,
+                                                      "SUBSCRIPTION_URL")
         argv = [self.python, "-m", "mpm_macos.cli", "install"]
         if not request.start:
             argv.append("--no-start")

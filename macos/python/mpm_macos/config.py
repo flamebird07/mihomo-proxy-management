@@ -36,6 +36,11 @@ PROVIDER_NAME = "subscription"
 #: includes it exactly when ``providers/node-valid.yaml`` exists.
 VALID_PROVIDER_NAME = "node-valid"
 VALID_PROVIDER_PATH = "./providers/node-valid.yaml"
+#: The Feishu node pool (「节点测速总表」 output).  With no subscription URL the
+#: ``subscription`` provider becomes a *file* provider reading this path - the
+#: name stays ``subscription`` so every group's ``use:`` and the audit share
+#: one provider across both source modes.
+POOL_PROVIDER_PATH = "./providers/feishu-pool.yaml"
 
 MODES = ("tun", "mixed")
 
@@ -158,8 +163,6 @@ def render(
         raise RenderError(f"unknown mode '{mode}' (expected tun or mixed)")
     if not secret:
         raise RenderError("controller secret is empty; refusing to render an unauthenticated config")
-    if not subscription_url:
-        raise RenderError("subscription URL is empty")
 
     yaml = _yaml()
     document = yaml.safe_load(template_text)
@@ -179,12 +182,27 @@ def render(
     providers = document.get("proxy-providers")
     if not isinstance(providers, dict) or not isinstance(providers.get(PROVIDER_NAME), dict):
         raise RenderError(f"config template is missing the '{PROVIDER_NAME}' proxy provider")
-    provider = providers[PROVIDER_NAME]
-    provider["url"] = subscription_url
-    provider["path"] = provider_path
-    # The operator's ``SUBSCRIPTION_INTERVAL`` is in minutes; mihomo reads
-    # seconds.  Writing minutes directly made mihomo refresh every 60 seconds.
-    provider["interval"] = provider_interval_seconds(interval_minutes)
+    if subscription_url:
+        # Subscription mode: behaviour identical to before (http provider,
+        # refreshed by interval).  The whole template provider dict is kept.
+        provider = providers[PROVIDER_NAME]
+        provider["type"] = "http"
+        provider["url"] = subscription_url
+        provider["path"] = provider_path
+        # The operator's ``SUBSCRIPTION_INTERVAL`` is in minutes; mihomo reads
+        # seconds.  Writing minutes directly made mihomo refresh every 60 seconds.
+        provider["interval"] = provider_interval_seconds(interval_minutes)
+    else:
+        # Feishu-pool mode: replace the template provider wholesale - keeping
+        # any of its keys (``interval: __SUBSCRIPTION_INTERVAL__`` in
+        # particular) would leak placeholders into the rendered config and
+        # fail the audit.  The provider *name* stays ``subscription`` so the
+        # groups' ``use:`` and the audit are shared between the two modes.
+        providers[PROVIDER_NAME] = {
+            "type": "file",
+            "path": POOL_PROVIDER_PATH,
+        }
+        provider = providers[PROVIDER_NAME]
     health_check = provider.setdefault("health-check", {})
     if not isinstance(health_check, dict):
         health_check = {}
@@ -546,6 +564,24 @@ def audit(text: str, *, mode: str, secret: str | None = None, valid_nodes: bool 
     provider = (document.get("proxy-providers") or {}).get(PROVIDER_NAME)
     require(isinstance(provider, dict), f"missing proxy provider '{PROVIDER_NAME}'")
     require(bool(provider.get("path")), "provider path must be kept (offline cache fallback)")
+    provider_type = provider.get("type")
+    if provider_type == "file":
+        # Feishu-pool mode: exactly the pool file, never a URL or a refresh
+        # interval (the pool is rebuilt by the bootstrap / the pool script).
+        require(
+            provider.get("path") == POOL_PROVIDER_PATH,
+            f"file provider path must be {POOL_PROVIDER_PATH}",
+        )
+        require("url" not in provider, "file provider must not carry a url")
+        require("interval" not in provider, "file provider must not carry an interval")
+    else:
+        require(provider_type == "http", "provider type must be 'http' or 'file'")
+        require(bool(provider.get("url")), "subscription provider url must be kept")
+        interval = provider.get("interval")
+        require(
+            isinstance(interval, int) and interval >= PROVIDER_MIN_INTERVAL,
+            f"provider interval must be at least {PROVIDER_MIN_INTERVAL} seconds",
+        )
     groups = _groups(document)
     provider_group_sources = [PROVIDER_NAME]
     supplement = document["proxy-providers"].get("source1-local")
@@ -564,11 +600,6 @@ def audit(text: str, *, mode: str, secret: str | None = None, valid_nodes: bool 
         valid_health = valid_provider.get("health-check") or {}
         require(valid_health.get("enable") is True,
                 f"{VALID_PROVIDER_NAME} health-check must be enabled")
-    interval = provider.get("interval")
-    require(
-        isinstance(interval, int) and interval >= PROVIDER_MIN_INTERVAL,
-        f"provider interval must be at least {PROVIDER_MIN_INTERVAL} seconds",
-    )
     health_check = provider.get("health-check") or {}
     require(health_check.get("enable") is True, "provider health-check must be enabled")
     require(
@@ -892,6 +923,7 @@ __all__ = [
     "PROVIDER_MIN_INTERVAL",
     "PROVIDER_NAME",
     "PROXY_MEMBERS",
+    "POOL_PROVIDER_PATH",
     "REGION_FILTERS",
     "RenderError",
     "SUBSCRIPTION_TIMEOUT_SECONDS",

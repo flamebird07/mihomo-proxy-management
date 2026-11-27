@@ -120,11 +120,12 @@ def test_required_geodata_is_empty_without_geodata_mode():
     assert config.required_geodata(_render("tun")) == ("GeoIP.dat", "GeoSite.dat")
 
 
-def test_render_requires_a_secret_and_a_url():
+def test_render_requires_a_secret_but_allows_an_empty_url():
     with pytest.raises(config.RenderError):
         config.render(_template(), secret="", subscription_url=URL)
-    with pytest.raises(config.RenderError):
-        config.render(_template(), secret=SECRET, subscription_url="")
+    # new semantics: an empty URL selects the Feishu-pool mode instead of failing
+    document = yaml.safe_load(config.render(_template(), secret=SECRET, subscription_url=""))
+    assert document["proxy-providers"]["subscription"]["type"] == "file"
 
 
 def test_audit_rejects_a_reordered_first_rule():
@@ -500,3 +501,81 @@ def test_fake_ip_range_avoids_198_18():
     broken = yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
     with pytest.raises(config.RenderError):
         config.audit(broken, mode="tun")
+
+
+# ---- Feishu-pool mode: the subscription provider becomes a file provider --
+
+
+def _render_pool(mode: str = "tun") -> str:
+    return config.render(_template(), secret=SECRET, subscription_url="", mode=mode)
+
+
+@pytest.mark.parametrize("mode", ["tun", "mixed"])
+def test_pool_render_turns_subscription_into_the_pool_file_provider(mode):
+    text = _render_pool(mode)
+    document = yaml.safe_load(text)
+    provider = document["proxy-providers"]["subscription"]
+    assert provider["type"] == "file"
+    assert provider["path"] == config.POOL_PROVIDER_PATH
+    assert "url" not in provider
+    assert "interval" not in provider
+    assert provider["health-check"]["enable"] is True
+    assert provider["health-check"]["interval"] == config.PROVIDER_HEALTHCHECK_INTERVAL
+    assert provider["health-check"]["lazy"] is True
+    assert config._PLACEHOLDER.search(text) is None, "no unresolved placeholder may survive"
+    # the audit must accept exactly what render produced, in both modes
+    config.audit(text, mode=mode, secret=SECRET)
+
+
+def test_subscription_render_keeps_the_http_provider_shape():
+    """Regression: a configured URL renders the http provider exactly as before."""
+    document = yaml.safe_load(_render("tun"))
+    provider = document["proxy-providers"]["subscription"]
+    assert provider["type"] == "http"
+    assert provider["url"] == URL
+    assert provider["interval"] == 3600
+
+
+def _broken_pool(**provider_overrides):
+    document = yaml.safe_load(_render_pool("tun"))
+    provider = document["proxy-providers"]["subscription"]
+    for key, value in provider_overrides.items():
+        if value is None:
+            provider.pop(key, None)
+        else:
+            provider[key] = value
+    return yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
+
+
+def test_audit_rejects_a_pool_file_provider_with_the_wrong_path():
+    with pytest.raises(config.RenderError):
+        config.audit(_broken_pool(path="./providers/other.yaml"), mode="tun")
+
+
+def test_audit_rejects_a_pool_file_provider_with_a_url():
+    with pytest.raises(config.RenderError):
+        config.audit(_broken_pool(url=URL), mode="tun")
+
+
+def test_audit_rejects_a_pool_file_provider_with_an_interval():
+    with pytest.raises(config.RenderError):
+        config.audit(_broken_pool(interval=3600), mode="tun")
+
+
+def test_audit_rejects_an_unknown_provider_type():
+    with pytest.raises(config.RenderError):
+        config.audit(_broken_pool(type="ss"), mode="tun")
+
+
+def test_audit_rejects_an_http_provider_without_a_url():
+    with pytest.raises(config.RenderError):
+        config.audit(_broken_pool(type="http", url=None), mode="tun")
+
+
+@pytest.mark.parametrize("pool_mode", [False, True])
+def test_valid_nodes_mode_passes_audit_in_both_source_modes(pool_mode):
+    url = URL if pool_mode else ""
+    text = config.render(
+        _template(), secret=SECRET, subscription_url=url, mode="tun", valid_nodes=True
+    )
+    config.audit(text, mode="tun", secret=SECRET, valid_nodes=True)

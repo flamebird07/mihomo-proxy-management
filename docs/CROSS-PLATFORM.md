@@ -95,6 +95,37 @@ socket 绑物理网卡直连，绕开 TUN）且 DNS 换用大陆可达解析器
 （`route -n get default`）并注入：node-pipeline 走子进程 env，feishu-sync
 在进程内 `os.environ.setdefault` 后按路径调用（同文件加载链共享环境）。
 
+### 订阅 URL 可选 / 飞书供池与 SECRET 生成（2026-11-28，影响两端）
+
+安装模式由「主订阅 URL 是否真实配置」决定，两端语义必须一致：
+
+1. **主订阅 URL 已配置** → 订阅模式（行为不变）。
+2. **主订阅 URL 空 / 未配置** → 飞书供池模式：名为 `subscription` 的 provider 变成
+   file provider，读 `providers/feishu-pool.yaml`（macOS 侧 `config.POOL_PROVIDER_PATH`，
+   Windows 侧同路径形状）。provider 名字不变，各策略组 `use:` 与审计两种模式共用。
+   池文件必须已存在且至少 1 个节点（引导流程 / 流水线周期写出），否则 fail closed。
+3. **controller SECRET 不再可选**：全新机器的 `subscription.env` 没有它，macOS
+   `load_secrets` 拒绝缺失、Windows 热重载需要 bearer。引导（`scripts/deploy/bootstrap.py`）
+   写密钥时：现有 SECRET 有效 → 保留；空白 / 缺失 → 生成 `secrets.token_urlsafe(32)`。
+   值只进文件，日志与 JSON 摘要只出现键名和数量。
+4. **pool_required 与最终安装模式一致**：主 URL 判定顺序 = 环境覆盖（`MPM_SUBSCRIPTION_URL`）
+   > 已有密钥文件的 `SUBSCRIPTION_URL`；空值与示例地址（`example.com` / `example.org` /
+   `provider.example.invalid`）不算真实配置。环境只提供 `_2.._4` 辅助订阅而无主订阅时，
+   仍需生成飞书池。dry-run 走到节点计数，但不生成、不写入任何凭据文件。
+5. **推导出的主 URL 同步写回密钥文件**（2026-11-28 补修）：环境或旧文件里的占位主 URL
+   会被明确清空（`SUBSCRIPTION_URL=`），真实原值与「环境覆盖优先」保持不变——否则
+   `pool_required` 判定是池模式、安装器却从文件/环境拿到占位 URL 选了订阅模式。
+   macOS 引导的 install 子进程把密钥文件里的主 URL 作为 `MPM_SUBSCRIPTION_URL` 覆盖
+   传给安装器，调用环境里的失效值无法绕过规范化（Windows 接线不变）。
+6. **流水线每周期刷新飞书池**（2026-11-28，macOS 已实现，Windows 入口后续同步）：
+   飞书供池机器的流水线在 collect 之后插入 `feishu_pool.py` 步骤重建
+   `providers/feishu-pool.yaml`（先并入新抓节点，再出池）；文件内容变化时对运行中的
+   内核热重载该 provider（mihomo 不会自己重读 `type: file`），重载成功才落
+   `pool.sha256` marker，失败下周期重试。纯池机器（无任何订阅槽位且无 supplement
+   文件）记录并跳过 collect（零输入的 collect 只会因零节点退出非零），ops/provide
+   照常刷新；有订阅槽位（含辅助）或 supplement 时保持采集。步骤规划、dry-run 与
+   实际执行共用同一 `build_step_argv`。
+
 ### Windows 端接入清单（拉取 main 即生效）
 
 **自动继承（共享文件，无需 Windows 侧改动）**：表1/2/3 与总表全部 upsert 化、

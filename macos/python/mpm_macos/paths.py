@@ -43,6 +43,9 @@ XIGUA_IPPOOL_LABEL = f"com.{PROJECT}.xigua-ippool"
 #: member until the first hourly tick.
 NODE_PIPELINE_LABEL = f"com.{PROJECT}.node-pipeline"
 BINARY_NAME = "mihomo"
+#: 飞书「节点测速总表」生成的节点池，供没有订阅 URL 的机器使用（引导流程或
+#: 节点池脚本写出后，名为 ``subscription`` 的 provider 以 file 方式读它）。
+POOL_FILE_NAME = "feishu-pool.yaml"
 RUNNER_NAME = "runner"
 PLIST_NAME = f"{LABEL}.plist"
 BOOT_PLIST_NAME = f"{BOOT_LABEL}.plist"
@@ -223,6 +226,21 @@ class Layout:
         presence flips the renderer to valid-node assignment mode.
         """
         return os.path.join(self.providers, "node-valid.yaml")
+
+    @property
+    def pool_file(self) -> str:
+        """The Feishu node pool written by the bootstrap / the pool script.
+
+        When no subscription URL is configured the ``subscription`` provider
+        renders as a file provider reading this file (see
+        ``config.POOL_PROVIDER_PATH``); it must already hold at least one node.
+        """
+        return os.path.join(self.providers, POOL_FILE_NAME)
+
+    @property
+    def pool_script(self) -> str:
+        """Installed copy of ``scripts/feishu_pool.py`` (rebuilds the pool)."""
+        return os.path.join(self.scripts_dir, "feishu_pool.py")
 
     @property
     def state_dir(self) -> str:
@@ -414,6 +432,7 @@ __all__ = [
     "NODE_PIPELINE_LABEL",
     "NODE_PIPELINE_PLIST_NAME",
     "PLIST_NAME",
+    "POOL_FILE_NAME",
     "PROJECT",
     "RUNNER_NAME",
     "Layout",

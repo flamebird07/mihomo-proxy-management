@@ -39,6 +39,7 @@ class TempRepoTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="platforms-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.repo = make_tmp_repo(self.tmp)
+        self.host = os.path.join(self.tmp, "host")  # sandbox host root
 
 
 class FindRepoRootTests(unittest.TestCase):
@@ -106,6 +107,44 @@ class MacosPlatformTests(TempRepoTestCase):
         platform = platforms.MacosPlatform(self.repo, environ={}, root="/")
         argv, _ = self.invoke(platform, start=False)
         self.assertEqual(argv[-1], "--no-start")
+
+    def test_install_feeds_the_file_main_url_as_the_env_override(self):
+        """The installer normalizes the main URL from the secret file: a stale
+        placeholder MPM_SUBSCRIPTION_URL must not bypass it."""
+        platform = platforms.MacosPlatform(self.repo, environ={}, root=self.host)
+        os.makedirs(os.path.dirname(platform.secret_path), exist_ok=True)
+        real = "https://sub.real-host.test/one?token=abc"
+        with open(platform.secret_path, "w", encoding="utf-8") as stream:
+            stream.write(f"SUBSCRIPTION_URL={real}\nSECRET=keep\n")
+        stale = platforms.MacosPlatform(
+            self.repo,
+            environ={"MPM_SUBSCRIPTION_URL": "https://example.com/your-sub"},
+            root=self.host)
+        _, kwargs = self.invoke(stale)
+        self.assertEqual(kwargs["env"]["MPM_SUBSCRIPTION_URL"], real)
+
+    def test_install_pool_mode_feeds_an_empty_main_url(self):
+        platform = platforms.MacosPlatform(self.repo, environ={}, root=self.host)
+        os.makedirs(os.path.dirname(platform.secret_path), exist_ok=True)
+        with open(platform.secret_path, "w", encoding="utf-8") as stream:
+            stream.write("SUBSCRIPTION_URL=\nSECRET=keep\n")
+        _, kwargs = self.invoke(platform)
+        self.assertEqual(kwargs["env"]["MPM_SUBSCRIPTION_URL"], "")
+
+    def test_install_without_a_secret_file_feeds_an_empty_main_url(self):
+        platform = platforms.MacosPlatform(self.repo, environ={}, root=self.host)
+        _, kwargs = self.invoke(platform)
+        self.assertEqual(kwargs["env"]["MPM_SUBSCRIPTION_URL"], "")
+
+    def test_install_reads_a_bom_prefixed_file(self):
+        platform = platforms.MacosPlatform(self.repo, environ={}, root=self.host)
+        os.makedirs(os.path.dirname(platform.secret_path), exist_ok=True)
+        real = "https://sub.real-host.test/one?token=abc"
+        with open(platform.secret_path, "wb") as stream:
+            stream.write("\ufeff".encode("utf-8")
+                         + f"SUBSCRIPTION_URL={real}\n".encode("utf-8"))
+        _, kwargs = self.invoke(platform)
+        self.assertEqual(kwargs["env"]["MPM_SUBSCRIPTION_URL"], real)
 
 
 class WindowsPlatformTests(TempRepoTestCase):
