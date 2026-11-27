@@ -101,6 +101,7 @@ class MacosPlatformTests(TempRepoTestCase):
         self.assertIn(os.path.join(self.repo, "common", "python"), pythonpath)
         self.assertIn(os.path.join(self.repo, "macos", "python"), pythonpath)
         self.assertEqual(kwargs["cwd"], self.repo)
+        self.assertIs(kwargs["stdout"], sys.stderr)
 
     def test_install_start_false_appends_no_start(self):
         platform = platforms.MacosPlatform(self.repo, environ={}, root="/")
@@ -157,10 +158,13 @@ class WindowsPlatformTests(TempRepoTestCase):
         self.assertEqual(argv[1:5], ["-NoProfile", "-NonInteractive",
                                      "-ExecutionPolicy", "Bypass"])
         script = ntpath.join(self.repo, "scripts", "deploy.ps1")
-        self.assertEqual(argv[5:8], ["-File", script, "-StagingDir"])
-        self.assertEqual(argv[8], platform.staging_dir)
+        self.assertEqual(argv[5:9], ["-File", script, "-Phase", "Install"])
+        self.assertEqual(argv[9], "-StagingDir")
+        self.assertEqual(argv[10], platform.staging_dir)
         self.assertNotIn("-NoStart", argv)
         self.assertEqual(kwargs["cwd"], self.repo)
+        self.assertEqual(kwargs["env"]["MIHOMO_DIR"], platform.install_dir)
+        self.assertIs(kwargs["stdout"], sys.stderr)
 
     def test_install_start_false_appends_no_start(self):
         platform = platforms.WindowsPlatform(self.repo, environ={})

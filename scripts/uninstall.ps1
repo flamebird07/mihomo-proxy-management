@@ -24,6 +24,15 @@ if ($t) {
     Write-Warn 'task not found'
 }
 
+# 节点流水线任务（引导安装时注册）/ node pipeline task (registered by bootstrap)
+$pipelineTask = Get-ScheduledTask -TaskName 'MihomoNodePipeline' -ErrorAction SilentlyContinue
+if ($pipelineTask) {
+    Unregister-ScheduledTask -TaskName 'MihomoNodePipeline' -Confirm:$false
+    Write-Ok 'node pipeline task removed'
+} else {
+    Write-Warn 'node pipeline task not found'
+}
+
 if ($Purge) {
     $dir = Get-InstallDir
     $ans = Read-Host "确认删除 $dir 下所有文件？[y/N]"

@@ -51,6 +51,28 @@ pool/ops/provide。非零退出码一律算失败（`node_provider` 的 3 同时
 订阅模式三个旧 argv 语义不变。`scripts/render_config.py`：显式给了 `--output` 时，即使输入已是
 目标形状也写出该文件；默认原地重复（无 `--output` 且 changed=False）不重写。
 
+**Windows 引导入口的宿主接线（2026-11-28，`scripts/deploy.ps1`）**：
+- 入口分两阶段：默认 `Bootstrap` 准备 Python 3.10+ / PyYAML 后调用 `scripts/deploy/__main__.py`；
+  Python 适配器回调 `deploy.ps1 -Phase Install -StagingDir <dir> [-NoStart]`（`platforms.py` 已显式带
+  `-Phase Install`）。Bootstrap 选定的绝对解释器经子进程环境 `MPM_PYTHON` 传给 Install 阶段，
+  `Render-Config` 与任务注册都优先用它，绝不悄悄换另一个 Python。
+- Install 阶段先校验暂存文件齐全、按 SHA256 判断内容是否变化；全部一致时不停止运行中的 mihomo。
+- 引导注册的 `MihomoFeishuBitableSync` / `MihomoNodePipeline` 以**当前部署账号**的
+  Interactive/Limited principal 运行（绝不 SYSTEM/Highest；`Assert-BootstrapTaskPrincipal` /
+  `Test-ElevatedTaskIdentity` 会拒绝提升身份，pipeline 也拒绝继承提升后的 sync principal）。
+  注册前先用 `icacls` + 当前用户 SID 追加授权：对 `subscription.env` 追加只读（保留 Python 已设的
+  SYSTEM/Administrators ACL），对 `logs` 与 `providers` 追加 `(OI)(CI)M`（继承到子文件）；
+  每条 `icacls` 都检查退出码，失败则不注册依赖任务，也不给 Everyone、不读取凭据内容。
+  任务动作由 Task Scheduler 直接执行**绝对 Windows PowerShell 5.1 的 `-File` 入口**
+  （`sync-feishu-bitable.ps1 -Run` / `install-node-pipeline-task.ps1 -Run`，固定 `-InstallDir` 与
+  `-Interpreter`），不再生成 `.cmd` 启动器或拼 cmd 字符串；`-Run` 通过进程环境设置 `MIHOMO_DIR`，
+  以 `&` 调固定 Python，sync 先于 switch 且任一非零即让任务失败。手工 `-RegisterTask` 的旧行为
+  （schtasks /RL LIMITED、PATH python、仓库内 `.bat` 入口）保持不变。Bootstrap 无论默认或显式
+  `InstallDir` 都用规范化绝对路径经 `MIHOMO_DIR` 传给 CLI/Install 阶段，并跳过 Microsoft Store 的
+  `WindowsApps` 占位 python 再按版本挑选解释器。
+- `--json` 要求 stdout 只有一个 JSON 值：两个平台的安装子进程 stdout 统一导向 stderr，
+  交互提示也写 stderr。
+
 **表2 数据来源（2026-11-21，影响两端）**：西瓜加速没有订阅 URL，链 A 每轮优先读链 B 的
 「节点测速总表」作为其节点清单（按 来源 过滤、按 节点名 去重、取 节点配置JSON），
 表1 拉取结果=总表；读不到时才回退本地 `source4-cache.yaml`（拉取结果=缓存）。

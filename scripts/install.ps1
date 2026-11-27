@@ -40,13 +40,23 @@ if (-not $SkipConfigRender) {
         Write-Host "subscription.env 不存在，从模板创建空文件并打开 / creating from template"
         Copy-Item (Join-Path (Get-RepoRoot) 'config\subscription.env.example') $envPath -Force
         Start-Process notepad.exe $envPath
-        throw "请先填写 subscription.env 中的 SUBSCRIPTION_URL，再重新运行本脚本 / `nPlease fill SUBSCRIPTION_URL in subscription.env and re-run."
+        throw "请先填写 subscription.env，再重新运行本脚本：填 SUBSCRIPTION_URL（订阅模式），或填 FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_BITABLE_APP_TOKEN（飞书供池模式）/ `nFill SUBSCRIPTION_URL (subscription mode) OR the FEISHU_* keys (Feishu-pool mode), then re-run."
     }
 
     if (-not (Test-EnvConfigured $envPath)) {
-        Write-Err "subscription.env 中的 SUBSCRIPTION_URL 未配置或仍为示例值 / SUBSCRIPTION_URL not configured"
+        Write-Err "subscription.env 未配置：SUBSCRIPTION_URL 缺失/示例值，且飞书凭据不完整 / not configured"
         Start-Process notepad.exe $envPath
         throw "请编辑 $envPath 后重试 / Please edit it then re-run."
+    }
+
+    # ---------- 飞书供池 / Feishu-pool mode ----------
+    $feishuPool = Test-FeishuPoolMode -EnvPath $envPath
+    if ($feishuPool) {
+        $poolPath = Join-Path $InstallDir 'providers\feishu-pool.yaml'
+        if (-not (Test-Path -LiteralPath $poolPath) -or (Get-Item -LiteralPath $poolPath).Length -le 0) {
+            throw "飞书供池模式需要节点池 $poolPath，但它不存在或为空。请先用 scripts\deploy.ps1 引导，它会生成节点池 / Feishu-pool mode needs $poolPath; run scripts\deploy.ps1 first."
+        }
+        Write-Ok '检测到飞书供池模式 / Feishu-pool mode detected'
     }
 
     # ---------- 渲染 config ----------
@@ -54,7 +64,8 @@ if (-not $SkipConfigRender) {
     Render-Config `
         -EnvPath     $envPath `
         -TemplatePath (Get-TemplatePath) `
-        -OutPath     (Join-Path $InstallDir 'config.yaml')
+        -OutPath     (Join-Path $InstallDir 'config.yaml') `
+        -FeishuPool:$feishuPool
     Write-Ok "config.yaml 已生成 / generated at $(Join-Path $InstallDir 'config.yaml')"
 } else {
     if (-not (Test-Path (Join-Path $InstallDir 'config.yaml'))) {

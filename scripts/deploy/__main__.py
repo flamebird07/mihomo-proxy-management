@@ -30,10 +30,16 @@ from deploy import bootstrap, credentials, feishu_url, platforms
 
 
 def hidden_prompt(field: str) -> str:
-    """Ask for ``field`` on the terminal; the secret is not echoed."""
+    """Ask for ``field`` on the terminal; the secret is not echoed.
+
+    The prompt goes to stderr so a ``--json`` run keeps stdout to one JSON value.
+    """
+    prompt = f"{field}: "
     if field == "app_secret":
-        return getpass.getpass(f"{field}: ")
-    return input(f"{field}: ")
+        return getpass.getpass(prompt)
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    return input()
 
 
 def build_parser() -> argparse.ArgumentParser:

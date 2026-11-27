@@ -149,7 +149,7 @@ class InteractiveTests(CliTestCase):
         answers = iter([URL, APP_ID])
         calls = []
         with mock.patch("builtins.input",
-                        lambda prompt: (calls.append(prompt), next(answers))[1]):
+                        lambda *a, **k: (calls.append(a[0] if a else ""), next(answers))[1]):
             with mock.patch("getpass.getpass", return_value=SECRET) as getpass_mock:
                 code, _, _ = self.run_main(self.happy_argv(), stdin_text=None)
         self.assertEqual(code, 0)
@@ -159,7 +159,7 @@ class InteractiveTests(CliTestCase):
         self.assertEqual(creds.app_secret, SECRET)
 
     def test_interrupted_prompt_returns_130(self):
-        with mock.patch("builtins.input", lambda _: URL):
+        with mock.patch("builtins.input", lambda *a, **k: URL):
             with mock.patch("getpass.getpass",
                             side_effect=KeyboardInterrupt):
                 code, _, err = self.run_main(self.happy_argv(), stdin_text=None)
