@@ -2,7 +2,7 @@
 
 > **读者**：Windows 侧与 macOS 侧的开发者/Agent。两端**异步开发**，本文件是双方必须
 > 共同维护的"接口契约"——改动任何一侧的共享逻辑，先读这里，改完更新这里。
-> 最后更新：2026-11-27（流水线脚本去掉内置 app_token，表格地址改由部署机器提供；前版 2026-11-20 Windows 接入自检 + 测试基线）。
+> 最后更新：2026-11-28（以飞书表格引导新机器）。
 
 ## 1. 一句话架构
 
@@ -15,11 +15,13 @@
 |---|---|---|
 | `config/config.yaml.template` | 策略组/规则唯一来源。Windows 渲染器=install.ps1，macOS 渲染器=`macos/python/mpm_macos/config.py`（叠加 mac 专用覆盖，见 §4） | 改组/规则必须两侧重装生效；mac audit 会锁组形，Windows 侧改组要先看 `mpm_common/policy.py` |
 | `common/python/mpm_common/policy.py` | 区域过滤器常量（CURSOR/CODEBUDDY/GROKBOT 系） | template 与 audit 都引用它，单一事实源 |
+| `scripts/deploy/` | GitHub 引导命令、飞书权限校验、供应链锁与校验、配置及服务安装的宿主接线 | macOS/Windows 共用入口；凭据来自环境变量、stdin JSON 或交互 |
+| `scripts/feishu_pool.py` | 从「节点测速总表」生成 mihomo 文件节点池 | 只读飞书；低于节点下限时保留原池 |
 | `scripts/convert_sub.py` | 订阅转换/合并（三源候选）；`--source1-supplement` 多源模式 | 跨平台纯逻辑 |
 | `scripts/sync-feishu-bitable.py` | 飞书表1(订阅源状态)/表2(可测速节点)/表3(GPT可用地区组) 写入链 | 两端共用；`--source-cache-dir`/`--source1-supplement` 是 mac 守护传的新参数 |
 | `scripts/node_provider/` + `node_ops/` + `gpt_switch_entry.py` + `gpt_stability_policy.py` | 节点流水线核心（采集→测速门控→有效节点 provider；GPT 稳定切换） | 跨平台纯逻辑；**数据只存飞书两表** |
 | `scripts/named_mutex_lock.py` | GPT 切换跨进程锁：Windows=kernel32 named mutex，POSIX=`flock` 文件锁（`NAMED_MUTEX_LOCK_DIR` 可改目录） | 两实现语义对齐：超时=LockBusy，持锁方死亡=内核释放 |
-| **飞书 Bitable** `URo9bAsd5azYe5swAmtclIbEnNh` | 数据总线：「节点测速总表」「有效节点」「采集状态」（流水线）+ 表1/2/3、实时状态、西瓜IP池（sync 链） | 表按**名称**运行时定位，列结构见 `node_provider/schema.py` / `node_ops/schema.py`（两侧镜像，改一边必须同步另一边）。app_token **没有代码内置默认值**（2026-11-27）：每台机器自带自己的表格地址，解析优先级 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` > env 文件同名键；三处都没有时 `node_provider` / `node_ops` 以退出码 2 报告键名（`app_token_missing`）并等下个周期重试 |
+| **飞书 Bitable** | 数据总线：「节点测速总表」「有效节点」「采集状态」（流水线）+ 表1/2/3、实时状态、西瓜IP池（sync 链） | 表按**名称**运行时定位，列结构见 `node_provider/schema.py` / `node_ops/schema.py`（两侧镜像，改一边必须同步另一边）。app_token **没有代码内置默认值**（2026-11-27）：每台机器自带自己的表格地址，解析优先级 `--app-token` > 进程环境变量 `FEISHU_BITABLE_APP_TOKEN` > env 文件同名键；三处都没有时 `node_provider` / `node_ops` 以退出码 2 报告键名（`app_token_missing`）并等下个周期重试 |
 
 ## 3. 双链并行（谁写哪张表，别搞混）
 
