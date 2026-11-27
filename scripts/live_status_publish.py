@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one live-status row into the Feishu Bitable table 实时状态 (DIAN-18).
+r"""Publish one live-status row into the Feishu Bitable table 实时状态 (DIAN-18).
 
 Reads a live_status_collect.py JSON document plus a live_status_alert.py
 evaluation (imported, or read from its --out JSON) and upserts exactly ONE row

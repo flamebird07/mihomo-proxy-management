@@ -142,7 +142,8 @@ Windows（在同一个管理员 PowerShell 会话里设置后再运行）：
 ```powershell
 $env:MPM_FEISHU_BASE_URL = 'https://example.feishu.cn/base/EXAMPLEappToken123456'
 $env:MPM_FEISHU_APP_ID     = 'cli_example_app_id'
-$env:MPM_FEISHU_APP_SECRET = 'example-app-secret-not-real'
+$secret = Read-Host 'Feishu App Secret' -AsSecureString
+$env:MPM_FEISHU_APP_SECRET = [Net.NetworkCredential]::new('', $secret).Password
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy.ps1
 ```
 

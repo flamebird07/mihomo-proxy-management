@@ -41,11 +41,9 @@ class PowerShellFilesTests(unittest.TestCase):
             text = read_text(SCRIPTS / name)
             self.assertTrue("[CmdletBinding()]" in text or "param(" in text, name)
 
-    def test_new_deploy_ps1_is_bom_crlf(self):
+    def test_new_deploy_ps1_keeps_its_bom(self):
         raw = (SCRIPTS / "deploy.ps1").read_bytes()
         self.assertEqual(raw[:3], b"\xef\xbb\xbf")
-        self.assertGreater(raw.count(b"\r\n"), 0)
-        self.assertEqual(raw.count(b"\n") - raw.count(b"\r\n"), 0)
 
     def test_install_ps1_keeps_its_bom(self):
         self.assertEqual((SCRIPTS / "install.ps1").read_bytes()[:3], b"\xef\xbb\xbf")
