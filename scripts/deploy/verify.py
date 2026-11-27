@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../scripts
 if _HERE not in sys.path:
@@ -53,6 +53,7 @@ class AccessReport:
     write_ok: bool = False
     base_name: str = ""
     app_token_masked: str = ""
+    app_token: str = field(repr=False, default="")
     resolved_from_wiki: bool = False
     tables: tuple = ()
     nodes_table_present: bool = False
@@ -89,9 +90,17 @@ def _problem(step: str, exc: BaseException) -> str:
     return f"{step}:{type(exc).__name__}"
 
 
-def verify_access(client_factory, credentials, parsed, record, *, log=None) -> AccessReport:
+def verify_access(client_factory, credentials, parsed, record, *, log=None,
+                  write_probe: bool = True) -> AccessReport:
     """Run the read checks, then the write probe.  Feishu errors never raise;
-    the report names the step that failed and everything after it was skipped."""
+    the report names the step that failed and everything after it was skipped.
+
+    ``write_probe=False`` skips the write step entirely (dry-run): nothing is
+    written, ``registry_action`` becomes ``"skipped"`` and ``write_ok`` stays
+    ``False`` - which in a dry-run means "write access was not verified", not
+    "verified missing".  A dry-run caller must therefore judge success by
+    ``read_ok`` alone.
+    """
     say = log or (lambda _message: None)
     report = AccessReport()
     app_token = parsed.token
@@ -117,6 +126,7 @@ def verify_access(client_factory, credentials, parsed, record, *, log=None) -> A
         except Exception as exc:  # noqa: BLE001 - every failure is reported, not raised
             return fail("wiki", exc)
     report.app_token_masked = feishu_url.mask_token(app_token)
+    report.app_token = app_token
 
     try:
         client = client_factory(credentials.app_id, credentials.app_secret, app_token)
@@ -145,6 +155,11 @@ def verify_access(client_factory, credentials, parsed, record, *, log=None) -> A
             report.nodes_rows = len(client.list_records(nodes[0]["table_id"]))
         except Exception as exc:  # noqa: BLE001 - soft: a new or busy table must not block
             fail("nodes", exc)
+
+    if not write_probe:
+        report.registry_action = "skipped"
+        say("feishu write probe skipped (dry-run) write_ok stays False")
+        return report
 
     try:
         report.registry_action = registry.upsert_registry(client, record, log=say)
